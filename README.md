@@ -329,25 +329,19 @@ This is exactly the same result as computing the loss on the full batch at once.
 ### End-to-End Token Budgeting Flow (GitHub-Rendered Diagram)
 
 ```mermaid
+graph TD
+    A[Dataset<br>Variable‑length sequences] --> B[Token‑Packed Batch Construction<br>Σ effective tokens ≤ 16384]
+    B --> C[Logical Batch B<br>Variable number of samples]
+    C --> D[Microbatch Partitioning<br>Σ tokens ≤ 4096<br>Samples ≤ 28]
+    D --> M1[Microbatch M1<br>≤ 4096 tokens]
+    D --> M2[Microbatch M2<br>≤ 4096 tokens]
+    D --> M3[Microbatch M3<br>≤ 4096 tokens]
+    M1 --> G[Forward + Backward Pass<br>on GPU]
+    M2 --> G
+    M3 --> G
+    G --> H[Scaled Gradient Accumulation]
+    H --> I[Optimizer Step]
 
-A[Dataset<br/>Variable-length sequences] --> B[Token-Packed Batch Construction<br/>Σ effective tokens ≤ 16384]
-
-B --> C[Logical Batch B<br/>Variable number of samples]
-
-C --> D[Microbatch Partitioning<br/>Σ tokens ≤ 4096<br/>Samples ≤ 28]
-
-D --> M1[Microbatch M1<br/>≤ 4096 tokens]
-D --> M2[Microbatch M2<br/>≤ 4096 tokens]
-D --> M3[Microbatch M3<br/>≤ 4096 tokens]
-
-M1 --> G[Forward + Backward Pass<br/>on GPU]
-M2 --> G
-M3 --> G
-
-G --> H[Scaled Gradient Accumulation]
-
-H --> I[Optimizer Step]
-```
 
 7. Summary (Numbers in Practice)
 
