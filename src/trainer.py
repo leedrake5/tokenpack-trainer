@@ -78,7 +78,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         if self.args.gradient_accumulation_steps != 1:
             print(
-                "[HierarchicalTokenTrainer] Warning: gradient_accumulation_steps != 1.\n"
+                "[TokenPackTrainer] Warning: gradient_accumulation_steps != 1.\n"
                 "You now have two layers of accumulation (HF + microbatch). "
                 "Make sure this is intentional."
             )
@@ -210,7 +210,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         am = inputs.get("attention_mask", None)
         if am is None:
             raise ValueError(
-                "attention_mask is required to compute lengths for HierarchicalTokenTrainer. "
+                "attention_mask is required to compute lengths for TokenPackTrainer. "
                 "Make sure your collator provides it."
             )
         if not isinstance(am, torch.Tensor):
@@ -812,7 +812,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if self.optimizer is not None:
                 self._save_optimizer_and_scheduler(ckpt_dir)
 
-        print(f"\n[HierarchicalTokenTrainer] Saved emergency checkpoint to {ckpt_dir} "
+        print(f"\n[TokenPackTrainer] Saved emergency checkpoint to {ckpt_dir} "
               f"after CUDA error: {msg}\n")
 
         raise err
@@ -938,7 +938,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         # --- DEBUG: see where the batch lives when we first see it ---
         #if "input_ids" in inputs and isinstance(inputs["input_ids"], torch.Tensor):
-            #print(f"[HierarchicalTokenTrainer] training_step got input_ids on device: {inputs['input_ids'].device}")
+            #print(f"[TokenPackTrainer] training_step got input_ids on device: {inputs['input_ids'].device}")
 
         # ---------------- CPU-microbatching path ----------------
         if self.use_cpu_microbatch:

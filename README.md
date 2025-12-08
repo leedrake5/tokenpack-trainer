@@ -187,7 +187,7 @@ compute_metrics = make_seq2seq_compute_metrics(
     meteor_only_for_english=True,
 )
 
-trainer = HierarchicalTokenTrainer(
+trainer = TokenPackTrainer(
     ...,
     compute_metrics=compute_metrics,
 )
@@ -197,15 +197,15 @@ trainer = HierarchicalTokenTrainer(
 
 ## Supported Training Types
 
-  Task Type                Supported
-  ------------------------ -----------
-  T5 Pretraining           ✅
-  Translation              ✅
-  Instruction Tuning       ✅
-  Mixed-Length Corpora     ✅
-  Flash-Attention Models   ✅
-  DeepSpeed                ✅
-  Token Packing            ✅
+| Task Type                | Supported |
+|--------------------------|-----------|
+| T5 Pretraining           | ✅        |
+| Translation              | ✅        |
+| Instruction Tuning       | ✅        |
+| Mixed-Length Corpora     | ✅        |
+| Flash-Attention Models   | ✅        |
+| DeepSpeed                | ✅        |
+| Token Packing            | ✅        |
 
 
 ------------------------------------------------------------------------
