@@ -1,7 +1,7 @@
 # TokenPack Trainer
 
-A lightweight toolkit for token-budgeted batching and microbatching
-with Hugging Face Transformers.\
+A lightweight toolkit for token-budgeted batching and microbatching with Hugging Face Transformers.
+
 Designed for long-sequence pretraining, seq2seq translation, and mixed-length corpora where fixed batch sizes waste memory. Crucially, most transformers-style syntax can still be used, this is a drop-in patch to improve memory efficiency.
 
 This package provides:
@@ -39,8 +39,7 @@ Traditional training uses:
 
     batch_size × max_sequence_length
 
-This wastes VRAM when sequences vary widely. Token-based batching
-instead enforces:
+This wastes VRAM when sequences vary widely. Token-based batching instead enforces:
 
     sum(tokens_in_batch) ≤ token_budget
 
@@ -92,6 +91,7 @@ trainer = TokenPackTrainer(
 
 ### Common Advanced Configuration
 For UMT5-Base, I found the following configuration to be stable on an RTX 6000 Pro Blackwell (96Gb VRAM):
+
 ``` python
 trainer = TokenPackTrainer(
     model=model,
@@ -222,15 +222,15 @@ At the core of `TokenPackTrainer` is a two-level token budgeting system that rep
 The mechanism is controlled by four key parameters:
 
 ```python
-max_tokens_per_batch           = 16384
-max_tokens_per_microbatch      = 4096
+max_tokens_per_batch = 16384
+max_tokens_per_microbatch = 4096
 max_eval_tokens_per_microbatch = 4096
-max_examples_per_microbatch   = 28`
+max_examples_per_microbatch = 28`
 ```
 
 These bounds directly determine the maximum matrix sizes seen by the GPU.
 
-1. Per-Example Effective Token Cost
+###1. Per-Example Effective Token Cost
 
 For each example ( i ), the trainer computes:
 
@@ -249,7 +249,7 @@ This reflects that decoder-side computation is typically more expensive than enc
  
 
 
-2. Stage 1 — Token-Packed Batches (Global Budget)
+###2. Stage 1 — Token-Packed Batches (Global Budget)
 
 The DataLoader does not emit fixed-size batches. Instead, it builds a batch ( B ) such that:
 
@@ -263,7 +263,7 @@ This means:
 
 So every optimizer step contains roughly the same total token workload, not the same number of examples. This removes most wasted padding and ensures stable throughput.
 
-3. Stage 2 — Microbatch Splitting (GPU Budget)
+###3. Stage 2 — Microbatch Splitting (GPU Budget)
 
 Inside training_step, the packed batch is further split into microbatches ( M_k ) that satisfy:
 
@@ -274,7 +274,7 @@ Inside training_step, the packed batch is further split into microbatches ( M_k 
 
 This guarantees that no forward/backward pass ever exceeds the GPU’s safe matrix budget (assuming memory limits are well understood). Microbatches are formed greedily after sorting by length.
 
-4. Matrix Math Bound
+###4. Matrix Math Bound
 
 Let:
 ```math
@@ -300,7 +300,7 @@ This means:
 
 The GPU never sees the full 16,384-token batch at once — it only ever processes safe 4,096-token windows.
 
-5. Gradient Equivalence to a Full Batch
+###5. Gradient Equivalence to a Full Batch
 
 Even though computation is split into microbatches, the resulting gradient is mathematically identical to computing the loss on the full batch.
 
@@ -326,7 +326,7 @@ Summing over all microbatches:
 
 This is exactly the same result as computing the loss on the full batch at once.
 
-### End-to-End Token Budgeting Flow (GitHub-Rendered Diagram)
+### End-to-End Token Budgeting Flow
 
 ```mermaid
 graph TD
@@ -347,10 +347,10 @@ graph TD
 
 With:
 
-max_tokens_per_batch           = 16384
-max_tokens_per_microbatch      = 4096
+max_tokens_per_batch = 16384
+max_tokens_per_microbatch = 4096
 max_eval_tokens_per_microbatch = 4096
-max_examples_per_microbatch   = 28
+max_examples_per_microbatch = 28
 
     •    Each optimizer step sees ~16k tokens of work
     •    Each GPU matmul never exceeds ~4k tokens
