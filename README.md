@@ -341,7 +341,7 @@ graph TD
     M3 --> G
     G --> H[Scaled Gradient Accumulation]
     H --> I[Optimizer Step]
-
+```
 
 7. Summary (Numbers in Practice)
 
