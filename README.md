@@ -6,7 +6,7 @@ Designed for long-sequence pretraining, seq2seq translation, and mixed-length co
 
 This package provides:
 
--   `HierarchicalTokenTrainer` --- token-aware, OOM-safe Trainer with
+-   `HierarchicalTokenTrainer` --- token-aware, VRAM budget Trainer with
     CPU/GPU microbatching\
 -   `T5SpanCorruptionCollatorFast` --- efficient span corruption for
     T5-style pretraining\
@@ -23,10 +23,10 @@ From source:
 pip install -e .
 ```
 
-From GitHub (example):
+From GitHub:
 
 ``` bash
-pip install git+https://github.com/yourname/tokenpack-trainer.git
+pip install git+https://github.com/leedrake5/tokenpack-trainer.git
 ```
 
 ------------------------------------------------------------------------
