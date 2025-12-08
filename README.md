@@ -346,12 +346,12 @@ graph TD
 7. Summary (Numbers in Practice)
 
 With:
-
+```python
 max_tokens_per_batch = 16384
 max_tokens_per_microbatch = 4096
 max_eval_tokens_per_microbatch = 4096
 max_examples_per_microbatch = 28
-
+```
     •    Each optimizer step sees ~16k tokens of work
     •    Each GPU matmul never exceeds ~4k tokens
     •    Each microbatch never exceeds 28 samples
@@ -365,4 +365,4 @@ This turns token count — not batch size — into the primary unit of compute c
 
 ## License
 
-MIT License (or update to match your project).
+MIT License
