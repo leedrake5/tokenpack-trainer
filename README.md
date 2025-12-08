@@ -326,45 +326,28 @@ Summing over all microbatches:
 
 This is exactly the same result as computing the loss on the full batch at once.
 
-Dataset
-  │
-  ▼
-[examples with variable token lengths]
-  │
-  ▼
-┌─────────────────────────────────────┐
-│ Token-Packed Batch Construction     │
-│  max Σ effective tokens ≤ 16384     │
-└─────────────────────────────────────┘
-              │
-              ▼
-     ┌────────────────────┐
-     │  Logical Batch B   │
-     │  (variable size)   │
-     └────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│ Microbatch Partitioning             │
-│  max Σ tokens ≤ 4096                │
-│  max examples ≤ 28                  │
-└─────────────────────────────────────┘
-      │           │            │
-      ▼           ▼            ▼
-┌──────────┐  ┌────────────┐  ┌─────────────┐
-│ Micro M1 │  │ Micro M2   │  │ Micro M3    │
-│ ≤4096 tok│  │ ≤4096 tok  │  │ ≤4096 tok   │
-└──────────┘  └────────────┘  └─────────────┘
-      │           │            │
-      ▼           ▼            ▼
-  Forward+Backward on GPU (sequential)
-      │           │            │
-      └───────┬───┴───────┬────┘
-              ▼           ▼
-       Scaled Gradient Accumulation
-                    │
-                    ▼
-              Optimizer Step
+### End-to-End Token Budgeting Flow (GitHub-Rendered Diagram)
+
+```mermaid
+
+A[Dataset<br/>Variable-length sequences] --> B[Token-Packed Batch Construction<br/>Σ effective tokens ≤ 16384]
+
+B --> C[Logical Batch B<br/>Variable number of samples]
+
+C --> D[Microbatch Partitioning<br/>Σ tokens ≤ 4096<br/>Samples ≤ 28]
+
+D --> M1[Microbatch M1<br/>≤ 4096 tokens]
+D --> M2[Microbatch M2<br/>≤ 4096 tokens]
+D --> M3[Microbatch M3<br/>≤ 4096 tokens]
+
+M1 --> G[Forward + Backward Pass<br/>on GPU]
+M2 --> G
+M3 --> G
+
+G --> H[Scaled Gradient Accumulation]
+
+H --> I[Optimizer Step]
+```
 
 7. Summary (Numbers in Practice)
 
