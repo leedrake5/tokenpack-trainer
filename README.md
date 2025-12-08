@@ -230,7 +230,7 @@ max_examples_per_microbatch = 28`
 
 These bounds directly determine the maximum matrix sizes seen by the GPU.
 
-###1. Per-Example Effective Token Cost
+### 1. Per-Example Effective Token Cost
 
 For each example ( i ), the trainer computes:
 
@@ -249,7 +249,7 @@ This reflects that decoder-side computation is typically more expensive than enc
  
 
 
-###2. Stage 1 — Token-Packed Batches (Global Budget)
+### 2. Stage 1 — Token-Packed Batches (Global Budget)
 
 The DataLoader does not emit fixed-size batches. Instead, it builds a batch ( B ) such that:
 
@@ -263,7 +263,7 @@ This means:
 
 So every optimizer step contains roughly the same total token workload, not the same number of examples. This removes most wasted padding and ensures stable throughput.
 
-###3. Stage 2 — Microbatch Splitting (GPU Budget)
+### 3. Stage 2 — Microbatch Splitting (GPU Budget)
 
 Inside training_step, the packed batch is further split into microbatches ( M_k ) that satisfy:
 
@@ -274,7 +274,7 @@ Inside training_step, the packed batch is further split into microbatches ( M_k 
 
 This guarantees that no forward/backward pass ever exceeds the GPU’s safe matrix budget (assuming memory limits are well understood). Microbatches are formed greedily after sorting by length.
 
-###4. Matrix Math Bound
+### 4. Matrix Math Bound
 
 Let:
 ```math
@@ -300,7 +300,7 @@ This means:
 
 The GPU never sees the full 16,384-token batch at once — it only ever processes safe 4,096-token windows.
 
-###5. Gradient Equivalence to a Full Batch
+### 5. Gradient Equivalence to a Full Batch
 
 Even though computation is split into microbatches, the resulting gradient is mathematically identical to computing the loss on the full batch.
 
