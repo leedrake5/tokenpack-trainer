@@ -5,7 +5,7 @@ import time
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
-class HierarchicalTokenTrainer(Seq2SeqTrainer):
+class TokenPackTrainer(Seq2SeqTrainer):
     """
     Trainer that:
       - (optionally) truncates encoder/decoder sequences to hard caps,
