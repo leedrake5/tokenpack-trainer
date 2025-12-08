@@ -296,15 +296,11 @@ Total training memory scales as:
 \mathcal{O}(L \cdot B_{\max} \cdot T_{\max} \cdot d_{model})
 ```
 
-This means:
-
-The GPU never sees the full 16,384-token batch at once — it only ever processes safe 4,096-token windows.
+Thus, the GPU never sees the full 16,384-token batch at once — it only ever processes safe 4,096-token windows. However, gradients will update on the larger token window to stabilize training. 
 
 ### 5. Gradient Equivalence to a Full Batch
 
-Even though computation is split into microbatches, the resulting gradient is mathematically identical to computing the loss on the full batch.
-
-If:
+Even though computation is split into microbatches, the resulting gradient is mathematically identical to computing the loss on the full batch. If:
 
 ```math
 B = \bigcup_k M_k, \quad N = |B|
