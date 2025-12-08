@@ -265,7 +265,7 @@ So every optimizer step contains roughly the same total token workload, not the 
 
 ### 3. Stage 2 — Microbatch Splitting (GPU Budget)
 
-Inside training_step, the packed batch is further split into microbatches ( M_k ) that satisfy:
+Inside training_step, the packed batch is further split into microbatches ( $M_k$ ) that satisfy:
 
 ```math
 \sum_{i \in M_k} \tilde{\ell}_i \le 4096
