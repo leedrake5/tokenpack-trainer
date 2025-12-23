@@ -2,6 +2,7 @@ import torch
 from transformers import Seq2SeqTrainer
 from torch.nn.utils.rnn import pad_sequence
 import time
+from typing import Any, List, Optional
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
