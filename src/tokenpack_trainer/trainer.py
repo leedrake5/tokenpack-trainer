@@ -511,27 +511,25 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # GPU-native microbatching path
         # (mirrors training_step)
         # -----------------------------
-        inputs = self._prepare_inputs(inputs)  # let HF/Accelerate do device placement
+        inputs = self._prepare_inputs(inputs)
         inputs = self._truncate_batch(inputs)
 
         microbatch_indices = self._plan_microbatches(inputs)
 
-        if not microbatches:
+        if not microbatch_indices:
             return (None, None, None)
 
         total_loss = 0.0
         total_examples = 0
 
-        for mb in microbatches:
-            mb = self._slice_inputs(self, inputs, mb_idx)   # creates ONE microbatch copy
+        for mb_idx in microbatch_indices:
+            mb = self._slice_inputs(self, inputs, mb_idx)   # ONE microbatch copy
             bsz = mb["input_ids"].size(0)
             total_examples += bsz
 
-            # 🔹 drop length column
             if self.length_column_name in mb:
                 mb = {k: v for k, v in mb.items() if k != self.length_column_name}
 
-            # mb is already on correct device; do NOT call _to_device here
             with torch.no_grad():
                 with self.compute_loss_context_manager():
                     loss_mb = self.compute_loss(model, mb, return_outputs=False)
@@ -539,8 +537,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if isinstance(loss_mb, tuple):
                 loss_mb = loss_mb[0]
 
-            loss_mb = loss_mb.detach()
-            total_loss += loss_mb * bsz
+            total_loss += loss_mb.detach() * bsz
 
         if total_examples == 0:
             return (None, None, None)
