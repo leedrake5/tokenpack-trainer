@@ -605,6 +605,52 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # 1) Basic dataloader (no token-budgeting here; we control size via per_device_eval_batch_size)
         dataloader = self.get_eval_dataloader(eval_dataset)
 
+        if getattr(self, "compute_metrics", None) is None:
+            # Loss-only eval loop (no generate)
+            total_eval_loss = 0.0
+            total_eval_tokens = 0
+            num_steps = 0
+            num_examples = 0
+            start_time = time.time()
+
+            for batch in dataloader:
+                num_steps += 1
+                labels = batch.get("labels", None)
+                if labels is None:
+                    raise ValueError("Eval dataset must have labels to compute eval_loss.")
+
+                with torch.no_grad():
+                    loss, _, _ = self.prediction_step(
+                        self.model,
+                        batch,
+                        prediction_loss_only=True,
+                        ignore_keys=None,
+                    )
+
+                labels_cpu = labels.detach().to("cpu")
+                num_tokens = int((labels_cpu != -100).sum().item())
+                if loss is not None and num_tokens > 0:
+                    total_eval_loss += float(loss.item()) * num_tokens
+                    total_eval_tokens += num_tokens
+
+                num_examples += int(labels.size(0))
+
+            runtime = time.time() - start_time
+            eval_loss = total_eval_loss / total_eval_tokens if total_eval_tokens > 0 else float("nan")
+
+            metrics = {
+                "eval_loss": float(eval_loss),
+                "eval_runtime": float(runtime),
+                "eval_samples_per_second": float(num_examples / runtime) if runtime > 0 else 0.0,
+                "eval_steps_per_second": float(num_steps / runtime) if runtime > 0 else 0.0,
+                "eval_gen_len": 0.0,
+                "eval_bleu": 0.0,
+                "eval_chrf": 0.0,
+                "eval_meteor": 0.0,
+            }
+            return metrics
+
+
         # 2) Build generation kwargs like HF does
         gen_kwargs: dict[str, Any] = {}
 
@@ -741,6 +787,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 padded_labels.append(l)
             labels = np.concatenate(padded_labels, axis=0)
 
+            compute_metrics_fn = getattr(self, "compute_metrics", None)
+            if compute_metrics_fn is None:
+                # No metrics function provided: return loss-only metrics
+                raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
+            else:
+                raw_metrics = compute_metrics_fn((preds, labels))
+
             # (N, max_pred_len), (N, max_label_len)
             raw_metrics = self.compute_metrics((preds, labels))
             # raw_metrics is assumed to contain {"bleu": ..., "chrf": ..., "meteor": ..., "gen_len": ...}
@@ -847,6 +900,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 eval_dataset = self.eval_dataset
             if eval_dataset is None:
                 raise ValueError("Evaluation requires an eval_dataset.")
+
+            compute_metrics_fn = getattr(self, "compute_metrics", None)
+            if compute_metrics_fn is None:
+                # No metrics function provided: return loss-only metrics
+                raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
+            else:
+                raw_metrics = compute_metrics_fn((preds, labels))
 
             start_time = time.time()
             raw_metrics = self._token_aware_evaluate(
