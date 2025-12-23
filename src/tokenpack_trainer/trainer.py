@@ -64,7 +64,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.use_cpu_microbatch = bool(use_cpu_microbatch)
         self.max_examples_per_microbatch = max_examples_per_microbatch
         self.max_eval_tokens_per_microbatch = (
-            int(max_eval_tokens_per_microbatch/4)
+            int(max_eval_tokens_per_microbatch)
             if max_eval_tokens_per_microbatch is not None
             else self.max_tokens_per_microbatch
         )
@@ -515,16 +515,18 @@ class TokenPackTrainer(Seq2SeqTrainer):
         inputs = self._prepare_inputs(inputs)
         inputs = self._truncate_batch(inputs)
 
-        microbatch_indices = self._plan_microbatches(inputs)
+        microbatches = self._make_microbatches(
+            inputs,
+            max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,  # IMPORTANT
+        )
 
-        if not microbatch_indices:
+        if not microbatches:
             return (None, None, None)
 
         total_loss = 0.0
         total_examples = 0
 
-        for mb_idx in microbatch_indices:
-            mb = self._slice_inputs(self, inputs, mb_idx)   # ONE microbatch copy
+        for mb in microbatches:
             bsz = mb["input_ids"].size(0)
             total_examples += bsz
 
@@ -540,10 +542,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
             total_loss += loss_mb.detach() * bsz
 
-        if total_examples == 0:
-            return (None, None, None)
-
-        avg_loss = total_loss / total_examples
+        avg_loss = total_loss / max(total_examples, 1)
         return (avg_loss, None, None)
 
     def get_eval_dataloader(self, eval_dataset=None):
@@ -603,15 +602,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             raise ValueError("Need an eval_dataset for token-aware evaluation.")
 
         # 1) Basic dataloader (no token-budgeting here; we control size via per_device_eval_batch_size)
-        dataloader = DataLoader(
-            eval_dataset,
-            batch_size=self.args.per_device_eval_batch_size,
-            collate_fn=self.data_collator,
-            num_workers=self.args.dataloader_num_workers,
-            pin_memory=self.args.dataloader_pin_memory,
-            persistent_workers=self.args.dataloader_persistent_workers,
-            prefetch_factor=getattr(self.args, "dataloader_prefetch_factor", 2),
-        )
+        dataloader = self.get_eval_dataloader(eval_dataset)
 
         # 2) Build generation kwargs like HF does
         gen_kwargs: dict[str, Any] = {}
