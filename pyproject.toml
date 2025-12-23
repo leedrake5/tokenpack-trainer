@@ -24,8 +24,19 @@ dependencies = [
 Homepage = "https://github.com/leedrake5/tokenpack-trainer"
 Issues   = "https://github.com/leedrake5/tokenpack-trainer/issues"
 
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenpack-trainer"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["numpy", "torch", "tqdm", "transformers"]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["tokenpack_trainer*"]
