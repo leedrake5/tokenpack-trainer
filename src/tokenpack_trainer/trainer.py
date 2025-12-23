@@ -510,10 +510,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         inputs = self._prepare_inputs(inputs)  # let HF/Accelerate do device placement
         inputs = self._truncate_batch(inputs)
 
-        microbatches = self._make_microbatches(
-            inputs,
-            max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
-        )
+        microbatch_indices = self._plan_microbatches(inputs)
 
         if not microbatches:
             return (None, None, None)
@@ -522,6 +519,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         total_examples = 0
 
         for mb in microbatches:
+            mb = self._slice_inputs(self, inputs, mb_idx)   # creates ONE microbatch copy
             bsz = mb["input_ids"].size(0)
             total_examples += bsz
 
