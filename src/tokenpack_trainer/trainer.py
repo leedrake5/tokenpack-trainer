@@ -6,6 +6,9 @@ from typing import Any, List, Optional
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
+from .samplers import LengthBucketedBatchSampler
+
+
 class TokenPackTrainer(Seq2SeqTrainer):
     """
     Trainer that:
