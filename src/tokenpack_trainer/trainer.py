@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 from transformers.utils import logging
 from torch.utils.data import DataLoader
 logger = logging.get_logger(__name__)
+import os
 
 from .samplers import LengthBucketedBatchSampler
 
@@ -441,8 +442,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         ignore_keys: Optional[List[str]] = None,
     ):
     
-        if self.length_column_name in inputs:
-            inputs = {k: v for k, v in inputs.items() if k != self.length_column_name}
+        #if self.length_column_name in inputs:
+        #    inputs = {k: v for k, v in inputs.items() if k != self.length_column_name}
 
         # If we need logits/labels, or no microbatching, just use the base implementation
         if (not prediction_loss_only) or (self.max_tokens_per_microbatch is None):
