@@ -7,6 +7,7 @@ from transformers.utils import logging
 from torch.utils.data import DataLoader
 logger = logging.get_logger(__name__)
 import os
+import numpy as np
 
 from .samplers import LengthBucketedBatchSampler
 
