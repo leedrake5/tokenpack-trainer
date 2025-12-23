@@ -4,6 +4,7 @@ from torch.nn.utils.rnn import pad_sequence
 import time
 from typing import Any, List, Optional
 from transformers.utils import logging
+from torch.utils.data import DataLoader
 logger = logging.get_logger(__name__)
 
 from .samplers import LengthBucketedBatchSampler
