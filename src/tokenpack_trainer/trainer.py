@@ -43,14 +43,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Route legacy assignment to the new attribute
         self.processing_class = value
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        # Optional: if something populated _processing_class (older HF),
-        # but processing_class is missing, sync it.
-        if getattr(self, "processing_class", None) is None and getattr(self, "_processing_class", None) is not None:
-            self.processing_class = self._processing_class
-
     def __init__(
         self,
         *args,
@@ -65,6 +57,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
         use_cpu_microbatch: bool = True,
         eval_mode: str | None = None,  #use classic hf or switch to "token_aware_metrics" to use token packing
         debug: bool = False,
+        oom_max_retries: int = 3,
+        oom_shrink_B: float = 0.5,           # halve B on OOM
+        oom_shrink_tokens: float = 0.85,     # then shrink token budget
+        oom_min_B: int = 1,
+        oom_min_tokens: int = 64,
+        oom_skip_batch_on_fail: bool = True, # if retries exhausted, just skip batch
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -83,6 +81,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
         )
         self.eval_mode = eval_mode or "token_aware_metrics"
         self.debug = debug
+        self.oom_max_retries = int(oom_max_retries)
+        self.oom_shrink_B = float(oom_shrink_B)
+        self.oom_shrink_tokens = float(oom_shrink_tokens)
+        self.oom_min_B = int(oom_min_B)
+        self.oom_min_tokens = int(oom_min_tokens)
+        self.oom_skip_batch_on_fail = bool(oom_skip_batch_on_fail)
+
+        self._oom_events = 0
+        self._oom_skipped_batches = 0
 
         # running maxima
         self._max_seen_enc_len = 0
@@ -101,6 +108,71 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 "You now have two layers of accumulation (HF + microbatch). "
                 "Make sure this is intentional."
             )
+
+        # Optional: if something populated _processing_class (older HF),
+        # but processing_class is missing, sync it.
+        if getattr(self, "processing_class", None) is None and getattr(self, "_processing_class", None) is not None:
+            self.processing_class = self._processing_class
+
+
+    def _is_cuda_oom(self, err: BaseException) -> bool:
+        msg = str(err)
+        return (
+            isinstance(err, torch.cuda.OutOfMemoryError)
+            or "CUDA out of memory" in msg
+            or "CUBLAS_STATUS_ALLOC_FAILED" in msg
+            or "cudaMalloc" in msg
+        )
+
+    def _oom_cleanup(self):
+        # Clear gradients that may be partially accumulated
+        try:
+            self.accelerator.zero_grad(set_to_none=True)
+        except Exception:
+            # fallback
+            try:
+                for p in self.model.parameters():
+                    p.grad = None
+            except Exception:
+                pass
+
+        # Clear CUDA allocator state
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    def _oom_shrink_limits(self):
+        """
+        Prefer shrinking max_examples_per_microbatch (B) first.
+        If already minimal, shrink max_tokens_per_microbatch.
+        """
+        changed = False
+
+        # Shrink B (if set)
+        if self.max_examples_per_microbatch is not None and self.max_examples_per_microbatch > self.oom_min_B:
+            new_B = max(self.oom_min_B, int(self.max_examples_per_microbatch * self.oom_shrink_B))
+            if new_B < self.max_examples_per_microbatch:
+                self.max_examples_per_microbatch = new_B
+                changed = True
+
+        # If B is None (unbounded) or already minimal, shrink token budget
+        if not changed:
+            if self.max_tokens_per_microbatch is not None and self.max_tokens_per_microbatch > self.oom_min_tokens:
+                new_T = max(self.oom_min_tokens, int(self.max_tokens_per_microbatch * self.oom_shrink_tokens))
+                if new_T < self.max_tokens_per_microbatch:
+                    self.max_tokens_per_microbatch = new_T
+                    # keep eval consistent-ish
+                    self.max_eval_tokens_per_microbatch = min(self.max_eval_tokens_per_microbatch, self.max_tokens_per_microbatch)
+                    changed = True
+
+        return changed
 
     @staticmethod
     def _pad_and_concat(arrays, pad_value: int):
@@ -125,7 +197,29 @@ class TokenPackTrainer(Seq2SeqTrainer):
             offset += n
 
         return out
-        
+
+    def _compact_microbatch(self, mb: dict) -> dict:
+        # Trim encoder side to max attention_mask sum in this microbatch
+        if "attention_mask" in mb and isinstance(mb["attention_mask"], torch.Tensor):
+            am = mb["attention_mask"]
+            if am.ndim == 2:
+                enc_max = int(am.sum(dim=-1).max().item())
+                enc_max = max(enc_max, 1)
+                for k in ("input_ids", "attention_mask"):
+                    if k in mb and isinstance(mb[k], torch.Tensor) and mb[k].ndim == 2:
+                        mb[k] = mb[k][:, :enc_max]
+
+        # Trim decoder side to max non -100 labels in this microbatch
+        if "labels" in mb and isinstance(mb["labels"], torch.Tensor):
+            lab = mb["labels"]
+            if lab.ndim == 2:
+                dec_max = int((lab != -100).sum(dim=-1).max().item())
+                dec_max = max(dec_max, 1)
+                for k in ("labels", "decoder_input_ids", "decoder_attention_mask"):
+                    if k in mb and isinstance(mb[k], torch.Tensor) and mb[k].ndim == 2:
+                        mb[k] = mb[k][:, :dec_max]
+
+        return mb
         
     def get_train_dataloader(self):
         if self.train_dataset is None:
@@ -366,6 +460,52 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 cpu_inputs[k] = v
         return cpu_inputs
 
+
+    def _maybe_adapt_limits(self):
+        if not torch.cuda.is_available():
+            return
+        total = torch.cuda.get_device_properties(self.args.device.index).total_memory
+        peak = torch.cuda.max_memory_allocated(self.args.device)
+        util = peak / total
+
+        # tune these
+        high = 0.92
+        low  = 0.80
+
+        # initialize state
+        if not hasattr(self, "_adapt_cooldown"):
+            self._adapt_cooldown = 0
+            self._stable_low_steps = 0
+
+        if self._adapt_cooldown > 0:
+            self._adapt_cooldown -= 1
+            return
+
+        if util > high:
+            # back off fast
+            if self.max_examples_per_microbatch is None:
+                self.max_examples_per_microbatch = 16  # pick a sane start
+            self.max_examples_per_microbatch = max(1, int(self.max_examples_per_microbatch * 0.7))
+            self._stable_low_steps = 0
+            self._adapt_cooldown = 10  # wait N steps before changing again
+
+        elif util < low:
+            self._stable_low_steps += 1
+            if self._stable_low_steps >= 10:
+                if self.max_examples_per_microbatch is None:
+                    self.max_examples_per_microbatch = 16
+                self.max_examples_per_microbatch = int(self.max_examples_per_microbatch * 1.15) + 1
+                self._stable_low_steps = 0
+                self._adapt_cooldown = 10
+        else:
+            self._stable_low_steps = 0
+
+        if self.control.should_log:
+            self.log({
+                "adaptive_vram_util": float(util),
+                "adaptive_max_B": float(self.max_examples_per_microbatch or 0),
+            })
+
     def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None):
         # Compute lengths
         enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
@@ -401,7 +541,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if cur_indices:
             microbatches.append(cur_indices)
 
-        return [self._slice_inputs(self, inputs, mb_idx) for mb_idx in microbatches]
+        return [self._compact_microbatch(self._slice_inputs(self, inputs, mb_idx)) for mb_idx in microbatches]
 
     def _plan_microbatches(self, inputs):
         """
@@ -993,131 +1133,106 @@ class TokenPackTrainer(Seq2SeqTrainer):
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        """
-        If use_cpu_microbatch:
-          - force full batch to CPU,
-          - compute lengths + truncate + plan microbatches on CPU,
-          - move only microbatches to GPU via _to_device.
-
-        Else:
-          - let HF/Accelerate handle device placement via _prepare_inputs,
-          - truncate + microbatch on that device (typically GPU).
-        """
         model.train()
 
-        # --- DEBUG: see where the batch lives when we first see it ---
-        #if "input_ids" in inputs and isinstance(inputs["input_ids"], torch.Tensor):
-            #print(f"[TokenPackTrainer] training_step got input_ids on device: {inputs['input_ids'].device}")
+        # turn off KV cache during training to reduce memory spikes
+        if hasattr(model, "config") and getattr(model.config, "use_cache", None) is True:
+            model.config.use_cache = False
 
-        # ---------------- CPU-microbatching path ----------------
-        if self.use_cpu_microbatch:
-            # Make absolutely sure everything is on CPU before we do any planning
-            inputs = self._move_to_cpu(inputs)
+        last_err = None
 
+        for attempt in range(self.oom_max_retries + 1):
             try:
-                # Compute lengths on CPU only
-                enc_len, dec_len, total_len = self._compute_lengths_enc_dec(inputs)
-            except Exception:
-                # If this is where an error hits, you'll still see it
-                raise
+                # ---------------- PLAN MICROBATCHE(S) ----------------
+                if self.use_cpu_microbatch:
+                    inputs_work = self._move_to_cpu(inputs)
+                    _ = self._compute_lengths_enc_dec(inputs_work)
+                    inputs_work = self._truncate_batch(inputs_work)
+                    microbatches = self._make_microbatches(inputs_work)
+                else:
+                    inputs_work = self._prepare_inputs(inputs)
+                    inputs_work = self._truncate_batch(inputs_work)
+                    _ = self._compute_lengths_enc_dec(inputs_work)
+                    microbatches = self._make_microbatches(inputs_work)
 
-            inputs = self._truncate_batch(inputs)
-            microbatches = self._make_microbatches(inputs)
+                num_micro = max(len(microbatches), 1)
+                total_loss = 0.0
+                total_examples = sum(mb["input_ids"].size(0) for mb in microbatches)
 
-        # ---------------- GPU-native microbatching path ----------------
-        else:
-            inputs = self._prepare_inputs(inputs)
-            inputs = self._truncate_batch(inputs)
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
 
-            enc_len, dec_len, total_len = self._compute_lengths_enc_dec(inputs)
-            microbatches = self._make_microbatches(inputs)
-
-            # --- DEBUG: log summary for this HF batch ---
-            with torch.no_grad():
-                mb_stats = []
+                # ---------------- EXECUTE MICROBATCHE(S) ----------------
                 for mb in microbatches:
-                    am_mb = mb["attention_mask"]
-                    enc_mb_len = am_mb.sum(dim=-1)                  # (B,)
-                    labels_mb = mb.get("labels", None)
-                    if labels_mb is not None and labels_mb.ndim == 2:
-                        dec_mb_len = (labels_mb != -100).sum(dim=-1)
-                    else:
-                        dec_mb_len = torch.zeros_like(enc_mb_len)
+                    if self.use_cpu_microbatch:
+                        mb = self._to_device(mb)
 
-                    total_mb_len = enc_mb_len + dec_mb_len
-                    mb_stats.append({
-                        "B": int(enc_mb_len.size(0)),
-                        "enc_tokens": int(enc_mb_len.sum().item()),
-                        "dec_tokens": int(dec_mb_len.sum().item()),
-                        "total_tokens": int(total_mb_len.sum().item()),
-                        "max_enc": int(enc_mb_len.max().item()),
-                        "max_dec": int(dec_mb_len.max().item()),
+                    if self.length_column_name in mb:
+                        mb = {k: v for k, v in mb.items() if k != self.length_column_name}
+
+                    bsz = mb["input_ids"].size(0)
+
+                    with self.compute_loss_context_manager():
+                        loss = self.compute_loss(model, mb)
+
+                    if isinstance(loss, tuple):
+                        loss = loss[0]
+
+                    loss = loss * (bsz / total_examples)
+
+                    if self.args.gradient_accumulation_steps > 1:
+                        loss = loss / self.args.gradient_accumulation_steps
+
+                    self.accelerator.backward(loss)
+                    total_loss += loss.detach().float()
+
+                avg_loss = total_loss / num_micro
+
+                # optional logging
+                if attempt > 0 and self.control.should_log:
+                    self.log({
+                        "oom_recovered": 1.0,
+                        "oom_recovery_attempt": float(attempt),
+                        "max_B_now": float(self.max_examples_per_microbatch or 0),
+                        "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
                     })
-                if self.debug:
-                    print("[DEBUG] HF batch has", len(microbatches), "microbatches")
-                    for j, s in enumerate(mb_stats[:4]):  # print only first few
-                        print(
-                            f"   mb{j}: B={s['B']}, "
-                            f"enc_tokens={s['enc_tokens']}, dec_tokens={s['dec_tokens']}, "
-                            f"total={s['total_tokens']}, "
-                            f"max_enc={s['max_enc']}, max_dec={s['max_dec']}"
-                        )
 
-        # ---------------- Common microbatch execution ----------------
-        num_micro = max(len(microbatches), 1)
-        total_loss = 0.0
-        total_examples = sum(mb["input_ids"].size(0) for mb in microbatches)
+                return avg_loss
 
-        torch.cuda.reset_peak_memory_stats()
-        before = torch.cuda.memory_allocated()
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                if not self._is_cuda_oom(e):
+                    raise
 
-        for mb_idx, mb in enumerate(microbatches):
-            if self.use_cpu_microbatch:
-                mb = self._to_device(mb)
+                last_err = e
+                self._oom_events += 1
 
-            # 🔹 Drop length column so it never reaches the model
-            if self.length_column_name in mb:
-                mb = {k: v for k, v in mb.items() if k != self.length_column_name}
+                # cleanup + shrink + retry
+                self._oom_cleanup()
+                changed = self._oom_shrink_limits()
 
-            bsz = mb["input_ids"].size(0)
+                if self.control.should_log:
+                    self.log({
+                        "oom_event": 1.0,
+                        "oom_attempt": float(attempt),
+                        "oom_changed_limits": float(1.0 if changed else 0.0),
+                        "max_B_now": float(self.max_examples_per_microbatch or 0),
+                        "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
+                    })
 
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, mb)
+                if not changed:
+                    # We’re already at minimums; no point retrying forever
+                    break
 
-            if isinstance(loss, tuple):
-                loss = loss[0]
+                continue
 
-            loss = loss * (bsz / total_examples)
+        # ---------------- OUT OF RETRIES ----------------
+        if self.oom_skip_batch_on_fail:
+            self._oom_skipped_batches += 1
+            if self.control.should_log:
+                self.log({"oom_skipped_batch": 1.0, "oom_skipped_batches_total": float(self._oom_skipped_batches)})
 
-            if self.args.gradient_accumulation_steps > 1:
-                loss = loss / self.args.gradient_accumulation_steps
+            # Return a zero loss tensor (keeps trainer moving)
+            return torch.tensor(0.0, device=self.args.device)
 
-            self.accelerator.backward(loss)
-            total_loss += loss.detach().float()
-
-            # --- DEBUG: memory after this microbatch ---
-            if self.debug:
-                after = torch.cuda.memory_allocated()
-                peak = torch.cuda.max_memory_allocated()
-                print(
-                    f"[DEBUG] mb {mb_idx}: mem_alloc={after/1e9:.2f} GB, "
-                    f"peak={peak/1e9:.2f} GB"
-                )
-
-        avg_loss = total_loss / num_micro
-
-        if (
-            self.log_longest_every > 0
-            and self.state.global_step > 0
-            and (self.state.global_step % self.log_longest_every == 0)
-        ):
-            self.log(
-                {
-                    "max_seen_enc_len":   float(self._max_seen_enc_len),
-                    "max_seen_dec_len":   float(self._max_seen_dec_len),
-                    "max_seen_total_len": float(self._max_seen_total_len),
-                    "num_trunc_hits":     float(self._num_trunc_hits),
-                }
-            )
-
-        return avg_loss
+        # Otherwise, crash like normal
+        raise last_err
