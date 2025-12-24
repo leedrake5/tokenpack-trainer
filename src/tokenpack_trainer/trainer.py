@@ -489,24 +489,21 @@ class TokenPackTrainer(Seq2SeqTrainer):
             total_examples = 0
 
             for mb in microbatches:
-                bsz = mb["input_ids"].size(0)
-                total_examples += bsz
-
-                mb = self._to_device(mb)
-
-                # 🔹 drop length column
-                if self.length_column_name in mb:
-                    mb = {k: v for k, v in mb.items() if k != self.length_column_name}
+                labels = mb.get("labels", None)
+                if labels is None:
+                    continue
+                num_tokens = int((labels != -100).sum().item())
+                if num_tokens == 0:
+                    continue
 
                 with torch.no_grad():
                     with self.compute_loss_context_manager():
                         loss_mb = self.compute_loss(model, mb, return_outputs=False)
-
                 if isinstance(loss_mb, tuple):
                     loss_mb = loss_mb[0]
 
-                loss_mb = loss_mb.detach()
-                total_loss += loss_mb * bsz
+                total_loss_tokens += loss_mb.detach() * num_tokens
+                total_tokens += num_tokens
                 print(
                     "mb shapes:",
                     mb["input_ids"].shape,
@@ -540,21 +537,21 @@ class TokenPackTrainer(Seq2SeqTrainer):
         total_examples = 0
 
         for mb in microbatches:
-            bsz = mb["input_ids"].size(0)
-            total_examples += bsz
-
-            if self.length_column_name in mb:
-                mb = {k: v for k, v in mb.items() if k != self.length_column_name}
+            labels = mb.get("labels", None)
+            if labels is None:
+                continue
+            num_tokens = int((labels != -100).sum().item())
+            if num_tokens == 0:
+                continue
 
             with torch.no_grad():
                 with self.compute_loss_context_manager():
                     loss_mb = self.compute_loss(model, mb, return_outputs=False)
-
             if isinstance(loss_mb, tuple):
                 loss_mb = loss_mb[0]
 
-            total_loss += loss_mb.detach() * bsz
-
+            total_loss_tokens += loss_mb.detach() * num_tokens
+            total_tokens += num_tokens
         avg_loss = total_loss / max(total_examples, 1)
         return (avg_loss, None, None)
 
@@ -598,39 +595,105 @@ class TokenPackTrainer(Seq2SeqTrainer):
     # Token-aware evaluation with metrics
     # --------------------------------------------------------------
 
-    def _token_aware_evaluate(
-        self,
-        eval_dataset=None,
-        max_eval_tokens_per_microbatch: int | None = None,
-        desc: str = "Eval (token-aware)",
-    ):
-        import time
+    def _token_aware_evaluate(...):
+        import time, random, numpy as np, torch
         from tqdm.auto import tqdm
 
-        self.model.eval()
+        py_state = random.getstate()
+        np_state = np.random.get_state()
 
-        if eval_dataset is None:
-            eval_dataset = self.eval_dataset
-        if eval_dataset is None:
-            raise ValueError("Need an eval_dataset for token-aware evaluation.")
+        devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=devices):
+            try:
+                # Deterministic eval RNG (inside fork_rng)
+                torch.manual_seed(0)
+                np.random.seed(0)
+                random.seed(0)
 
-        # 1) Basic dataloader (no token-budgeting here; we control size via per_device_eval_batch_size)
-        dataloader = self.get_eval_dataloader(eval_dataset)
+                if eval_dataset is None:
+                    eval_dataset = self.eval_dataset
+                if eval_dataset is None:
+                    raise ValueError("Need an eval_dataset for token-aware evaluation.")
 
-        if getattr(self, "compute_metrics", None) is None:
-            # Loss-only eval loop (no generate)
-            total_eval_loss = 0.0
-            total_eval_tokens = 0
+                dataloader = self.get_eval_dataloader(eval_dataset)
+
+                # --- loss-only path ---
+                if getattr(self, "compute_metrics", None) is None:
+                    total_eval_loss = 0.0
+                    total_eval_tokens = 0
+                    num_steps = 0
+                    num_examples = 0
+                    start_time = time.time()
+
+                    for batch in dataloader:
+                        num_steps += 1
+                        labels = batch.get("labels", None)
+                        if labels is None:
+                            raise ValueError("Eval dataset must have labels to compute eval_loss.")
+
+                        with torch.no_grad():
+                            loss, _, _ = self.prediction_step(
+                                self.model, batch, prediction_loss_only=True, ignore_keys=None
+                            )
+
+                        # NOTE: best is to use tokens actually used in prediction_step,
+                        # but this is OK if prediction_step doesn't change labels.
+                        num_tokens = int((labels.detach().to("cpu") != -100).sum().item())
+                        if loss is not None and num_tokens > 0:
+                            total_eval_loss += float(loss.item()) * num_tokens
+                            total_eval_tokens += num_tokens
+
+                        num_examples += int(labels.size(0))
+
+                    runtime = time.time() - start_time
+                    eval_loss = total_eval_loss / total_eval_tokens if total_eval_tokens > 0 else float("nan")
+
+                    metrics = {
+                        "eval_loss": float(eval_loss),
+                        "eval_runtime": float(runtime),
+                        "eval_samples_per_second": float(num_examples / runtime) if runtime > 0 else 0.0,
+                        "eval_steps_per_second": float(num_steps / runtime) if runtime > 0 else 0.0,
+                    }
+                    return metrics
+
+
+            # 2) Build generation kwargs like HF does
+            gen_kwargs: dict[str, Any] = {}
+
+            if self.args.generation_max_length is not None:
+                gen_kwargs["max_length"] = self.args.generation_max_length
+            if self.args.generation_num_beams is not None:
+                gen_kwargs["num_beams"] = self.args.generation_num_beams
+
+            if getattr(self.args, "do_sample", False):
+                gen_kwargs["do_sample"] = True
+                if self.args.top_k is not None:
+                    gen_kwargs["top_k"] = self.args.top_k
+                if self.args.top_p is not None:
+                    gen_kwargs["top_p"] = self.args.top_p
+
+            # Merge with any internally-prepared _gen_kwargs
+            if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
+                tmp = self._gen_kwargs.copy()
+                tmp.update(gen_kwargs)
+                gen_kwargs = tmp
+
+            # 3) Loop with tqdm + collect preds/labels
+            all_preds = []
+            all_labels = []
+
             num_steps = 0
             num_examples = 0
+
+            total_eval_loss = 0.0
+            total_eval_tokens = 0
+
             start_time = time.time()
 
-            for batch in dataloader:
+            for batch in tqdm(dataloader, desc=desc, leave=False):
                 num_steps += 1
-                labels = batch.get("labels", None)
-                if labels is None:
-                    raise ValueError("Eval dataset must have labels to compute eval_loss.")
 
+                # 1) Loss with our microbatch-aware prediction_step
                 with torch.no_grad():
                     loss, _, _ = self.prediction_step(
                         self.model,
@@ -639,198 +702,134 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         ignore_keys=None,
                     )
 
-                labels_cpu = labels.detach().to("cpu")
-                num_tokens = int((labels_cpu != -100).sum().item())
-                if loss is not None and num_tokens > 0:
+                labels = batch.get("labels", None)
+                if labels is None:
+                    raise ValueError("Eval dataset must have labels for metric computation.")
+
+                if loss is not None:
+                    # Move labels to CPU just for counting tokens
+                    labels_cpu = labels.detach().to("cpu")
+                    num_tokens = int((labels_cpu != -100).sum().item())
                     total_eval_loss += float(loss.item()) * num_tokens
                     total_eval_tokens += num_tokens
 
-                num_examples += int(labels.size(0))
+                batch_size = labels.size(0)
+                num_examples += int(batch_size)
 
-            runtime = time.time() - start_time
-            eval_loss = total_eval_loss / total_eval_tokens if total_eval_tokens > 0 else float("nan")
+                # 2) Now prepare inputs for generation (separate from loss)
+                batch = self._prepare_inputs(batch)
+
+                # Drop labels & input_length from generation kwargs
+                ignore_keys = {
+                    "labels",
+                    self.length_column_name,
+                    "decoder_input_ids",
+                    "decoder_attention_mask",
+                }
+                gen_inputs = {k: v for k, v in batch.items() if k not in ignore_keys}
+
+                # 3) Fast generation with use_cache=True
+                orig_use_cache = getattr(self.model.config, "use_cache", True)
+                self.model.config.use_cache = True
+                with torch.no_grad():
+                    generated_tokens = self.model.generate(
+                        **gen_inputs,
+                        **gen_kwargs,
+                    )
+                self.model.config.use_cache = orig_use_cache
+
+                if generated_tokens.ndim == 1:
+                    generated_tokens = generated_tokens.unsqueeze(0)
+
+                all_preds.append(generated_tokens.cpu().numpy())
+                all_labels.append(labels.cpu().numpy())
+
+            end_time = time.time()
+            runtime = end_time - start_time if num_steps > 0 else 0.0
+
+            # 4) Concatenate + call compute_metrics
+            if len(all_preds) == 0:
+                # No batches? Return zeros instead of crashing.
+                raw_metrics = {
+                    "bleu": 0.0,
+                    "chrf": 0.0,
+                    "meteor": 0.0,
+                    "gen_len": 0.0,
+                }
+            else:
+                # ---- PAD PREDICTIONS TO COMMON LENGTH ----
+                # all_preds: list of (B_i, L_pred_i)
+                max_pred_len = max(p.shape[1] for p in all_preds)
+                pad_id = self.processing_class.pad_token_id
+                if pad_id is None:
+                    pad_id = 0  # very safe fallback
+
+                padded_preds = []
+                for p in all_preds:
+                    if p.shape[1] < max_pred_len:
+                        pad_width = max_pred_len - p.shape[1]
+                        p = np.pad(
+                            p,
+                            pad_width=((0, 0), (0, pad_width)),
+                            mode="constant",
+                            constant_values=pad_id,
+                        )
+                    padded_preds.append(p)
+                preds = np.concatenate(padded_preds, axis=0)
+
+                # ---- PAD LABELS TO COMMON LENGTH ----
+                # all_labels: list of (B_i, L_label_i)
+                max_label_len = max(l.shape[1] for l in all_labels)
+                padded_labels = []
+                for l in all_labels:
+                    if l.shape[1] < max_label_len:
+                        pad_width = max_label_len - l.shape[1]
+                        l = np.pad(
+                            l,
+                            pad_width=((0, 0), (0, pad_width)),
+                            mode="constant",
+                            constant_values=-100,  # ignore index
+                        )
+                    padded_labels.append(l)
+                labels = np.concatenate(padded_labels, axis=0)
+
+                compute_metrics_fn = getattr(self, "compute_metrics", None)
+                if compute_metrics_fn is None:
+                    # No metrics function provided: return loss-only metrics
+                    raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
+                else:
+                    raw_metrics = compute_metrics_fn((preds, labels))
+
+                # (N, max_pred_len), (N, max_label_len)
+                #raw_metrics = self.compute_metrics((preds, labels))
+                # raw_metrics is assumed to contain {"bleu": ..., "chrf": ..., "meteor": ..., "gen_len": ...}
+
+            # 5) Convert to HF-style eval_* keys + runtime stats
+            eval_loss = (
+                total_eval_loss / total_eval_tokens
+                if total_eval_tokens > 0
+                else float("nan")
+            )
 
             metrics = {
-                "eval_loss": float(eval_loss),
-                "eval_runtime": float(runtime),
-                "eval_samples_per_second": float(num_examples / runtime) if runtime > 0 else 0.0,
-                "eval_steps_per_second": float(num_steps / runtime) if runtime > 0 else 0.0,
-                "eval_gen_len": 0.0,
-                "eval_bleu": 0.0,
-                "eval_chrf": 0.0,
-                "eval_meteor": 0.0,
+                "eval_loss":   float(eval_loss),
+                "eval_bleu":   float(raw_metrics.get("bleu", 0.0)),
+                "eval_chrf":   float(raw_metrics.get("chrf", 0.0)),
+                "eval_meteor": float(raw_metrics.get("meteor", 0.0)),
+                "eval_gen_len": float(raw_metrics.get("gen_len", 0.0)),
             }
+
+            if runtime > 0 and num_steps > 0:
+                metrics["eval_runtime"] = float(runtime)
+                metrics["eval_samples_per_second"] = float(num_examples / runtime)
+                metrics["eval_steps_per_second"] = float(num_steps / runtime)
+
             return metrics
-
-
-        # 2) Build generation kwargs like HF does
-        gen_kwargs: dict[str, Any] = {}
-
-        if self.args.generation_max_length is not None:
-            gen_kwargs["max_length"] = self.args.generation_max_length
-        if self.args.generation_num_beams is not None:
-            gen_kwargs["num_beams"] = self.args.generation_num_beams
-
-        if getattr(self.args, "do_sample", False):
-            gen_kwargs["do_sample"] = True
-            if self.args.top_k is not None:
-                gen_kwargs["top_k"] = self.args.top_k
-            if self.args.top_p is not None:
-                gen_kwargs["top_p"] = self.args.top_p
-
-        # Merge with any internally-prepared _gen_kwargs
-        if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
-            tmp = self._gen_kwargs.copy()
-            tmp.update(gen_kwargs)
-            gen_kwargs = tmp
-
-        # 3) Loop with tqdm + collect preds/labels
-        all_preds = []
-        all_labels = []
-
-        num_steps = 0
-        num_examples = 0
-
-        total_eval_loss = 0.0
-        total_eval_tokens = 0
-
-        start_time = time.time()
-
-        for batch in tqdm(dataloader, desc=desc, leave=False):
-            num_steps += 1
-
-            # 1) Loss with our microbatch-aware prediction_step
-            with torch.no_grad():
-                loss, _, _ = self.prediction_step(
-                    self.model,
-                    batch,
-                    prediction_loss_only=True,
-                    ignore_keys=None,
-                )
-
-            labels = batch.get("labels", None)
-            if labels is None:
-                raise ValueError("Eval dataset must have labels for metric computation.")
-
-            if loss is not None:
-                # Move labels to CPU just for counting tokens
-                labels_cpu = labels.detach().to("cpu")
-                num_tokens = int((labels_cpu != -100).sum().item())
-                total_eval_loss += float(loss.item()) * num_tokens
-                total_eval_tokens += num_tokens
-
-            batch_size = labels.size(0)
-            num_examples += int(batch_size)
-
-            # 2) Now prepare inputs for generation (separate from loss)
-            batch = self._prepare_inputs(batch)
-
-            # Drop labels & input_length from generation kwargs
-            ignore_keys = {
-                "labels",
-                self.length_column_name,
-                "decoder_input_ids",
-                "decoder_attention_mask",
-            }
-            gen_inputs = {k: v for k, v in batch.items() if k not in ignore_keys}
-
-            # 3) Fast generation with use_cache=True
-            orig_use_cache = getattr(self.model.config, "use_cache", True)
-            self.model.config.use_cache = True
-            with torch.no_grad():
-                generated_tokens = self.model.generate(
-                    **gen_inputs,
-                    **gen_kwargs,
-                )
-            self.model.config.use_cache = orig_use_cache
-
-            if generated_tokens.ndim == 1:
-                generated_tokens = generated_tokens.unsqueeze(0)
-
-            all_preds.append(generated_tokens.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
-
-        end_time = time.time()
-        runtime = end_time - start_time if num_steps > 0 else 0.0
-
-        # 4) Concatenate + call compute_metrics
-        if len(all_preds) == 0:
-            # No batches? Return zeros instead of crashing.
-            raw_metrics = {
-                "bleu": 0.0,
-                "chrf": 0.0,
-                "meteor": 0.0,
-                "gen_len": 0.0,
-            }
-        else:
-            # ---- PAD PREDICTIONS TO COMMON LENGTH ----
-            # all_preds: list of (B_i, L_pred_i)
-            max_pred_len = max(p.shape[1] for p in all_preds)
-            pad_id = self.processing_class.pad_token_id
-            if pad_id is None:
-                pad_id = 0  # very safe fallback
-
-            padded_preds = []
-            for p in all_preds:
-                if p.shape[1] < max_pred_len:
-                    pad_width = max_pred_len - p.shape[1]
-                    p = np.pad(
-                        p,
-                        pad_width=((0, 0), (0, pad_width)),
-                        mode="constant",
-                        constant_values=pad_id,
-                    )
-                padded_preds.append(p)
-            preds = np.concatenate(padded_preds, axis=0)
-
-            # ---- PAD LABELS TO COMMON LENGTH ----
-            # all_labels: list of (B_i, L_label_i)
-            max_label_len = max(l.shape[1] for l in all_labels)
-            padded_labels = []
-            for l in all_labels:
-                if l.shape[1] < max_label_len:
-                    pad_width = max_label_len - l.shape[1]
-                    l = np.pad(
-                        l,
-                        pad_width=((0, 0), (0, pad_width)),
-                        mode="constant",
-                        constant_values=-100,  # ignore index
-                    )
-                padded_labels.append(l)
-            labels = np.concatenate(padded_labels, axis=0)
-
-            compute_metrics_fn = getattr(self, "compute_metrics", None)
-            if compute_metrics_fn is None:
-                # No metrics function provided: return loss-only metrics
-                raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
-            else:
-                raw_metrics = compute_metrics_fn((preds, labels))
-
-            # (N, max_pred_len), (N, max_label_len)
-            raw_metrics = self.compute_metrics((preds, labels))
-            # raw_metrics is assumed to contain {"bleu": ..., "chrf": ..., "meteor": ..., "gen_len": ...}
-
-        # 5) Convert to HF-style eval_* keys + runtime stats
-        eval_loss = (
-            total_eval_loss / total_eval_tokens
-            if total_eval_tokens > 0
-            else float("nan")
-        )
-
-        metrics = {
-            "eval_loss":   float(eval_loss),
-            "eval_bleu":   float(raw_metrics.get("bleu", 0.0)),
-            "eval_chrf":   float(raw_metrics.get("chrf", 0.0)),
-            "eval_meteor": float(raw_metrics.get("meteor", 0.0)),
-            "eval_gen_len": float(raw_metrics.get("gen_len", 0.0)),
-        }
-
-        if runtime > 0 and num_steps > 0:
-            metrics["eval_runtime"] = float(runtime)
-            metrics["eval_samples_per_second"] = float(num_examples / runtime)
-            metrics["eval_steps_per_second"] = float(num_steps / runtime)
-
-        return metrics
+            
+        finally:
+            # fork_rng restores torch + cuda automatically
+            np.random.set_state(np_state)
+            random.setstate(py_state)
         
     # --------------------------------------------------------------
     # OOM handling + emergency checkpoint
