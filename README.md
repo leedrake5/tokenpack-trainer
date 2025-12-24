@@ -357,6 +357,91 @@ max_examples_per_microbatch = 28
 
 This turns token count — not batch size — into the primary unit of compute control.
 
+## Adaptive Microbatch Limits (Automatic OOM-Aware Evaluation & Training)
+
+This trainer automatically adapts microbatch size and token budgets during both training and evaluation to maximize throughput while remaining robust to CUDA out-of-memory (OOM) events.
+
+Two limits are adjusted dynamically:
+    •    max_examples_per_microbatch (B)
+Maximum number of examples in a single microbatch.
+    •    max_tokens_per_microbatch / max_eval_tokens_per_microbatch (T)
+Maximum effective token budget per microbatch
+(encoder tokens + weighted decoder tokens).
+
+The goal is to push GPU utilization as high as possible without crashing, even when sequence lengths vary widely.
+
+### How the Adaptive System Behaves (High-Level)
+
+Rather than using a fixed microbatch size, the trainer:
+    1.    Starts from user-provided limits (often intentionally aggressive).
+    2.    Plans microbatches based on actual token counts, not example count alone.
+    3.    Detects OOM events at runtime.
+    4.    Automatically shrinks limits (first B, then T) only when needed.
+    5.    Remembers stable limits per length regime.
+    6.    Gradually ramps limits back up after repeated successful steps.
+
+This allows the trainer to:
+    •    Run short sequences at very high throughput.
+    •    Safely handle rare long-context batches.
+    •    Avoid manual re-tuning when dataset characteristics change.
+
+
+### Regime-Aware Adaptation (Why It’s Stable)
+
+Microbatch limits are tracked per length regime, where a regime is defined by the effective sequence length:
+
+```python
+effective_length = encoder_length + α × decoder_length
+```
+
+Batches with similar effective lengths share the same regime and therefore:
+    •    Learn their own stable (B, T) limits.
+    •    Do not penalize shorter or unrelated batches after an OOM.
+    •    Recover quickly when sequence distributions shift.
+
+This is especially important for mixed-length corpora and curriculum-style datasets.
+
+### Recommended Starting Values (Important)
+
+It is intentional and recommended to start with optimistic values.
+
+```python
+max_examples_per_microbatch = 128
+max_eval_tokens_per_microbatch = 4096
+```
+
+This often yields maximum throughput immediately on short or average-length batches.
+
+### Note on early OOMs
+
+Starting with a high B (e.g. 128) can trigger OOM events early in training
+or evaluation when a long-context batch is encountered.
+This is expected and safe:
+    •    The trainer catches the OOM
+    •    Automatically shrinks B (and/or T)
+    •    Retries the batch
+    •    Continues without crashing
+
+In practice, this converges quickly to a stable, regime-specific limit and
+avoids permanent under-utilization.
+
+If you prefer fewer early OOMs, start with a smaller B (e.g. 32–64),
+at the cost of lower initial throughput.
+
+⸻
+
+Evaluation vs Training
+
+Evaluation uses the same adaptive logic, but with a separate token budget:
+    •    max_eval_tokens_per_microbatch
+
+This allows:
+    •    Conservative evaluation on long sequences.
+    •    High-throughput evaluation on short sequences.
+    •    Safe generation-based metrics without manual tuning.
+
+The evaluation budget is always kept ≤ the training budget to avoid surprises.
+
 ------------------------------------------------------------------------
 
 ## License
