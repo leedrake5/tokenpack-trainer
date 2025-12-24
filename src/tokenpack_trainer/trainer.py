@@ -637,7 +637,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if cur_indices:
             microbatches.append(cur_indices)
 
-    return [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
+        return [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
 
     def _plan_microbatches(self, inputs):
         """
