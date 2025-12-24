@@ -481,41 +481,26 @@ class TokenPackTrainer(Seq2SeqTrainer):
         return enc_len, dec_len, total_len
 
     @staticmethod
-    def _slice_inputs(self_or_none, inputs, indices):
-        """
-        Slice a dict of tensors along the batch dimension for the given indices.
-        Non-tensor values or tensors with mismatched batch dims are passed through.
-
-        This function does NOT *change* device of the batch; it just matches the
-        device of the index tensor to whatever the batch tensors are already on.
-        """
+    def _slice_inputs(self, inputs: dict, indices: list[int]) -> dict:
         if not indices:
             return inputs
 
-        # Find an example tensor to infer device
-        example_tensor = None
-        for v in inputs.values():
-            if isinstance(v, torch.Tensor):
-                example_tensor = v
-                break
-
+        # infer device from any tensor in inputs
+        example_tensor = next((v for v in inputs.values() if isinstance(v, torch.Tensor)), None)
         device = example_tensor.device if example_tensor is not None else torch.device("cpu")
         idx = torch.as_tensor(indices, dtype=torch.long, device=device)
 
-        out = {}
+        # infer batch dim from input_ids if present
         batch_dim = None
         if "input_ids" in inputs and isinstance(inputs["input_ids"], torch.Tensor):
             batch_dim = inputs["input_ids"].size(0)
 
+        out = {}
         for k, v in inputs.items():
-            if isinstance(v, torch.Tensor):
-                if batch_dim is not None and v.size(0) == batch_dim:
-                    out[k] = v.index_select(0, idx)
-                else:
-                    out[k] = v
+            if isinstance(v, torch.Tensor) and batch_dim is not None and v.ndim >= 1 and v.size(0) == batch_dim:
+                out[k] = v.index_select(0, idx)
             else:
                 out[k] = v
-
         return out
 
     # ------------------------------------------------------------------
@@ -648,7 +633,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if cur_indices:
             microbatches.append(cur_indices)
 
-        return [self._compact_microbatch(self._slice_inputs(self, inputs, mb_idx)) for mb_idx in microbatches]
+        return [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
 
     def _plan_microbatches(self, inputs):
         """
@@ -701,12 +686,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         prediction_loss_only: bool = False,
         ignore_keys: Optional[List[str]] = None,
     ):
-    
-        #if self.length_column_name in inputs:
-        #    inputs = {k: v for k, v in inputs.items() if k != self.length_column_name}
-
-        # If we need logits/labels, or no microbatching, just use the base implementation
-        if (not prediction_loss_only) or (self.max_tokens_per_microbatch is None):
+        # If caller wants logits/labels, let HF handle it
+        if not prediction_loss_only or self.max_tokens_per_microbatch is None:
             return super().prediction_step(
                 model,
                 inputs,
@@ -714,12 +695,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 ignore_keys=ignore_keys,
             )
 
-        
         model.eval()
 
-        # -----------------------------
-        # CPU-microbatching path
-        # -----------------------------
+        # ------------- CPU microbatch path -------------
         if self.use_cpu_microbatch:
             inputs_cpu = self._move_to_cpu(inputs)
             inputs_cpu = self._truncate_batch(inputs_cpu)
@@ -728,79 +706,81 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 inputs_cpu,
                 max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
             )
-
             if not microbatches:
                 return (None, None, None)
 
-            total_loss = 0.0
-            total_examples = 0
+            total_loss_tokens = 0.0
+            total_tokens = 0
 
             for mb in microbatches:
                 labels = mb.get("labels", None)
-                if labels is None:
+                if not (isinstance(labels, torch.Tensor) and labels.ndim == 2):
                     continue
-                num_tokens = int((labels != -100).sum().item())
-                if num_tokens == 0:
+                ntok = int((labels != -100).sum().item())
+                if ntok == 0:
                     continue
+
+                mb = self._to_device(mb)
+
+                if self.length_column_name in mb:
+                    mb = {k: v for k, v in mb.items() if k != self.length_column_name}
 
                 with torch.no_grad():
                     with self.compute_loss_context_manager():
                         loss_mb = self.compute_loss(model, mb, return_outputs=False)
+
                 if isinstance(loss_mb, tuple):
                     loss_mb = loss_mb[0]
 
-                total_loss_tokens += loss_mb.detach() * num_tokens
-                total_tokens += num_tokens
-                print(
-                    "mb shapes:",
-                    mb["input_ids"].shape,
-                    mb["attention_mask"].shape,
-                    "labels" in mb and mb["labels"].shape,
-                )
+                total_loss_tokens += float(loss_mb.detach().item()) * ntok
+                total_tokens += ntok
 
-
-            if total_examples == 0:
+            if total_tokens == 0:
                 return (None, None, None)
 
-            avg_loss = total_loss / total_examples
-            return (avg_loss, None, None)
+            avg_loss = total_loss_tokens / total_tokens
+            return (torch.tensor(avg_loss, device=self.args.device), None, None)
 
-        # -----------------------------
-        # GPU-native microbatching path
-        # (mirrors training_step)
-        # -----------------------------
+        # ------------- GPU-native microbatch path -------------
         inputs = self._prepare_inputs(inputs)
         inputs = self._truncate_batch(inputs)
 
         microbatches = self._make_microbatches(
             inputs,
-            max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,  # IMPORTANT
+            max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
         )
-
         if not microbatches:
             return (None, None, None)
 
-        total_loss = 0.0
-        total_examples = 0
+        total_loss_tokens = 0.0
+        total_tokens = 0
 
         for mb in microbatches:
             labels = mb.get("labels", None)
-            if labels is None:
+            if not (isinstance(labels, torch.Tensor) and labels.ndim == 2):
                 continue
-            num_tokens = int((labels != -100).sum().item())
-            if num_tokens == 0:
+            ntok = int((labels != -100).sum().item())
+            if ntok == 0:
                 continue
+
+            if self.length_column_name in mb:
+                mb = {k: v for k, v in mb.items() if k != self.length_column_name}
 
             with torch.no_grad():
                 with self.compute_loss_context_manager():
                     loss_mb = self.compute_loss(model, mb, return_outputs=False)
+
             if isinstance(loss_mb, tuple):
                 loss_mb = loss_mb[0]
 
-            total_loss_tokens += loss_mb.detach() * num_tokens
-            total_tokens += num_tokens
-        avg_loss = total_loss / max(total_examples, 1)
-        return (avg_loss, None, None)
+            total_loss_tokens += float(loss_mb.detach().item()) * ntok
+            total_tokens += ntok
+
+        if total_tokens == 0:
+            return (None, None, None)
+
+        avg_loss = total_loss_tokens / total_tokens
+        return (torch.tensor(avg_loss, device=self.args.device), None, None)
 
     def get_eval_dataloader(self, eval_dataset=None):
         if eval_dataset is None:
@@ -1298,30 +1278,44 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     torch.cuda.reset_peak_memory_stats()
 
                 # ---------------- EXECUTE MICROBATCHE(S) ----------------
+                total_tokens = 0
+                mb_token_counts = []
                 for mb in microbatches:
+                    labels = mb.get("labels", None)
+                    ntok = int((labels != -100).sum().item()) if (isinstance(labels, torch.Tensor) and labels.ndim == 2) else 0
+                    mb_token_counts.append(ntok)
+                    total_tokens += ntok
+
+                total_loss_weighted = 0.0
+
+                for mb, ntok in zip(microbatches, mb_token_counts):
+                    if ntok == 0:
+                        continue
+
                     if self.use_cpu_microbatch:
                         mb = self._to_device(mb)
 
                     if self.length_column_name in mb:
                         mb = {k: v for k, v in mb.items() if k != self.length_column_name}
 
-                    bsz = mb["input_ids"].size(0)
-
                     with self.compute_loss_context_manager():
-                        loss = self.compute_loss(model, mb)
+                        loss_mb = self.compute_loss(model, mb)   # mean over tokens in this mb
 
-                    if isinstance(loss, tuple):
-                        loss = loss[0]
+                    if isinstance(loss_mb, tuple):
+                        loss_mb = loss_mb[0]
 
-                    loss = loss * (bsz / total_examples)
+                    weight = ntok / max(total_tokens, 1)
+                    loss = loss_mb * weight
 
                     if self.args.gradient_accumulation_steps > 1:
                         loss = loss / self.args.gradient_accumulation_steps
 
                     self.accelerator.backward(loss)
-                    total_loss += loss.detach().float()
 
-                avg_loss = total_loss / num_micro
+                    total_loss_weighted += (loss_mb.detach().float() * weight)
+
+                # Return a sane scalar for logging
+                return total_loss_weighted
 
                 # >>> on success, mark this regime as stable and possibly ramp up
                 if regime_key is not None:
