@@ -1132,11 +1132,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         """
         eval_mode:
           - None / "hf": use standard HF evaluation_loop
-          - "token_aware_metrics": use our custom generation+metrics with tqdm,
-            but log/save metrics similarly to HF, without the extra
-            '***** eval metrics *****' banner from log_metrics().
+          - "token_aware_metrics": use our custom generation+metrics
         """
-        # Pick mode: explicit arg wins, else trainer.default
         mode = eval_mode or getattr(self, "eval_mode", None)
 
         # -----------------------------
@@ -1148,51 +1145,26 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if eval_dataset is None:
                 raise ValueError("Evaluation requires an eval_dataset.")
 
-            compute_metrics_fn = getattr(self, "compute_metrics", None)
-            if compute_metrics_fn is None:
-                # No metrics function provided: return loss-only metrics
-                raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
-            else:
-                raw_metrics = compute_metrics_fn((preds, labels))
-
             start_time = time.time()
-            raw_metrics = self._token_aware_evaluate(
+            metrics = self._token_aware_evaluate(
                 eval_dataset=eval_dataset,
                 max_eval_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
                 desc="eval (token-aware)",
             )
             runtime = time.time() - start_time
 
-            num_samples = len(eval_dataset)
-            batch_size = self.args.per_device_eval_batch_size
-            num_steps = (num_samples + batch_size - 1) // batch_size
-
-            # Add runtime stats (if _token_aware_evaluate didn't already)
-            raw_metrics.setdefault("eval_runtime", float(runtime))
-            raw_metrics.setdefault(
-                "eval_samples_per_second",
-                float(num_samples / runtime) if runtime > 0 else 0.0,
-            )
-            raw_metrics.setdefault(
-                "eval_steps_per_second",
-                float(num_steps / runtime) if runtime > 0 else 0.0,
-            )
+            # If _token_aware_evaluate didn't add runtime stats, add them
+            metrics.setdefault("eval_runtime", float(runtime))
 
             # Attach epoch info (like HF)
             if self.state.epoch is not None:
-                raw_metrics[f"{metric_key_prefix}_epoch"] = self.state.epoch
-                raw_metrics["epoch"] = self.state.epoch
+                metrics[f"{metric_key_prefix}_epoch"] = self.state.epoch
+                metrics["epoch"] = self.state.epoch
 
-            metrics = raw_metrics
-
-            # 1) Log to the underlying logger (goes to console + WandB/TF via HF)
+            # Log to integrations (wandb/tensorboard) + keep trainer_state.json consistent
             self.log(metrics)
-
-            # 2) Append to log_history so it lands in trainer_state.json
-            #    (this is normally done inside log_metrics)
             self.state.log_history.append(metrics)
 
-            # 3) OPTIONAL: detailed print:
             if self.is_world_process_zero():
                 logger.info("***** eval results (token-aware) *****")
                 for k in sorted(metrics.keys()):
