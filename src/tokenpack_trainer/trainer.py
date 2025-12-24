@@ -1121,15 +1121,24 @@ class TokenPackTrainer(Seq2SeqTrainer):
     # Core override
     # --------------------------------------------------------------
 
+    def _contiguous_inputs(self, inputs: dict) -> dict:
+        out = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor) and not v.is_contiguous():
+                out[k] = v.contiguous()
+            else:
+                out[k] = v
+        return out
+
     def compute_loss(self, model, inputs, return_outputs=False):
-        # Strip length column if present
         if self.length_column_name in inputs:
             inputs = {k: v for k, v in inputs.items() if k != self.length_column_name}
 
-        outputs = model(**inputs)
-        # standard HF pattern
-        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+        # 🔹 critical: view() in HF loss expects contiguous
+        inputs = self._contiguous_inputs(inputs)
 
+        outputs = model(**inputs)
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
