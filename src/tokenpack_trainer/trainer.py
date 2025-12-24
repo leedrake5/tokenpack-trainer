@@ -595,7 +595,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
     # Token-aware evaluation with metrics
     # --------------------------------------------------------------
 
-    def _token_aware_evaluate(...):
+    def _token_aware_evaluate(
+        self,
+        eval_dataset=None,
+        max_eval_tokens_per_microbatch: int | None = None,
+        desc: str = "Eval (token-aware)",
+    ):
         import time, random, numpy as np, torch
         from tqdm.auto import tqdm
 
