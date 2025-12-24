@@ -480,24 +480,28 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 # No raise – just report
         return enc_len, dec_len, total_len
 
-    @staticmethod
     def _slice_inputs(self, inputs: dict, indices: list[int]) -> dict:
         if not indices:
             return inputs
 
-        # infer device from any tensor in inputs
+        # Infer device from any tensor in inputs
         example_tensor = next((v for v in inputs.values() if isinstance(v, torch.Tensor)), None)
         device = example_tensor.device if example_tensor is not None else torch.device("cpu")
         idx = torch.as_tensor(indices, dtype=torch.long, device=device)
 
-        # infer batch dim from input_ids if present
+        # Infer batch dim from input_ids if present
         batch_dim = None
         if "input_ids" in inputs and isinstance(inputs["input_ids"], torch.Tensor):
             batch_dim = inputs["input_ids"].size(0)
 
         out = {}
         for k, v in inputs.items():
-            if isinstance(v, torch.Tensor) and batch_dim is not None and v.ndim >= 1 and v.size(0) == batch_dim:
+            if (
+                isinstance(v, torch.Tensor)
+                and batch_dim is not None
+                and v.ndim >= 1
+                and v.size(0) == batch_dim
+            ):
                 out[k] = v.index_select(0, idx)
             else:
                 out[k] = v
@@ -633,7 +637,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if cur_indices:
             microbatches.append(cur_indices)
 
-        return [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
+    return [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
 
     def _plan_microbatches(self, inputs):
         """
