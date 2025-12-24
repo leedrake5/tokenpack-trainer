@@ -30,14 +30,26 @@ class TokenPackTrainer(Seq2SeqTrainer):
     
         # --- Compatibility shim: silence processing_class deprecation, use processing_class internally ---
     @property
-    def processing_class(self):
-        # HF now uses "processing_class" in lieu of "processing_class"
-        return getattr(self, "processing_class", None)
+    def tokenizer(self):
+        # In recent HF, Trainer stores it as .processing_class
+        pc = getattr(self, "processing_class", None)
+        if pc is not None:
+            return pc
+        # Fallback if some older version stored it differently
+        return getattr(self, "_processing_class", None)
 
-    @processing_class.setter
-    def processing_class(self, value):
-        # HF now uses "processing_class" in lieu of "processing_class"
+    @tokenizer.setter
+    def tokenizer(self, value):
+        # Route legacy assignment to the new attribute
         self.processing_class = value
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Optional: if something populated _processing_class (older HF),
+        # but processing_class is missing, sync it.
+        if getattr(self, "processing_class", None) is None and getattr(self, "_processing_class", None) is not None:
+            self.processing_class = self._processing_class
 
     def __init__(
         self,
