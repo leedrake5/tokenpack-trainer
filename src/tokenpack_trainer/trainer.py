@@ -28,15 +28,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
       - microbatch on whatever device inputs are already on (typically GPU).
     """
     
-        # --- Compatibility shim: silence tokenizer deprecation, use processing_class internally ---
+        # --- Compatibility shim: silence processing_class deprecation, use processing_class internally ---
     @property
-    def tokenizer(self):
-        # HF now uses "processing_class" in lieu of "tokenizer"
+    def processing_class(self):
+        # HF now uses "processing_class" in lieu of "processing_class"
         return getattr(self, "processing_class", None)
 
-    @tokenizer.setter
-    def tokenizer(self, value):
-        # HF now uses "processing_class" in lieu of "tokenizer"
+    @processing_class.setter
+    def processing_class(self, value):
+        # HF now uses "processing_class" in lieu of "processing_class"
         self.processing_class = value
 
     def __init__(
@@ -80,8 +80,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         
         if getattr(self, "processing_class", None) is None:
             # fallback, just in case
-            if hasattr(self, "_tokenizer") and self._tokenizer is not None:
-                self.processing_class = self._tokenizer
+            if hasattr(self, "_processing_class") and self._processing_class is not None:
+                self.processing_class = self._processing_class
 
         if self.args.gradient_accumulation_steps != 1:
             print(
@@ -754,7 +754,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             # ---- PAD PREDICTIONS TO COMMON LENGTH ----
             # all_preds: list of (B_i, L_pred_i)
             max_pred_len = max(p.shape[1] for p in all_preds)
-            pad_id = self.tokenizer.pad_token_id
+            pad_id = self.processing_class.pad_token_id
             if pad_id is None:
                 pad_id = 0  # very safe fallback
 
