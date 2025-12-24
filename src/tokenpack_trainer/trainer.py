@@ -826,6 +826,42 @@ class TokenPackTrainer(Seq2SeqTrainer):
     # Token-aware evaluation with metrics
     # --------------------------------------------------------------
 
+    def _eval_oom_cleanup(self):
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    def _shrink_eval_limits(self) -> bool:
+        """
+        Shrink eval limits on OOM. Returns True if we changed something.
+        Prefers shrinking eval token budget; optionally shrink B as secondary.
+        """
+        changed = False
+
+        # shrink eval token budget first
+        if self.max_eval_tokens_per_microbatch is not None and self.max_eval_tokens_per_microbatch > self.oom_min_tokens:
+            new_T = max(self.oom_min_tokens, int(self.max_eval_tokens_per_microbatch * self.oom_shrink_tokens))
+            if new_T < self.max_eval_tokens_per_microbatch:
+                self.max_eval_tokens_per_microbatch = new_T
+                changed = True
+
+        # optional: also shrink microbatch examples if tokens can't shrink further
+        if not changed:
+            if self.max_examples_per_microbatch is not None and self.max_examples_per_microbatch > self.oom_min_B:
+                new_B = max(self.oom_min_B, int(self.max_examples_per_microbatch * self.oom_shrink_B))
+                if new_B < self.max_examples_per_microbatch:
+                    self.max_examples_per_microbatch = new_B
+                    changed = True
+
+        return changed
+
     def _token_aware_evaluate(
         self,
         eval_dataset=None,
@@ -959,7 +995,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 # 2) Now prepare inputs for generation (separate from loss)
                 batch = self._prepare_inputs(batch)
 
-                # Drop labels & input_length from generation kwargs
                 ignore_keys = {
                     "labels",
                     self.length_column_name,
@@ -968,14 +1003,67 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 }
                 gen_inputs = {k: v for k, v in batch.items() if k not in ignore_keys}
 
-                # 3) Fast generation with use_cache=True
-                orig_use_cache = getattr(self.model.config, "use_cache", True)
-                self.model.config.use_cache = True
-                with torch.no_grad():
-                    generated_tokens = self.model.generate(
-                        **gen_inputs,
-                        **gen_kwargs,
-                    )
+                # ---- OOM-resilient generation ----
+                last_err = None
+                for attempt in range(self.oom_max_retries + 1):
+                    try:
+                        orig_use_cache = getattr(self.model.config, "use_cache", True)
+                        self.model.config.use_cache = True  # generation typically needs cache for speed
+                        with torch.no_grad():
+                            # Use CPU planning if you want maximum safety
+                            if self.use_cpu_microbatch:
+                                batch_cpu = self._move_to_cpu(batch)
+                                batch_cpu = self._truncate_batch(batch_cpu)
+                                eval_microbatches = self._make_microbatches(batch_cpu, max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch)
+                            else:
+                                batch = self._prepare_inputs(batch)
+                                batch = self._truncate_batch(batch)
+                                eval_microbatches = self._make_microbatches(batch, max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch)
+
+                            for mb in eval_microbatches:
+                                if self.use_cpu_microbatch:
+                                    mb = self._to_device(mb)
+
+                                gen_inputs = {k: v for k, v in mb.items() if k not in ignore_keys}
+                                generated_tokens = self.model.generate(**gen_inputs, **gen_kwargs)
+                        self.model.config.use_cache = orig_use_cache
+                        last_err = None
+                        break
+
+                    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                        if not self._is_cuda_oom(e):
+                            raise
+                        last_err = e
+
+                        self._eval_oom_cleanup()
+
+                        changed = self._shrink_eval_limits()
+                        if self.control.should_log:
+                            self.log({
+                                "eval_oom_event": 1.0,
+                                "eval_oom_attempt": float(attempt),
+                                "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
+                                "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
+                                "eval_changed_limits": float(1.0 if changed else 0.0),
+                            })
+
+                        if not changed:
+                            break
+
+                        # Re-microbatch *this eval batch* with the smaller eval token budget
+                        # NOTE: do this by re-splitting `batch` (or an earlier CPU copy) into microbatches.
+                        # If you're generating on the full batch, you'll still OOM.
+                        # Best practice: generate per microbatch.
+                        continue
+
+                if last_err is not None:
+                    # Either skip this batch or raise
+                    if getattr(self, "oom_skip_batch_on_fail", True):
+                        if self.control.should_log:
+                            self.log({"eval_oom_skipped_batch": 1.0})
+                        continue
+                    raise last_err
+
                 self.model.config.use_cache = orig_use_cache
 
                 if generated_tokens.ndim == 1:
