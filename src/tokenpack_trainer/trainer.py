@@ -661,10 +661,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     }
                     return metrics
        
-        finally:
-            # fork_rng restores torch + cuda automatically
-            np.random.set_state(np_state)
-            random.setstate(py_state)
+            finally:
+                # fork_rng restores torch + cuda automatically
+                np.random.set_state(np_state)
+                random.setstate(py_state)
 
             # 2) Build generation kwargs like HF does
             gen_kwargs: dict[str, Any] = {}
