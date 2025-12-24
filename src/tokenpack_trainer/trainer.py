@@ -91,6 +91,18 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self._oom_events = 0
         self._oom_skipped_batches = 0
 
+        self._regime_limits = {}  # key -> {"B": int|None, "T": int, "stable": int}
+        self._regime_bucket_size = 128   # effective-length bucket size (tokens); tune 64/128/256
+        self._regime_ramp_every = 50     # successes before increasing limits
+        self._regime_ramp_B = 1.10       # +10% B on ramp
+        self._regime_ramp_T = 1.03       # +3% token budget on ramp
+        self._regime_min_B = getattr(self, "oom_min_B", 1)
+        self._regime_min_T = getattr(self, "oom_min_tokens", 64)
+
+        # Defaults used to initialize new regimes
+        self._regime_default_B = self.max_examples_per_microbatch
+        self._regime_default_T = self.max_tokens_per_microbatch
+
         # running maxima
         self._max_seen_enc_len = 0
         self._max_seen_dec_len = 0
@@ -114,6 +126,74 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if getattr(self, "processing_class", None) is None and getattr(self, "_processing_class", None) is not None:
             self.processing_class = self._processing_class
 
+
+    def _regime_key_from_inputs(self, inputs_cpu: dict) -> int:
+        """
+        Compute a coarse "regime key" from the maximum effective length
+        in this HF batch: eff = enc_len + alpha * dec_len.
+        """
+        enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_cpu)
+        alpha = 2.0
+        eff = enc_len + alpha * dec_len
+        mx = int(eff.max().item()) if eff.numel() else 0
+        bs = int(self._regime_bucket_size)
+        return int((mx + bs - 1) // bs) if bs > 0 else mx
+
+    def _regime_state(self, key: int) -> dict:
+        st = self._regime_limits.get(key)
+        if st is None:
+            st = {"B": self._regime_default_B, "T": self._regime_default_T, "stable": 0}
+            # If defaults are None, pick something reasonable so we can adapt
+            if st["B"] is None:
+                st["B"] = 16
+            if st["T"] is None:
+                st["T"] = 400
+            self._regime_limits[key] = st
+        return st
+
+    def _apply_regime_limits(self, key: int):
+        st = self._regime_state(key)
+        self.max_examples_per_microbatch = st["B"]
+        self.max_tokens_per_microbatch = st["T"]
+        # keep eval budget <= train budget
+        if getattr(self, "max_eval_tokens_per_microbatch", None) is not None:
+            self.max_eval_tokens_per_microbatch = min(self.max_eval_tokens_per_microbatch, self.max_tokens_per_microbatch)
+
+    def _regime_on_success(self, key: int):
+        st = self._regime_state(key)
+        st["stable"] += 1
+
+        if st["stable"] % int(self._regime_ramp_every) == 0:
+            # ramp B up gently
+            if st["B"] is None:
+                st["B"] = 16
+            st["B"] = max(self._regime_min_B, int(st["B"] * float(self._regime_ramp_B)) + 1)
+
+            # ramp token budget slightly (optional)
+            st["T"] = max(self._regime_min_T, int(st["T"] * float(self._regime_ramp_T)))
+
+    def _regime_on_oom(self, key: int):
+        st = self._regime_state(key)
+        st["stable"] = 0
+
+        # Shrink B first
+        if st["B"] is None:
+            st["B"] = 16
+        new_B = max(self._regime_min_B, int(st["B"] * 0.7))
+        if new_B < st["B"]:
+            st["B"] = new_B
+            return
+
+        # If B can't shrink further, shrink token budget
+        st["T"] = max(self._regime_min_T, int(st["T"] * 0.85))
+
+    def _regime_key_from_batch(self, inputs_cpu) -> int:
+        enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_cpu)
+        alpha = 2.0
+        eff = enc_len + alpha * dec_len
+        mx = int(eff.max().item())
+        bucket_size = 128   # choose something coarse
+        return int((mx + bucket_size - 1) // bucket_size)
 
     def _is_cuda_oom(self, err: BaseException) -> bool:
         msg = str(err)
@@ -197,6 +277,33 @@ class TokenPackTrainer(Seq2SeqTrainer):
             offset += n
 
         return out
+
+    def _apply_bucket_limits(self, key: int):
+        st = self._bucket_limits.get(key)
+        if st is None:
+            st = {"B": self._default_B, "T": self._default_T, "stable": 0}
+            self._bucket_limits[key] = st
+        self.max_examples_per_microbatch = st["B"]
+        self.max_tokens_per_microbatch = st["T"]
+
+    def _bucket_oom(self, key: int):
+        st = self._bucket_limits.setdefault(key, {"B": self._default_B, "T": self._default_T, "stable": 0})
+        st["stable"] = 0
+        if st["B"] is None:
+            st["B"] = 16  # pick a starting bound
+        st["B"] = max(self._min_bucket_B, int(st["B"] * 0.7))
+        if st["B"] <= self._min_bucket_B:
+            st["T"] = max(self._min_bucket_T, int(st["T"] * 0.85))
+
+    def _bucket_success(self, key: int):
+        st = self._bucket_limits.setdefault(key, {"B": self._default_B, "T": self._default_T, "stable": 0})
+        st["stable"] += 1
+        if st["stable"] % self._ramp_up_every == 0:
+            if st["B"] is None:
+                st["B"] = 16
+            st["B"] = int(st["B"] * self._ramp_factor) + 1
+            # optional: also raise token budget slightly
+            st["T"] = int(st["T"] * 1.03)
 
     def _compact_microbatch(self, mb: dict) -> dict:
         # Trim encoder side to max attention_mask sum in this microbatch
@@ -1149,16 +1256,35 @@ class TokenPackTrainer(Seq2SeqTrainer):
             model.config.use_cache = False
 
         last_err = None
+        regime_key = None  # <<< keep across retries for this same HF batch
 
         for attempt in range(self.oom_max_retries + 1):
             try:
                 # ---------------- PLAN MICROBATCHE(S) ----------------
                 if self.use_cpu_microbatch:
                     inputs_work = self._move_to_cpu(inputs)
+
+                    # >>> compute regime key once per batch (from CPU tensors)
+                    if regime_key is None:
+                        regime_key = self._regime_key_from_inputs(inputs_work)
+
+                    # >>> apply per-regime best limits BEFORE planning microbatches
+                    self._apply_regime_limits(regime_key)
+
                     _ = self._compute_lengths_enc_dec(inputs_work)
                     inputs_work = self._truncate_batch(inputs_work)
                     microbatches = self._make_microbatches(inputs_work)
+
                 else:
+                    # We don't have CPU tensors by default; easiest is to still derive a key on CPU
+                    # from a detached copy. This is cheap because it's just masks/labels.
+                    if regime_key is None:
+                        tmp_cpu = self._move_to_cpu(inputs)
+                        regime_key = self._regime_key_from_inputs(tmp_cpu)
+
+                    # >>> apply per-regime best limits BEFORE planning microbatches
+                    self._apply_regime_limits(regime_key)
+
                     inputs_work = self._prepare_inputs(inputs)
                     inputs_work = self._truncate_batch(inputs_work)
                     _ = self._compute_lengths_enc_dec(inputs_work)
@@ -1197,11 +1323,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 avg_loss = total_loss / num_micro
 
+                # >>> on success, mark this regime as stable and possibly ramp up
+                if regime_key is not None:
+                    self._regime_on_success(regime_key)
+
                 # optional logging
                 if attempt > 0 and self.control.should_log:
                     self.log({
                         "oom_recovered": 1.0,
                         "oom_recovery_attempt": float(attempt),
+                        "regime_key": float(regime_key if regime_key is not None else -1),
                         "max_B_now": float(self.max_examples_per_microbatch or 0),
                         "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
                     })
@@ -1215,21 +1346,30 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 last_err = e
                 self._oom_events += 1
 
-                # cleanup + shrink + retry
+                # cleanup
                 self._oom_cleanup()
-                changed = self._oom_shrink_limits()
+
+                # >>> shrink only THIS regime first
+                if regime_key is not None:
+                    self._regime_on_oom(regime_key)
+                    # re-apply immediately so the retry uses the new values
+                    self._apply_regime_limits(regime_key)
+                    changed = True
+                else:
+                    # fallback to global shrink if key somehow missing
+                    changed = self._oom_shrink_limits()
 
                 if self.control.should_log:
                     self.log({
                         "oom_event": 1.0,
                         "oom_attempt": float(attempt),
+                        "regime_key": float(regime_key if regime_key is not None else -1),
                         "oom_changed_limits": float(1.0 if changed else 0.0),
                         "max_B_now": float(self.max_examples_per_microbatch or 0),
                         "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
                     })
 
                 if not changed:
-                    # We’re already at minimums; no point retrying forever
                     break
 
                 continue
@@ -1238,10 +1378,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if self.oom_skip_batch_on_fail:
             self._oom_skipped_batches += 1
             if self.control.should_log:
-                self.log({"oom_skipped_batch": 1.0, "oom_skipped_batches_total": float(self._oom_skipped_batches)})
+                self.log({
+                    "oom_skipped_batch": 1.0,
+                    "oom_skipped_batches_total": float(self._oom_skipped_batches),
+                    "regime_key": float(regime_key if regime_key is not None else -1),
+                })
 
-            # Return a zero loss tensor (keeps trainer moving)
             return torch.tensor(0.0, device=self.args.device)
 
-        # Otherwise, crash like normal
         raise last_err
