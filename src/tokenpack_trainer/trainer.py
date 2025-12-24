@@ -660,7 +660,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         "eval_steps_per_second": float(num_steps / runtime) if runtime > 0 else 0.0,
                     }
                     return metrics
-
+       
+        finally:
+            # fork_rng restores torch + cuda automatically
+            np.random.set_state(np_state)
+            random.setstate(py_state)
 
             # 2) Build generation kwargs like HF does
             gen_kwargs: dict[str, Any] = {}
@@ -831,10 +835,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
             return metrics
             
-        finally:
-            # fork_rng restores torch + cuda automatically
-            np.random.set_state(np_state)
-            random.setstate(py_state)
         
     # --------------------------------------------------------------
     # OOM handling + emergency checkpoint
