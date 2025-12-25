@@ -785,6 +785,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # If no token budget or we explicitly want HF-style eval, use default
         mode = self._normalize_eval_mode(getattr(self, "eval_mode", None))
         if mode is None or self.max_tokens_per_batch is None:
+            return super().get_eval_dataloader(eval_dataset)
 
         # Otherwise: token-aware eval DataLoader (length-bucketed)
         if hasattr(eval_dataset, "column_names"):
