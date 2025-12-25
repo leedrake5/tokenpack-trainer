@@ -326,16 +326,24 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         # Now safe to use for lengths + collator
         if hasattr(ds, "column_names"):
-            lengths = ds[self.length_column_name]
+            raw_lengths = ds[self.length_column_name]
         else:
-            lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
+            raw_lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
+
+        # IMPORTANT: cap lengths to what the model will actually see
+        if self.max_encoder_len is not None:
+            lengths_for_sampler = [min(int(L), self.max_encoder_len) for L in raw_lengths]
+        else:
+            lengths_for_sampler = [int(L) for L in raw_lengths]
 
         batch_sampler = LengthBucketedBatchSampler(
-            lengths=lengths,
+            lengths=lengths_for_sampler,
             max_tokens_per_batch=self.max_tokens_per_batch,
             bucket_size=16,
             shuffle=True,
             drop_last=False,
+            long_behavior="truncate",
+            max_length_in_batch=self.max_encoder_len,  # optional but recommended
         )
 
         return DataLoader(
@@ -770,18 +778,24 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return super().get_eval_dataloader(eval_dataset)
 
         # Otherwise: token-aware eval DataLoader (length-bucketed)
-        ds = eval_dataset
         if hasattr(ds, "column_names"):
-            lengths = ds[self.length_column_name]
+            raw_lengths = ds[self.length_column_name]
         else:
-            lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
+            raw_lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
+
+        if self.max_encoder_len is not None:
+            lengths_for_sampler = [min(int(L), self.max_encoder_len) for L in raw_lengths]
+        else:
+            lengths_for_sampler = [int(L) for L in raw_lengths]
 
         batch_sampler = LengthBucketedBatchSampler(
-            lengths=lengths,
+            lengths=lengths_for_sampler,
             max_tokens_per_batch=self.max_tokens_per_batch,
             bucket_size=16,
             shuffle=False,
             drop_last=False,
+            long_behavior="truncate",
+            max_length_in_batch=self.max_encoder_len,  # strongly recommended for eval
         )
 
         return DataLoader(
@@ -988,45 +1002,39 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 batch_cpu = self._truncate_batch(batch_cpu)
 
                 for attempt in range(self.oom_max_retries + 1):
+                    self.model.config.use_cache = True
                     try:
-                        self.model.config.use_cache = True
-
-                        # Replan microbatches each attempt (because T/B may shrink)
+                        # Replan microbatches each attempt
                         eval_microbatches_cpu = self._make_microbatches(
                             batch_cpu,
                             max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
                         )
 
-                        # Collect outputs for this *one* dataloader batch
                         batch_pred_chunks = []
                         batch_label_chunks = []
 
                         for mb_cpu in eval_microbatches_cpu:
-                            # Move one microbatch to GPU
-                            mb = self._to_device(mb_cpu) if self.use_cpu_microbatch else mb_cpu  # (cpu path uses _to_device)
+                            mb = self._to_device(mb_cpu)
 
-                            # Build gen inputs from microbatch
                             gen_inputs_mb = {k: v for k, v in mb.items() if k not in ignore_keys}
 
                             with torch.no_grad():
                                 gen_out = self.model.generate(**gen_inputs_mb, **gen_kwargs)
 
-                            # Save preds + matching labels for this microbatch
                             if gen_out.ndim == 1:
                                 gen_out = gen_out.unsqueeze(0)
 
-                            batch_pred_chunks.append(gen_out.detach().to("cpu").numpy())
-                            batch_label_chunks.append(mb["labels"].detach().to("cpu").numpy())
+                            batch_pred_chunks.append(gen_out.cpu().numpy())
+                            batch_label_chunks.append(mb["labels"].cpu().numpy())
 
-                            # Help GC release GPU tensors ASAP
+                            # aggressively release GPU memory
                             del mb, gen_out, gen_inputs_mb
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
 
-                        # If we got here, this batch succeeded
+                        # success → commit
                         all_preds.extend(batch_pred_chunks)
                         all_labels.extend(batch_label_chunks)
-
                         last_err = None
                         break
 
@@ -1036,26 +1044,22 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         last_err = e
 
                         self._eval_oom_cleanup()
-
                         changed = self._shrink_eval_limits()
+
                         if self.control.should_log:
                             self.log({
                                 "eval_oom_event": 1.0,
                                 "eval_oom_attempt": float(attempt),
                                 "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
                                 "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
-                                "eval_changed_limits": float(1.0 if changed else 0.0),
+                                "eval_changed_limits": float(changed),
                             })
 
-                        # If we can't shrink further, give up
                         if not changed:
                             break
 
-                        # Important: restart this batch from scratch with smaller limits
-                        continue
-
-                finally:
-                    self.model.config.use_cache = orig_use_cache
+                    finally:
+                        self.model.config.use_cache = orig_use_cache
 
                 if last_err is not None:
                     if getattr(self, "oom_skip_batch_on_fail", True):
@@ -1065,12 +1069,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     raise last_err
 
                 self.model.config.use_cache = orig_use_cache
-
-                if generated_tokens.ndim == 1:
-                    generated_tokens = generated_tokens.unsqueeze(0)
-
-                all_preds.append(generated_tokens.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
 
             end_time = time.time()
             runtime = end_time - start_time if num_steps > 0 else 0.0
