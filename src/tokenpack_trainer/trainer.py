@@ -79,7 +79,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if max_eval_tokens_per_microbatch is not None
             else self.max_tokens_per_microbatch
         )
-        self.eval_mode = eval_mode
+        self.eval_mode = self._normalize_eval_mode(eval_mode)
         self.debug = debug
         self.oom_max_retries = int(oom_max_retries)
         self.oom_shrink_B = float(oom_shrink_B)
@@ -126,6 +126,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if getattr(self, "processing_class", None) is None and getattr(self, "_processing_class", None) is not None:
             self.processing_class = self._processing_class
 
+    def _normalize_eval_mode(self, mode: str | None) -> str | None:
+        if mode is None:
+            return None
+        m = str(mode).lower()
+        if m in ("none", "hf", "vanilla", "huggingface"):
+            return None
+        if m in ("token_aware", "token-aware", "token_aware_metrics"):
+            return "token_aware_metrics"
+        return m
 
     def _regime_key_from_inputs(self, inputs_cpu: dict) -> int:
         """
@@ -774,9 +783,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
         # If no token budget or we explicitly want HF-style eval, use default
-        mode = getattr(self, "eval_mode", None)
-        if mode is None or mode == "hf" or self.max_tokens_per_batch is None:
-            return super().get_eval_dataloader(eval_dataset)
+        mode = self._normalize_eval_mode(getattr(self, "eval_mode", None))
+        if mode is None or self.max_tokens_per_batch is None:
 
         # Otherwise: token-aware eval DataLoader (length-bucketed)
         if hasattr(eval_dataset, "column_names"):
@@ -1286,7 +1294,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
           - None / "hf": use standard HF evaluation_loop
           - "token_aware_metrics": use our custom generation+metrics
         """
-        mode = eval_mode
+        self.eval_mode = self._normalize_eval_mode(eval_mode)
         if mode is not None:
             mode = str(mode).lower()
             if mode in ("none", "hf", "vanilla", "huggingface"):
