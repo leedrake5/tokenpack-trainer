@@ -396,7 +396,7 @@ Batches with similar effective lengths share the same regime and therefore:
 * Do not penalize shorter or unrelated batches after an OOM.
 * Recover quickly when sequence distributions shift.
 
-This is especially important for mixed-length corpora and curriculum-style datasets.
+This is especially important for mixed-length corpora and curriculum-style datasets. Note that early in training, you may observe periods of low GPU utilization and slower training - once the Trainer adjusts to VRAM limits and changing context size, it will stabilize at hibher values. 
 
 ### Recommended Starting Values
 
