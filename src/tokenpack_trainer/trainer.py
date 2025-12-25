@@ -778,10 +778,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return super().get_eval_dataloader(eval_dataset)
 
         # Otherwise: token-aware eval DataLoader (length-bucketed)
-        if hasattr(ds, "column_names"):
-            raw_lengths = ds[self.length_column_name]
+        if hasattr(eval_dataset, "column_names"):
+            raw_lengths = eval_dataset[self.length_column_name]
         else:
-            raw_lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
+            raw_lengths = [eval_dataset[i][self.length_column_name] for i in range(len(eval_dataset))]
 
         if self.max_encoder_len is not None:
             lengths_for_sampler = [min(int(L), self.max_encoder_len) for L in raw_lengths]
@@ -795,11 +795,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
             shuffle=False,
             drop_last=False,
             long_behavior="truncate",
-            max_length_in_batch=self.max_encoder_len,  # strongly recommended for eval
+            max_length_in_batch=self.max_encoder_len,
         )
 
         return DataLoader(
-            ds,
+            eval_dataset,
             batch_sampler=batch_sampler,
             collate_fn=self.data_collator,
             num_workers=self.args.dataloader_num_workers,
