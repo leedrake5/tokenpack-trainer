@@ -278,33 +278,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         return out
 
-    def _apply_bucket_limits(self, key: int):
-        st = self._bucket_limits.get(key)
-        if st is None:
-            st = {"B": self._default_B, "T": self._default_T, "stable": 0}
-            self._bucket_limits[key] = st
-        self.max_examples_per_microbatch = st["B"]
-        self.max_tokens_per_microbatch = st["T"]
-
-    def _bucket_oom(self, key: int):
-        st = self._bucket_limits.setdefault(key, {"B": self._default_B, "T": self._default_T, "stable": 0})
-        st["stable"] = 0
-        if st["B"] is None:
-            st["B"] = 16  # pick a starting bound
-        st["B"] = max(self._min_bucket_B, int(st["B"] * 0.7))
-        if st["B"] <= self._min_bucket_B:
-            st["T"] = max(self._min_bucket_T, int(st["T"] * 0.85))
-
-    def _bucket_success(self, key: int):
-        st = self._bucket_limits.setdefault(key, {"B": self._default_B, "T": self._default_T, "stable": 0})
-        st["stable"] += 1
-        if st["stable"] % self._ramp_up_every == 0:
-            if st["B"] is None:
-                st["B"] = 16
-            st["B"] = int(st["B"] * self._ramp_factor) + 1
-            # optional: also raise token budget slightly
-            st["T"] = int(st["T"] * 1.03)
-
     def _compact_microbatch(self, mb: dict) -> dict:
         # Trim encoder side to max attention_mask sum in this microbatch
         if "attention_mask" in mb and isinstance(mb["attention_mask"], torch.Tensor):
@@ -993,7 +966,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 num_examples += int(batch_size)
 
                 # 2) Now prepare inputs for generation (separate from loss)
-                batch = self._prepare_inputs(batch)
+                batch_gpu = self._prepare_inputs(batch)
 
                 ignore_keys = {
                     "labels",
@@ -1001,32 +974,59 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     "decoder_input_ids",
                     "decoder_attention_mask",
                 }
-                gen_inputs = {k: v for k, v in batch.items() if k not in ignore_keys}
+                # We will slice labels separately for metrics alignment
+                labels_full = batch_gpu.get("labels", None)
+                if labels_full is None:
+                    raise ValueError("Eval dataset must have labels for metric computation.")
 
-                # ---- OOM-resilient generation ----
+                # ---- OOM-resilient generation over MICROBATCHE(S) ----
+                orig_use_cache = getattr(self.model.config, "use_cache", True)
                 last_err = None
+
+                # Always plan on CPU to avoid duplicating GPU memory in a list of microbatches
+                batch_cpu = self._move_to_cpu(batch_gpu)
+                batch_cpu = self._truncate_batch(batch_cpu)
+
                 for attempt in range(self.oom_max_retries + 1):
                     try:
-                        orig_use_cache = getattr(self.model.config, "use_cache", True)
-                        self.model.config.use_cache = True  # generation typically needs cache for speed
-                        with torch.no_grad():
-                            # Use CPU planning if you want maximum safety
-                            if self.use_cpu_microbatch:
-                                batch_cpu = self._move_to_cpu(batch)
-                                batch_cpu = self._truncate_batch(batch_cpu)
-                                eval_microbatches = self._make_microbatches(batch_cpu, max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch)
-                            else:
-                                batch = self._prepare_inputs(batch)
-                                batch = self._truncate_batch(batch)
-                                eval_microbatches = self._make_microbatches(batch, max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch)
+                        self.model.config.use_cache = True
 
-                            for mb in eval_microbatches:
-                                if self.use_cpu_microbatch:
-                                    mb = self._to_device(mb)
+                        # Replan microbatches each attempt (because T/B may shrink)
+                        eval_microbatches_cpu = self._make_microbatches(
+                            batch_cpu,
+                            max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
+                        )
 
-                                gen_inputs = {k: v for k, v in mb.items() if k not in ignore_keys}
-                                generated_tokens = self.model.generate(**gen_inputs, **gen_kwargs)
-                        self.model.config.use_cache = orig_use_cache
+                        # Collect outputs for this *one* dataloader batch
+                        batch_pred_chunks = []
+                        batch_label_chunks = []
+
+                        for mb_cpu in eval_microbatches_cpu:
+                            # Move one microbatch to GPU
+                            mb = self._to_device(mb_cpu) if self.use_cpu_microbatch else mb_cpu  # (cpu path uses _to_device)
+
+                            # Build gen inputs from microbatch
+                            gen_inputs_mb = {k: v for k, v in mb.items() if k not in ignore_keys}
+
+                            with torch.no_grad():
+                                gen_out = self.model.generate(**gen_inputs_mb, **gen_kwargs)
+
+                            # Save preds + matching labels for this microbatch
+                            if gen_out.ndim == 1:
+                                gen_out = gen_out.unsqueeze(0)
+
+                            batch_pred_chunks.append(gen_out.detach().to("cpu").numpy())
+                            batch_label_chunks.append(mb["labels"].detach().to("cpu").numpy())
+
+                            # Help GC release GPU tensors ASAP
+                            del mb, gen_out, gen_inputs_mb
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+
+                        # If we got here, this batch succeeded
+                        all_preds.extend(batch_pred_chunks)
+                        all_labels.extend(batch_label_chunks)
+
                         last_err = None
                         break
 
@@ -1047,17 +1047,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
                                 "eval_changed_limits": float(1.0 if changed else 0.0),
                             })
 
+                        # If we can't shrink further, give up
                         if not changed:
                             break
 
-                        # Re-microbatch *this eval batch* with the smaller eval token budget
-                        # NOTE: do this by re-splitting `batch` (or an earlier CPU copy) into microbatches.
-                        # If you're generating on the full batch, you'll still OOM.
-                        # Best practice: generate per microbatch.
+                        # Important: restart this batch from scratch with smaller limits
                         continue
 
+                finally:
+                    self.model.config.use_cache = orig_use_cache
+
                 if last_err is not None:
-                    # Either skip this batch or raise
                     if getattr(self, "oom_skip_batch_on_fail", True):
                         if self.control.should_log:
                             self.log({"eval_oom_skipped_batch": 1.0})
@@ -1378,12 +1378,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                     total_loss_weighted += (loss_mb.detach().float() * weight)
 
-                # Return a sane scalar for logging
-                return total_loss_weighted
 
                 # >>> on success, mark this regime as stable and possibly ramp up
                 if regime_key is not None:
                     self._regime_on_success(regime_key)
+
+                # Return a sane scalar for logging
+                return total_loss_weighted
 
                 # optional logging
                 if attempt > 0 and self.control.should_log:
