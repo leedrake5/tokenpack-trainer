@@ -1292,17 +1292,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
     ):
         """
         eval_mode:
-          - None / "hf": use standard HF evaluation_loop
+          - None / "hf" / "vanilla" / "huggingface": use standard HF evaluation_loop
           - "token_aware_metrics": use our custom generation+metrics
         """
-        self.eval_mode = self._normalize_eval_mode(eval_mode)
-        if mode is not None:
-            mode = str(mode).lower()
-            if mode in ("none", "hf", "vanilla", "huggingface"):
-                mode = None
-        # -----------------------------
-        # Token-aware loop
-        # -----------------------------
+
+        # 1) Decide mode (ALWAYS define it first)
+        requested = eval_mode if eval_mode is not None else getattr(self, "eval_mode", None)
+        mode = self._normalize_eval_mode(requested)  # returns None or "token_aware_metrics" or other
+
+        # 2) Token-aware loop
         if mode == "token_aware_metrics":
             if eval_dataset is None:
                 eval_dataset = self.eval_dataset
@@ -1316,16 +1314,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 desc="eval (token-aware)",
             )
             runtime = time.time() - start_time
-
-            # If _token_aware_evaluate didn't add runtime stats, add them
             metrics.setdefault("eval_runtime", float(runtime))
 
-            # Attach epoch info (like HF)
             if self.state.epoch is not None:
                 metrics[f"{metric_key_prefix}_epoch"] = self.state.epoch
                 metrics["epoch"] = self.state.epoch
 
-            # Log to integrations (wandb/tensorboard) + keep trainer_state.json consistent
             self.log(metrics)
             self.state.log_history.append(metrics)
 
@@ -1336,9 +1330,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
             return metrics
 
-        # -----------------------------
-        # Fallback: standard HF behavior
-        # -----------------------------
+        # 3) Default: standard HF behavior
         return super().evaluate(
             eval_dataset=eval_dataset,
             ignore_keys=ignore_keys,
