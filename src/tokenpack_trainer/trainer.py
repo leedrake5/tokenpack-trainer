@@ -79,7 +79,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if max_eval_tokens_per_microbatch is not None
             else self.max_tokens_per_microbatch
         )
-        self.eval_mode = eval_mode or "token_aware_metrics"
+        self.eval_mode = eval_mode
         self.debug = debug
         self.oom_max_retries = int(oom_max_retries)
         self.oom_shrink_B = float(oom_shrink_B)
@@ -774,7 +774,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
         # If no token budget or we explicitly want HF-style eval, use default
-        if self.max_tokens_per_batch is None or self.eval_mode == "hf":
+        mode = getattr(self, "eval_mode", None)
+        if mode is None or mode == "hf" or self.max_tokens_per_batch is None:
             return super().get_eval_dataloader(eval_dataset)
 
         # Otherwise: token-aware eval DataLoader (length-bucketed)
@@ -1022,6 +1023,33 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 # Prepare once
                 batch_gpu = self._prepare_inputs(batch)
 
+               # FAST PATH: if everything fits comfortably, generate once for the whole batch
+                # (avoids microbatch splitting overhead)
+                if (
+                    self.max_eval_tokens_per_microbatch is not None
+                    and "attention_mask" in batch_gpu
+                    and "labels" in batch_gpu
+                ):
+                    # estimate tokens (cheap)
+                    enc = int(batch_gpu["attention_mask"].sum().item())
+                    dec = int((batch_gpu["labels"] != -100).sum().item())
+                    eff = enc + 2.0 * dec  # same alpha you use
+
+                    # also respect max_examples_per_microbatch if set
+                    B = int(batch_gpu["input_ids"].size(0))
+                    fits_B = (self.max_examples_per_microbatch is None) or (B <= self.max_examples_per_microbatch)
+
+                    if eff <= self.max_eval_tokens_per_microbatch and fits_B:
+                        # Single generate call for the whole batch
+                        gen_inputs = {k: v for k, v in batch_gpu.items() if k not in ignore_keys}
+                        gen_out = self.model.generate(**gen_inputs, **gen_kwargs)
+
+                        all_preds.append(gen_out.detach().cpu().numpy())
+                        all_labels.append(batch_gpu["labels"].detach().cpu().numpy())
+
+                        self._eval_on_success()
+                        continue
+  
                 # truncate on the same device you will use
                 if self.use_cpu_microbatch:
                     plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
@@ -1258,8 +1286,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
           - None / "hf": use standard HF evaluation_loop
           - "token_aware_metrics": use our custom generation+metrics
         """
-        mode = eval_mode or getattr(self, "eval_mode", None)
-
+        if mode is not None:
+            mode = str(mode).lower()
+            if mode in ("none", "hf", "vanilla", "huggingface"):
+                mode = None
         # -----------------------------
         # Token-aware loop
         # -----------------------------

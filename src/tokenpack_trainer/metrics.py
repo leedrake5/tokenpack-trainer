@@ -23,6 +23,21 @@ def default_is_english_target_from_prompt(prompt: str) -> bool:
         or "english translation" in p
     )
 
+def postprocess_text(preds, labels):
+    # preds: list[str]
+    preds = [p.strip() for p in preds]
+
+    # labels can be list[str] OR list[list[str]]; normalize to list[list[str]]
+    norm_labels = []
+    for lab in labels:
+        if isinstance(lab, (list, tuple)):
+            # take first reference if provided
+            s = lab[0] if len(lab) > 0 else ""
+        else:
+            s = lab
+        norm_labels.append([str(s).strip()])
+
+    return preds, norm_labels
 
 def compute_metrics(eval_preds, MAX_REF_TOKENS=64):
     preds, labels = eval_preds
