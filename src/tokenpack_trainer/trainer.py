@@ -1286,6 +1286,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
           - None / "hf": use standard HF evaluation_loop
           - "token_aware_metrics": use our custom generation+metrics
         """
+        mode = eval_mode
         if mode is not None:
             mode = str(mode).lower()
             if mode in ("none", "hf", "vanilla", "huggingface"):
