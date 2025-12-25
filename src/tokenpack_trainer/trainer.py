@@ -1432,8 +1432,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
                     })
 
-                return avg_loss
-
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 if not self._is_cuda_oom(e):
                     raise
