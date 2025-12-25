@@ -24,7 +24,7 @@ def default_is_english_target_from_prompt(prompt: str) -> bool:
     )
 
 
-def compute_metrics(eval_preds):
+def compute_metrics(eval_preds, MAX_REF_TOKENS=64):
     preds, labels = eval_preds
     if isinstance(preds, tuple):
         preds = preds[0]
@@ -44,6 +44,13 @@ def compute_metrics(eval_preds):
 
     decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
     decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    def truncate_by_words(s, n=64):
+        w = s.split()
+        return " ".join(w[:n])
+
+    decoded_preds  = [truncate_by_words(p, MAX_REF_TOKENS) for p in decoded_preds]
+    decoded_labels = [[truncate_by_words(r[0], MAX_REF_TOKENS)] for r in decoded_labels]
 
     decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
 
