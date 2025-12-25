@@ -1010,6 +1010,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 batch_size = labels.size(0)
                 num_examples += int(batch_size)
 
+
+                ignore_keys = {
+                    "labels",
+                    self.length_column_name,
+                    "decoder_input_ids",
+                    "decoder_attention_mask",
+                }
+                
                 # 2) Now prepare inputs for generation (separate from loss)
                 # Prepare once
                 batch_gpu = self._prepare_inputs(batch)
