@@ -849,6 +849,37 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         return changed
 
+        def _eval_regime_init(self):
+            if not hasattr(self, "_eval_stable"):
+                self._eval_stable = 0
+
+        def _eval_on_success(self):
+            """
+            Called once per *successful eval batch* (i.e., the batch generated without OOM).
+            Ramps up token budget slowly after enough stable batches.
+            """
+            self._eval_regime_init()
+            self._eval_stable += 1
+
+            # only ramp if we have a budget
+            if self.max_eval_tokens_per_microbatch is None:
+                return
+
+            ramp_every = 50
+            ramp_T = 1.05  # +5%
+            max_T_cap = getattr(self, "max_tokens_per_microbatch", None)  # never exceed train budget if set
+
+            if (self._eval_stable % ramp_every) == 0:
+                new_T = int(self.max_eval_tokens_per_microbatch * ramp_T)
+                if max_T_cap is not None:
+                    new_T = min(new_T, int(max_T_cap))
+                self.max_eval_tokens_per_microbatch = max(new_T, self.oom_min_tokens)
+
+        def _eval_on_oom(self):
+            """Reset stability counter on OOM so we don't ramp immediately after shrinking."""
+            self._eval_regime_init()
+            self._eval_stable = 0
+
     def _token_aware_evaluate(
         self,
         eval_dataset=None,
@@ -980,46 +1011,38 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 num_examples += int(batch_size)
 
                 # 2) Now prepare inputs for generation (separate from loss)
+                # Prepare once
                 batch_gpu = self._prepare_inputs(batch)
 
-                ignore_keys = {
-                    "labels",
-                    self.length_column_name,
-                    "decoder_input_ids",
-                    "decoder_attention_mask",
-                }
-                # We will slice labels separately for metrics alignment
-                labels_full = batch_gpu.get("labels", None)
-                if labels_full is None:
-                    raise ValueError("Eval dataset must have labels for metric computation.")
+                # truncate on the same device you will use
+                if self.use_cpu_microbatch:
+                    plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
+                else:
+                    plan_inputs = self._truncate_batch(batch_gpu)
 
-                # ---- OOM-resilient generation over MICROBATCHE(S) ----
-                orig_use_cache = getattr(self.model.config, "use_cache", True)
                 last_err = None
 
-                # Always plan on CPU to avoid duplicating GPU memory in a list of microbatches
-                batch_cpu = self._move_to_cpu(batch_gpu)
-                batch_cpu = self._truncate_batch(batch_cpu)
-
                 for attempt in range(self.oom_max_retries + 1):
-                    self.model.config.use_cache = True
                     try:
-                        # Replan microbatches each attempt
-                        eval_microbatches_cpu = self._make_microbatches(
-                            batch_cpu,
+                        # (optional but recommended) enable cache for generation
+                        orig_use_cache = getattr(self.model.config, "use_cache", True)
+                        self.model.config.use_cache = True
+
+                        microbatches = self._make_microbatches(
+                            plan_inputs,
                             max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
                         )
 
+                        # IMPORTANT: reset per attempt (fixes double-append after partial OOM)
                         batch_pred_chunks = []
                         batch_label_chunks = []
 
-                        for mb_cpu in eval_microbatches_cpu:
-                            mb = self._to_device(mb_cpu)
+                        for mb in microbatches:
+                            if self.use_cpu_microbatch:
+                                mb = self._to_device(mb)  # CPU→GPU only in this mode
 
                             gen_inputs_mb = {k: v for k, v in mb.items() if k not in ignore_keys}
-
-                            with torch.no_grad():
-                                gen_out = self.model.generate(**gen_inputs_mb, **gen_kwargs)
+                            gen_out = self.model.generate(**gen_inputs_mb, **gen_kwargs)
 
                             if gen_out.ndim == 1:
                                 gen_out = gen_out.unsqueeze(0)
@@ -1027,15 +1050,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
                             batch_pred_chunks.append(gen_out.cpu().numpy())
                             batch_label_chunks.append(mb["labels"].cpu().numpy())
 
-                            # aggressively release GPU memory
-                            del mb, gen_out, gen_inputs_mb
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
+                            del gen_out, gen_inputs_mb, mb
 
                         # success → commit
                         all_preds.extend(batch_pred_chunks)
                         all_labels.extend(batch_label_chunks)
                         last_err = None
+
+                        # ADAPTIVE RAMP (place it here: only after a successful batch)
+                        self._eval_on_success()
+
                         break
 
                     except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
@@ -1043,6 +1067,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                             raise
                         last_err = e
 
+                        self._eval_on_oom()           # reset stability counter
                         self._eval_oom_cleanup()
                         changed = self._shrink_eval_limits()
 
@@ -1053,13 +1078,18 @@ class TokenPackTrainer(Seq2SeqTrainer):
                                 "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
                                 "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
                                 "eval_changed_limits": float(changed),
+                                "eval_stable": float(getattr(self, "_eval_stable", 0)),
                             })
 
                         if not changed:
                             break
 
                     finally:
-                        self.model.config.use_cache = orig_use_cache
+                        # restore cache flag
+                        try:
+                            self.model.config.use_cache = orig_use_cache
+                        except Exception:
+                            pass
 
                 if last_err is not None:
                     if getattr(self, "oom_skip_batch_on_fail", True):
