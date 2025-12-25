@@ -849,36 +849,36 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         return changed
 
-        def _eval_regime_init(self):
-            if not hasattr(self, "_eval_stable"):
-                self._eval_stable = 0
-
-        def _eval_on_success(self):
-            """
-            Called once per *successful eval batch* (i.e., the batch generated without OOM).
-            Ramps up token budget slowly after enough stable batches.
-            """
-            self._eval_regime_init()
-            self._eval_stable += 1
-
-            # only ramp if we have a budget
-            if self.max_eval_tokens_per_microbatch is None:
-                return
-
-            ramp_every = 50
-            ramp_T = 1.05  # +5%
-            max_T_cap = getattr(self, "max_tokens_per_microbatch", None)  # never exceed train budget if set
-
-            if (self._eval_stable % ramp_every) == 0:
-                new_T = int(self.max_eval_tokens_per_microbatch * ramp_T)
-                if max_T_cap is not None:
-                    new_T = min(new_T, int(max_T_cap))
-                self.max_eval_tokens_per_microbatch = max(new_T, self.oom_min_tokens)
-
-        def _eval_on_oom(self):
-            """Reset stability counter on OOM so we don't ramp immediately after shrinking."""
-            self._eval_regime_init()
+    def _eval_regime_init(self):
+        if not hasattr(self, "_eval_stable"):
             self._eval_stable = 0
+
+    def _eval_on_success(self):
+        """
+        Called once per *successful eval batch* (i.e., the batch generated without OOM).
+        Ramps up token budget slowly after enough stable batches.
+        """
+        self._eval_regime_init()
+        self._eval_stable += 1
+
+        # only ramp if we have a budget
+        if self.max_eval_tokens_per_microbatch is None:
+            return
+
+        ramp_every = 50
+        ramp_T = 1.05  # +5%
+        max_T_cap = getattr(self, "max_tokens_per_microbatch", None)  # never exceed train budget if set
+
+        if (self._eval_stable % ramp_every) == 0:
+            new_T = int(self.max_eval_tokens_per_microbatch * ramp_T)
+            if max_T_cap is not None:
+                new_T = min(new_T, int(max_T_cap))
+            self.max_eval_tokens_per_microbatch = max(new_T, self.oom_min_tokens)
+
+    def _eval_on_oom(self):
+        """Reset stability counter on OOM so we don't ramp immediately after shrinking."""
+        self._eval_regime_init()
+        self._eval_stable = 0
 
     def _token_aware_evaluate(
         self,
