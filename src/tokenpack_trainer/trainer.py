@@ -93,9 +93,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         self._regime_limits = {}  # key -> {"B": int|None, "T": int, "stable": int}
         self._regime_bucket_size = 128   # effective-length bucket size (tokens); tune 64/128/256
-        self._regime_ramp_every = 50     # successes before increasing limits
-        self._regime_ramp_B = 1.10       # +10% B on ramp
-        self._regime_ramp_T = 1.03       # +3% token budget on ramp
+        self._regime_ramp_every = 10
+        self._regime_ramp_B = 1.25
+        self._regime_ramp_T = 1.10
         self._regime_min_B = getattr(self, "oom_min_B", 1)
         self._regime_min_T = getattr(self, "oom_min_tokens", 64)
 
@@ -250,6 +250,29 @@ class TokenPackTrainer(Seq2SeqTrainer):
         mx = int(eff.max().item())
         bucket_size = 128   # choose something coarse
         return int((mx + bucket_size - 1) // bucket_size)
+
+
+    def _autotune_regime_from_peak(self, key: int, eff_tokens_in_step: int, safety: float = 0.90):
+        if not torch.cuda.is_available() or eff_tokens_in_step <= 0:
+            return
+
+        total = torch.cuda.get_device_properties(self.args.device.index).total_memory
+        peak  = torch.cuda.max_memory_allocated(self.args.device)
+
+        # avoid divide-by-zero / nonsense
+        if peak <= 0:
+            return
+
+        bytes_per_eff_token = peak / float(eff_tokens_in_step)
+
+        # target peak = safety * total
+        target_peak = safety * total
+        target_eff_tokens = int(target_peak / max(bytes_per_eff_token, 1e-9))
+
+        # clamp hard
+        INT64_MAX = (1 << 63) - 1
+        st = self._regime_state(key)
+        st["T"] = max(self._regime_min_T, min(target_eff_tokens, INT64_MAX, getattr(self, "_regime_max_T", INT64_MAX)))
 
     def _is_cuda_oom(self, err: BaseException) -> bool:
         msg = str(err)
@@ -1454,6 +1477,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     _ = self._compute_lengths_enc_dec(inputs_work)
                     microbatches = self._make_microbatches(inputs_work)
 
+                enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_work)
+                eff_tokens = int((enc_len + 2.0 * dec_len).sum().item())
+
                 num_micro = max(len(microbatches), 1)
                 total_loss = 0.0
                 total_examples = sum(mb["input_ids"].size(0) for mb in microbatches)
@@ -1502,6 +1528,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 # >>> on success, mark this regime as stable and possibly ramp up
                 if regime_key is not None:
                     self._regime_on_success(regime_key)
+
+                if regime_key is not None and not getattr(self, "_autotuned_keys", set()).__contains__(regime_key):
+                    self._autotune_regime_from_peak(regime_key, eff_tokens, safety=0.90)
+                    self._autotuned_keys = getattr(self, "_autotuned_keys", set())
+                    self._autotuned_keys.add(regime_key)
 
                 # Return a sane scalar for logging
                 return total_loss_weighted
