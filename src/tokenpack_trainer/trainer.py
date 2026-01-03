@@ -201,7 +201,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
             st["T"] = max(self._regime_min_T, int(st["T"] * float(self._regime_ramp_T)))
             # hard clamp to practical + int64 safety
-            st["T"] = self._clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, INT64_MAX))
+            st["T"] = self._clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, self.INT64_MAX))
 
     def _regime_on_oom(self, key: int):
         st = self._regime_state(key)
