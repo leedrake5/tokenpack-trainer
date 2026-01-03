@@ -134,30 +134,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if getattr(self, "processing_class", None) is None and getattr(self, "_processing_class", None) is not None:
             self.processing_class = self._processing_class
 
-
-
-    import sys
-
-    INT64_MAX = (1 << 63) - 1
-
-    def _clamp_int(x: int, lo: int, hi: int) -> int:
-        return max(lo, min(int(x), int(hi)))
-
-    def _regime_on_success(self, key: int):
-        st = self._regime_state(key)
-        st["stable"] += 1
-
-        if st["stable"] % int(self._regime_ramp_every) == 0:
-            if st["B"] is None:
-                st["B"] = 16
-            st["B"] = max(self._regime_min_B, int(st["B"] * float(self._regime_ramp_B)) + 1)
-            st["B"] = _clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
-
-            st["T"] = max(self._regime_min_T, int(st["T"] * float(self._regime_ramp_T)))
-            # hard clamp to practical + int64 safety
-            st["T"] = _clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, INT64_MAX))
-
-
     def _normalize_eval_mode(self, mode: str | None) -> str | None:
         if mode is None:
             return None
