@@ -183,12 +183,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if getattr(self, "max_eval_tokens_per_microbatch", None) is not None:
             self.max_eval_tokens_per_microbatch = min(self.max_eval_tokens_per_microbatch, self.max_tokens_per_microbatch)
 
-    import sys
-
     INT64_MAX = (1 << 63) - 1
 
+    @staticmethod
     def _clamp_int(x: int, lo: int, hi: int) -> int:
-        return max(lo, min(int(x), int(hi)))
+        return max(int(lo), min(int(x), int(hi)))
 
     def _regime_on_success(self, key: int):
         st = self._regime_state(key)
@@ -198,11 +197,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if st["B"] is None:
                 st["B"] = 16
             st["B"] = max(self._regime_min_B, int(st["B"] * float(self._regime_ramp_B)) + 1)
-            st["B"] = _clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
+            st["B"] = self._clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
 
             st["T"] = max(self._regime_min_T, int(st["T"] * float(self._regime_ramp_T)))
             # hard clamp to practical + int64 safety
-            st["T"] = _clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, INT64_MAX))
+            st["T"] = self._clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, INT64_MAX))
 
     def _regime_on_oom(self, key: int):
         st = self._regime_state(key)
@@ -1510,8 +1509,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self._autotuned_keys = getattr(self, "_autotuned_keys", set())
                     self._autotuned_keys.add(regime_key)
 
-                # Return a sane scalar for logging
-                return total_loss_weighted
 
                 # optional logging
                 if attempt > 0 and self.control.should_log:
@@ -1522,6 +1519,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         "max_B_now": float(self.max_examples_per_microbatch or 0),
                         "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
                     })
+
+                # Return a sane scalar for logging
+                return total_loss_weighted
+
+
 
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 if not self._is_cuda_oom(e):
