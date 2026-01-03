@@ -108,7 +108,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self._max_seen_dec_len = 0
         self._max_seen_total_len = 0
         self._num_trunc_hits = 0
-        
+
+        self._regime_max_T = (
+            (self.max_encoder_len or 0) + 2 * (self.max_decoder_len or 0)
+        ) or 8192  # fallback if caps not set
+
+        self._regime_max_B = 1024  # or whatever you consider “absurdly large”
+
+
+
         if getattr(self, "processing_class", None) is None:
             # fallback, just in case
             if hasattr(self, "_processing_class") and self._processing_class is not None:
@@ -125,6 +133,30 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # but processing_class is missing, sync it.
         if getattr(self, "processing_class", None) is None and getattr(self, "_processing_class", None) is not None:
             self.processing_class = self._processing_class
+
+
+
+    import sys
+
+    INT64_MAX = (1 << 63) - 1
+
+    def _clamp_int(x: int, lo: int, hi: int) -> int:
+        return max(lo, min(int(x), int(hi)))
+
+    def _regime_on_success(self, key: int):
+        st = self._regime_state(key)
+        st["stable"] += 1
+
+        if st["stable"] % int(self._regime_ramp_every) == 0:
+            if st["B"] is None:
+                st["B"] = 16
+            st["B"] = max(self._regime_min_B, int(st["B"] * float(self._regime_ramp_B)) + 1)
+            st["B"] = _clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
+
+            st["T"] = max(self._regime_min_T, int(st["T"] * float(self._regime_ramp_T)))
+            # hard clamp to practical + int64 safety
+            st["T"] = _clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, INT64_MAX))
+
 
     def _normalize_eval_mode(self, mode: str | None) -> str | None:
         if mode is None:
@@ -162,24 +194,39 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
     def _apply_regime_limits(self, key: int):
         st = self._regime_state(key)
+        INT64_MAX = (1 << 63) - 1
+
+        T = int(st["T"])
+        if hasattr(self, "_regime_max_T") and self._regime_max_T is not None:
+            T = min(T, int(self._regime_max_T))
+        T = min(T, INT64_MAX)
+
         self.max_examples_per_microbatch = st["B"]
-        self.max_tokens_per_microbatch = st["T"]
+        self.max_tokens_per_microbatch = T
         # keep eval budget <= train budget
         if getattr(self, "max_eval_tokens_per_microbatch", None) is not None:
             self.max_eval_tokens_per_microbatch = min(self.max_eval_tokens_per_microbatch, self.max_tokens_per_microbatch)
+
+    import sys
+
+    INT64_MAX = (1 << 63) - 1
+
+    def _clamp_int(x: int, lo: int, hi: int) -> int:
+        return max(lo, min(int(x), int(hi)))
 
     def _regime_on_success(self, key: int):
         st = self._regime_state(key)
         st["stable"] += 1
 
         if st["stable"] % int(self._regime_ramp_every) == 0:
-            # ramp B up gently
             if st["B"] is None:
                 st["B"] = 16
             st["B"] = max(self._regime_min_B, int(st["B"] * float(self._regime_ramp_B)) + 1)
+            st["B"] = _clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
 
-            # ramp token budget slightly (optional)
             st["T"] = max(self._regime_min_T, int(st["T"] * float(self._regime_ramp_T)))
+            # hard clamp to practical + int64 safety
+            st["T"] = _clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, INT64_MAX))
 
     def _regime_on_oom(self, key: int):
         st = self._regime_state(key)
@@ -417,6 +464,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
         - enc_len: sum over attention_mask
         - dec_len: # of non -100 labels (if 2D); 0 for pretraining/encoder-only.
         """
+        
+        T = self.max_tokens_per_microbatch
+        if T is not None and (not isinstance(T, int) or T <= 0 or T > (1 << 62)):
+            raise RuntimeError(f"max_tokens_per_microbatch is insane: {T}")
+            
         am = inputs.get("attention_mask", None)
         if am is None:
             raise ValueError(
