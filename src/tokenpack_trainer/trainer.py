@@ -109,9 +109,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self._max_seen_total_len = 0
         self._num_trunc_hits = 0
 
-        self._regime_max_T = (
-            (self.max_encoder_len or 0) + 2 * (self.max_decoder_len or 0)
-        ) or 8192  # fallback if caps not set
+        self._regime_max_T = int(max_tokens_per_microbatch * 4) if max_tokens_per_microbatch is not None else (1 << 62)
 
         self._regime_max_B = 1024  # or whatever you consider “absurdly large”
 
