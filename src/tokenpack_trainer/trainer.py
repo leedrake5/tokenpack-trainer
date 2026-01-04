@@ -567,22 +567,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
         return super()._prepare_inputs(inputs)
 
     def _to_device(self, inputs: dict) -> dict:
-        """
-        Explicitly move a microbatch dict to self.args.device.
-        Used only when use_cpu_microbatch=True.
-        """
         device = self.args.device
         out = {}
-
         for k, v in inputs.items():
             if isinstance(v, torch.Tensor):
-                kwargs = {"device": device}
+                kwargs = {"device": device, "non_blocking": True}
                 if self.is_deepspeed_enabled and (torch.is_floating_point(v) or torch.is_complex(v)):
                     kwargs["dtype"] = self.accelerator.state.deepspeed_plugin.hf_ds_config.dtype()
                 out[k] = v.to(**kwargs)
             else:
                 out[k] = v
-
         return out
 
     def _move_to_cpu(self, inputs: dict) -> dict:
@@ -640,6 +634,56 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 "adaptive_max_B": float(self.max_examples_per_microbatch or 0),
             })
 
+
+    class CUDAPrefetcher:
+        """
+        Wrap a DataLoader to asynchronously move each batch to GPU on a side stream.
+        """
+        def __init__(self, loader, device):
+            self.loader = loader
+            self.device = device
+            self.stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+        def __iter__(self):
+            if self.stream is None:
+                yield from self.loader
+                return
+
+            it = iter(self.loader)
+
+            def _to_device(batch):
+                out = {}
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        out[k] = v.to(self.device, non_blocking=True)
+                    else:
+                        out[k] = v
+                return out
+
+            # Preload first
+            with torch.cuda.stream(self.stream):
+                next_batch = next(it, None)
+                if next_batch is not None:
+                    next_batch = _to_device(next_batch)
+
+            while True:
+                torch.cuda.current_stream().wait_stream(self.stream)
+                batch = next_batch
+                if batch is None:
+                    break
+                # Preload next
+                with torch.cuda.stream(self.stream):
+                    next_batch = next(it, None)
+                    if next_batch is not None:
+                        next_batch = _to_device(next_batch)
+                yield batch
+
+    def get_train_dataloader(self):
+        dl = super().get_train_dataloader() if self.max_tokens_per_batch is None else <your custom loader>
+        if torch.cuda.is_available() and not self.use_cpu_microbatch:
+            dl = CUDAPrefetcher(dl, self.args.device)
+        return dl
+
     def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None):
         # Compute lengths
         enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
@@ -656,9 +700,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
         cur_indices: list[int] = []
         cur_tokens = 0
 
-        sorted_indices = sorted(range(N), key=lambda i: lengths[i])
+        #sorted_indices = sorted(range(N), key=lambda i: lengths[i])
 
-        for i in sorted_indices:
+        for i in range(N):
             L = lengths[i]
 
             too_many_tokens = cur_indices and (cur_tokens + L) > budget
