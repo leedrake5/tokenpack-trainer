@@ -357,56 +357,62 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
+        # ---- build the DataLoader exactly as before ----
         if self.max_tokens_per_batch is None:
-            return super().get_train_dataloader()
-
-        ds = self.train_dataset
-
-        # 🔹 Drop raw text / unused columns *here*
-        if hasattr(ds, "column_names"):
-            keep_cols = {
-                "input_ids",
-                "attention_mask",
-                "labels",
-                "decoder_input_ids",
-                "decoder_attention_mask",
-                self.length_column_name,   # "input_length"
-            }
-            to_remove = [c for c in ds.column_names if c not in keep_cols]
-            if to_remove:
-                ds = ds.remove_columns(to_remove)
-
-        # Now safe to use for lengths + collator
-        if hasattr(ds, "column_names"):
-            raw_lengths = ds[self.length_column_name]
+            dl = super().get_train_dataloader()
         else:
-            raw_lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
+            ds = self.train_dataset
 
-        # IMPORTANT: cap lengths to what the model will actually see
-        if self.max_encoder_len is not None:
-            lengths_for_sampler = [min(int(L), self.max_encoder_len) for L in raw_lengths]
-        else:
-            lengths_for_sampler = [int(L) for L in raw_lengths]
+            if hasattr(ds, "column_names"):
+                keep_cols = {
+                    "input_ids",
+                    "attention_mask",
+                    "labels",
+                    "decoder_input_ids",
+                    "decoder_attention_mask",
+                    self.length_column_name,
+                }
+                to_remove = [c for c in ds.column_names if c not in keep_cols]
+                if to_remove:
+                    ds = ds.remove_columns(to_remove)
 
-        batch_sampler = LengthBucketedBatchSampler(
-            lengths=lengths_for_sampler,
-            max_tokens_per_batch=self.max_tokens_per_batch,
-            bucket_size=16,
-            shuffle=True,
-            drop_last=False,
-            long_behavior="truncate",
-            max_length_in_batch=self.max_encoder_len,  # optional but recommended
-        )
+            if hasattr(ds, "column_names"):
+                raw_lengths = ds[self.length_column_name]
+            else:
+                raw_lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
 
-        return DataLoader(
-            ds,
-            batch_sampler=batch_sampler,
-            collate_fn=self.data_collator,
-            num_workers=self.args.dataloader_num_workers,
-            pin_memory=self.args.dataloader_pin_memory,
-            persistent_workers=self.args.dataloader_persistent_workers,
-            prefetch_factor=getattr(self.args, "dataloader_prefetch_factor", 2),
-        )
+            if self.max_encoder_len is not None:
+                lengths_for_sampler = [
+                    min(int(L), self.max_encoder_len) for L in raw_lengths
+                ]
+            else:
+                lengths_for_sampler = [int(L) for L in raw_lengths]
+
+            batch_sampler = LengthBucketedBatchSampler(
+                lengths=lengths_for_sampler,
+                max_tokens_per_batch=self.max_tokens_per_batch,
+                bucket_size=16,
+                shuffle=True,
+                drop_last=False,
+                long_behavior="truncate",
+                max_length_in_batch=self.max_encoder_len,
+            )
+
+            dl = DataLoader(
+                ds,
+                batch_sampler=batch_sampler,
+                collate_fn=self.data_collator,
+                num_workers=self.args.dataloader_num_workers,
+                pin_memory=self.args.dataloader_pin_memory,
+                persistent_workers=self.args.dataloader_persistent_workers,
+                prefetch_factor=getattr(self.args, "dataloader_prefetch_factor", 2),
+            )
+
+        # ---- OPTIONAL GPU prefetch wrapper ----
+        if torch.cuda.is_available() and not self.use_cpu_microbatch:
+            dl = CUDAPrefetcher(dl, self.args.device)
+
+        return dl
 
     # ----------------------------------------------------------------------
     # Truncation helper
@@ -677,12 +683,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     if next_batch is not None:
                         next_batch = _to_device(next_batch)
                 yield batch
-
-    def get_train_dataloader(self):
-        dl = super().get_train_dataloader() if self.max_tokens_per_batch is None else <your custom loader>
-        if torch.cuda.is_available() and not self.use_cpu_microbatch:
-            dl = CUDAPrefetcher(dl, self.args.device)
-        return dl
 
     def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None):
         # Compute lengths
