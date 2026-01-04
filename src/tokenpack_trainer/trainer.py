@@ -11,6 +11,48 @@ import numpy as np
 
 from .samplers import LengthBucketedBatchSampler
 
+class CUDAPrefetcher:
+    """
+    Wrap a DataLoader to asynchronously move each batch to GPU on a side stream.
+    """
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+    def __iter__(self):
+        if self.stream is None:
+            yield from self.loader
+            return
+
+        it = iter(self.loader)
+
+        def _to_device(batch):
+            out = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    out[k] = v.to(self.device, non_blocking=True)
+                else:
+                    out[k] = v
+            return out
+
+        # Preload first
+        with torch.cuda.stream(self.stream):
+            next_batch = next(it, None)
+            if next_batch is not None:
+                next_batch = _to_device(next_batch)
+
+        while True:
+            torch.cuda.current_stream().wait_stream(self.stream)
+            batch = next_batch
+            if batch is None:
+                break
+            # Preload next
+            with torch.cuda.stream(self.stream):
+                next_batch = next(it, None)
+                if next_batch is not None:
+                    next_batch = _to_device(next_batch)
+            yield batch
 
 class TokenPackTrainer(Seq2SeqTrainer):
     """
@@ -640,49 +682,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 "adaptive_max_B": float(self.max_examples_per_microbatch or 0),
             })
 
-
-    class CUDAPrefetcher:
-        """
-        Wrap a DataLoader to asynchronously move each batch to GPU on a side stream.
-        """
-        def __init__(self, loader, device):
-            self.loader = loader
-            self.device = device
-            self.stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-
-        def __iter__(self):
-            if self.stream is None:
-                yield from self.loader
-                return
-
-            it = iter(self.loader)
-
-            def _to_device(batch):
-                out = {}
-                for k, v in batch.items():
-                    if isinstance(v, torch.Tensor):
-                        out[k] = v.to(self.device, non_blocking=True)
-                    else:
-                        out[k] = v
-                return out
-
-            # Preload first
-            with torch.cuda.stream(self.stream):
-                next_batch = next(it, None)
-                if next_batch is not None:
-                    next_batch = _to_device(next_batch)
-
-            while True:
-                torch.cuda.current_stream().wait_stream(self.stream)
-                batch = next_batch
-                if batch is None:
-                    break
-                # Preload next
-                with torch.cuda.stream(self.stream):
-                    next_batch = next(it, None)
-                    if next_batch is not None:
-                        next_batch = _to_device(next_batch)
-                yield batch
 
     def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None):
         # Compute lengths
