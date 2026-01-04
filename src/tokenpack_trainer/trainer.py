@@ -14,11 +14,24 @@ from .samplers import LengthBucketedBatchSampler
 class CUDAPrefetcher:
     """
     Wrap a DataLoader to asynchronously move each batch to GPU on a side stream.
+
+    IMPORTANT for HF Trainer: preserve __len__ and key attributes, otherwise
+    Trainer can't infer max_steps.
     """
     def __init__(self, loader, device):
         self.loader = loader
         self.device = device
         self.stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
+    def __len__(self):
+        # HF Trainer relies on len(dataloader) for step math
+        if hasattr(self.loader, "__len__"):
+            return len(self.loader)
+        raise TypeError("Underlying loader has no __len__; set args.max_steps > 0")
+
+    def __getattr__(self, name):
+        # Forward common attributes (dataset, batch_sampler, etc.)
+        return getattr(self.loader, name)
 
     def __iter__(self):
         if self.stream is None:
@@ -36,7 +49,6 @@ class CUDAPrefetcher:
                     out[k] = v
             return out
 
-        # Preload first
         with torch.cuda.stream(self.stream):
             next_batch = next(it, None)
             if next_batch is not None:
@@ -47,11 +59,12 @@ class CUDAPrefetcher:
             batch = next_batch
             if batch is None:
                 break
-            # Preload next
+
             with torch.cuda.stream(self.stream):
                 next_batch = next(it, None)
                 if next_batch is not None:
                     next_batch = _to_device(next_batch)
+
             yield batch
 
 class TokenPackTrainer(Seq2SeqTrainer):
