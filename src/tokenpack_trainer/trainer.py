@@ -118,9 +118,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
         oom_min_B: int = 1,
         oom_min_tokens: int = 64,
         oom_skip_batch_on_fail: bool = True, # if retries exhausted, just skip batch
+        eval_data_collator=None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.eval_data_collator = eval_data_collator
         self.max_tokens_per_microbatch = int(max_tokens_per_microbatch)
         self.max_encoder_len = int(max_encoder_len) if max_encoder_len is not None else None
         self.max_decoder_len = int(max_decoder_len) if max_decoder_len is not None else None
@@ -911,11 +913,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
             long_behavior="truncate",
             max_length_in_batch=self.max_encoder_len,
         )
-
+        
         return DataLoader(
             eval_dataset,
             batch_sampler=batch_sampler,
-            collate_fn=self.data_collator,
+            collate_fn=(self.eval_data_collator or self.data_collator),
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
             persistent_workers=self.args.dataloader_persistent_workers,
