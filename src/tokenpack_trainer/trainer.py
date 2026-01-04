@@ -1017,7 +1017,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     num_examples = 0
                     start_time = time.time()
 
-                    for batch in dataloader:
+                    for batch in tqdm(dataloader, desc=desc, leave=False):
                         num_steps += 1
                         labels = batch.get("labels", None)
                         if labels is None:
