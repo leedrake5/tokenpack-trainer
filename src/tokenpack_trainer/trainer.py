@@ -168,7 +168,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         self._regime_max_T = int(max_tokens_per_microbatch * 4) if max_tokens_per_microbatch is not None else (1 << 62)
 
-        self._regime_max_B = 1024  # or whatever you consider “absurdly large”
+        self._regime_max_B = 1024
 
 
 
@@ -758,7 +758,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
             L = lengths[i]
             if self.max_tokens_per_microbatch is not None and L > self.max_tokens_per_microbatch:
                 # single example exceeds cap; we already logged this in _compute_lengths_enc_dec
-                # You can choose to raise here if you want:
                 # raise RuntimeError(f"Example {i} has {L} tokens > max_tokens_per_microbatch={self.max_tokens_per_microbatch}")
                 pass
 
@@ -778,6 +777,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             microbatches.append(cur_indices)
 
         return microbatches
+
 
     def prediction_step(
         self,
@@ -1148,7 +1148,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     # estimate tokens (cheap)
                     enc = int(batch_gpu["attention_mask"].sum().item())
                     dec = int((batch_gpu["labels"] != -100).sum().item())
-                    eff = enc + 2.0 * dec  # same alpha you use
+                    eff = enc + 2.0 * dec
 
                     # also respect max_examples_per_microbatch if set
                     B = int(batch_gpu["input_ids"].size(0))
@@ -1165,7 +1165,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         self._eval_on_success()
                         continue
   
-                # truncate on the same device you will use
                 if self.use_cpu_microbatch:
                     plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
                 else:
@@ -1389,6 +1388,46 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
     logger = logging.get_logger(__name__)
 
+
+    def _token_aware_loss_only(self, eval_dataset, desc="Eval (token-weighted loss)"):
+        from tqdm.auto import tqdm
+        import time, torch
+
+        dl = self.get_eval_dataloader(eval_dataset)
+        total_loss_tokens = 0.0
+        total_tokens = 0
+        num_steps = 0
+        num_examples = 0
+        t0 = time.time()
+
+        for batch in tqdm(dl, desc=desc, leave=False):
+            num_steps += 1
+            labels = batch.get("labels", None)
+            if labels is None:
+                continue
+
+            with torch.no_grad():
+                loss, _, _ = self.prediction_step(self.model, batch, prediction_loss_only=True)
+
+            # IMPORTANT: count decoder tokens for THIS BATCH (not per microbatch)
+            # (prediction_step already token-weights within a batch)
+            ntok = int((labels.detach().to("cpu") != -100).sum().item())
+            if loss is not None and ntok > 0:
+                total_loss_tokens += float(loss.item()) * ntok
+                total_tokens += ntok
+
+            num_examples += int(labels.size(0))
+
+        runtime = time.time() - t0
+        eval_loss = total_loss_tokens / total_tokens if total_tokens > 0 else float("nan")
+
+        return {
+            "eval_loss": float(eval_loss),
+            "eval_runtime": float(runtime),
+            "eval_samples_per_second": float(num_examples / runtime) if runtime > 0 else 0.0,
+            "eval_steps_per_second": float(num_steps / runtime) if runtime > 0 else 0.0,
+        }
+
     def evaluate(
         self,
         eval_dataset=None,
@@ -1399,52 +1438,64 @@ class TokenPackTrainer(Seq2SeqTrainer):
         """
         eval_mode:
           - None / "hf" / "vanilla" / "huggingface": use standard HF evaluation_loop
-          - "token_aware_metrics": use our custom generation+metrics
+          - "token_aware_loss": token-weighted loss-only (no preds)
+          - "token_aware_metrics": token-aware generation/preds + compute_metrics
+          - "auto": (optional) use token-aware loss-only when no metrics/generate, otherwise HF
         """
+        eval_dataset = eval_dataset or self.eval_dataset
+        if eval_dataset is None:
+            raise ValueError("Evaluation requires an eval_dataset.")
 
-        # 1) Decide mode (ALWAYS define it first)
         requested = eval_mode if eval_mode is not None else getattr(self, "eval_mode", None)
-        mode = self._normalize_eval_mode(requested)  # returns None or "token_aware_metrics" or other
+        mode = self._normalize_eval_mode(requested)
 
-        # 2) Token-aware loop
+        wants_generate = bool(getattr(self.args, "predict_with_generate", False))
+        has_metrics = getattr(self, "compute_metrics", None) is not None
+
+        # ----------------------------
+        # Explicit token-aware modes
+        # ----------------------------
+        if mode == "token_aware_loss":
+            if wants_generate or has_metrics:
+                raise ValueError(
+                    "eval_mode='token_aware_loss' is loss-only. "
+                    "Set predict_with_generate=False and compute_metrics=None "
+                    "or use eval_mode='token_aware_metrics'."
+                )
+            return self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+
         if mode == "token_aware_metrics":
-            if eval_dataset is None:
-                eval_dataset = self.eval_dataset
-            if eval_dataset is None:
-                raise ValueError("Evaluation requires an eval_dataset.")
-
-            start_time = time.time()
-            metrics = self._token_aware_evaluate(
+            if not has_metrics:
+                raise ValueError(
+                    "eval_mode='token_aware_metrics' requires compute_metrics to be set. "
+                    "Use eval_mode='token_aware_loss' for loss-only."
+                )
+            return self._token_aware_evaluate(
                 eval_dataset=eval_dataset,
                 max_eval_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
                 desc="eval (token-aware)",
             )
-            runtime = time.time() - start_time
-            metrics.setdefault("eval_runtime", float(runtime))
 
-            if self.state.epoch is not None:
-                metrics[f"{metric_key_prefix}_epoch"] = self.state.epoch
-                metrics["epoch"] = self.state.epoch
+        # ----------------------------
+        # 2) Auto mode
+        # ----------------------------
+        if mode == "auto":
+            if (not wants_generate) and (not has_metrics):
+                return self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+            return super().evaluate(
+                eval_dataset=eval_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
 
-            self.log(metrics)
-            self.state.log_history.append(metrics)
-
-            if self.is_world_process_zero():
-                logger.info("***** eval results (token-aware) *****")
-                for k in sorted(metrics.keys()):
-                    logger.info("  %s = %s", k, metrics[k])
-
-            return metrics
-
-        # 3) Default: standard HF behavior
+        # ----------------------------
+        # 3) Pure HF behavior
+        # ----------------------------
         return super().evaluate(
             eval_dataset=eval_dataset,
             ignore_keys=ignore_keys,
             metric_key_prefix=metric_key_prefix,
         )
-    # --------------------------------------------------------------
-    # Core override
-    # --------------------------------------------------------------
 
     def _contiguous_inputs(self, inputs: dict) -> dict:
         out = {}
