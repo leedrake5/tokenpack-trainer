@@ -232,7 +232,4 @@ class LengthBucketedBatchSampler(Sampler):
                 yield current_batch
 
     def __len__(self):
-        # Lazy computation - only count batches when __len__ is first called
-        if self._num_batches is None:
-            self._num_batches = self._count_batches()
-        return self._num_batches
+        return self._count_batches()
