@@ -39,8 +39,8 @@ class LengthBucketedBatchSampler(Sampler):
         self.bucket_ids = sorted(buckets.keys())
         self.buckets = {b: idxs for b, idxs in buckets.items()}
 
-        # Pre-compute exact batch count (without shuffling) for accurate __len__
-        self._num_batches = self._count_batches()
+        # Lazy-computed batch count (deferred until __len__ is called)
+        self._num_batches: int | None = None
 
     def _count_batches(self) -> int:
         """Count batches by simulating iteration without shuffling."""
@@ -173,4 +173,7 @@ class LengthBucketedBatchSampler(Sampler):
                 yield current_batch
 
     def __len__(self):
+        # Lazy computation - only count batches when __len__ is first called
+        if self._num_batches is None:
+            self._num_batches = self._count_batches()
         return self._num_batches

@@ -16,6 +16,13 @@ dependencies = [
   "tqdm>=4.60",
 ]
 
+[project.optional-dependencies]
+metrics = [
+  "evaluate>=0.4",
+  "sacrebleu>=2.0",
+  "nltk>=3.8",  # for METEOR
+]
+
 [project.urls]
 Homepage = "https://github.com/leedrake5/tokenpack-trainer"
 Issues   = "https://github.com/leedrake5/tokenpack-trainer/issues"
