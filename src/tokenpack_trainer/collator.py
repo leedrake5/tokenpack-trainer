@@ -1,32 +1,93 @@
+"""
+Data collators for token-packed seq2seq training.
+
+This module provides two collators optimized for variable-length sequences:
+
+1. T5SpanCorruptionCollatorFast: For T5-style span denoising pretraining.
+   Corrupts input by replacing random spans with sentinel tokens.
+
+2. CappedSeq2SeqCollator: For seq2seq fine-tuning (translation, instruction).
+   Wraps HuggingFace's DataCollatorForSeq2Seq with length caps.
+
+Both collators include `input_length` in their output for compatibility with
+TokenPackTrainer's token-aware batching.
+"""
+
 import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
+
 import numpy as np
 import torch
-from typing import List, Dict, Any
-from transformers import PreTrainedTokenizerBase
+from transformers import DataCollatorForSeq2Seq, PreTrainedModel, PreTrainedTokenizerBase
 
-def shift_tokens_right(input_ids: torch.Tensor,
-                       pad_token_id: int,
-                       decoder_start_token_id: int) -> torch.Tensor:
+
+def shift_tokens_right(
+    input_ids: torch.Tensor,
+    pad_token_id: int,
+    decoder_start_token_id: int,
+) -> torch.Tensor:
     """
-    Shift input ids one token to the right, and replace -100 in the
-    labels by pad_token_id (so that cross‐entropy ignores it).
+    Shift input ids one token to the right for decoder input preparation.
+
+    This is used to create decoder_input_ids from labels: the decoder sees
+    the previous token to predict the next one.
+
+    Args:
+        input_ids: Label token IDs [batch, seq_len]
+        pad_token_id: Token ID to use for padding
+        decoder_start_token_id: Token ID for decoder start (e.g., <pad> for T5)
+
+    Returns:
+        Shifted tensor suitable for decoder_input_ids
     """
-    # make a new tensor full of pad tokens
     shifted = input_ids.new_zeros(input_ids.shape)
-
-    # copy everything except the last token
     shifted[..., 1:] = input_ids[..., :-1].clone()
-    # first token is the decoder start token
     shifted[..., 0] = decoder_start_token_id
-
-    # replace -100 (ignore_index) by pad_id so they’re not completely lost
+    # Replace -100 (ignore_index) by pad_id so cross-entropy ignores it
     shifted.masked_fill_(shifted == -100, pad_token_id)
     return shifted
 
 
 class T5SpanCorruptionCollatorFast:
     """
-    Faster span corruption collator following the T5 'random spans' recipe.
+    Collator for T5-style span corruption pretraining.
+
+    Implements the denoising objective from the T5 paper: randomly select spans
+    of tokens, replace them with sentinel tokens (<extra_id_0>, <extra_id_1>, ...),
+    and train the model to reconstruct the original spans.
+
+    This is the standard pretraining objective for T5, mT5, and similar models.
+
+    Parameters:
+    -----------
+    tokenizer : PreTrainedTokenizerBase
+        Tokenizer with sentinel tokens (extra_id_*) defined.
+
+    noise_density : float, default=0.15
+        Fraction of tokens to corrupt (replace with sentinels).
+
+    mean_noise_span_length : float, default=3.0
+        Average length of corrupted spans. Higher = fewer, longer spans.
+
+    input_length : int, default=64
+        Maximum encoder input length after corruption.
+
+    target_length : int, default=64
+        Maximum decoder target length.
+
+    dynamic_inputs : bool, default=True
+        If True, pad to max length in batch rather than fixed input_length.
+        Reduces padding waste for short sequences.
+
+    Example:
+    --------
+        >>> collator = T5SpanCorruptionCollatorFast(
+        ...     tokenizer=tokenizer,
+        ...     noise_density=0.15,
+        ...     mean_noise_span_length=3.0,
+        ... )
+        >>> batch = collator([{"input_ids": [1, 2, 3, 4, 5]}])
     """
 
     def __init__(
@@ -219,21 +280,15 @@ class T5SpanCorruptionCollatorFast:
             "input_length": attention_mask.sum(dim=-1),  # pre-computed for token-aware batching
         }
 
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Union
-
-import torch
-from transformers import DataCollatorForSeq2Seq, PreTrainedTokenizerBase, PreTrainedModel
-
-
 def _truncate_list_like(x, max_len: int):
     """
-    Truncate something that might be a list, numpy array, or tensor,
-    and always return a plain Python list of ints.
+    Truncate a list-like object to max_len, handling various input types.
+
+    Works with lists, numpy arrays, and tensors. Always returns a plain
+    Python list suitable for collation.
     """
     if isinstance(x, torch.Tensor):
         x = x.tolist()
-    # If it's None, just return as-is
     if x is None:
         return x
     return x[:max_len]
@@ -242,10 +297,36 @@ def _truncate_list_like(x, max_len: int):
 @dataclass
 class CappedSeq2SeqCollator:
     """
-    Thin wrapper around HF's DataCollatorForSeq2Seq that:
-      - Caps encoder length to `input_length`,
-      - Caps decoder/label length to `target_length`,
-      - Then defers to DataCollatorForSeq2Seq for padding, shifting, etc.
+    Seq2seq collator with hard length caps for encoder and decoder.
+
+    Wraps HuggingFace's DataCollatorForSeq2Seq, adding:
+    - Truncation of encoder inputs to `input_length`
+    - Truncation of decoder labels to `target_length`
+    - Pre-computed `input_length` field for token-aware batching
+
+    Use this for seq2seq fine-tuning tasks like translation, summarization,
+    or instruction following.
+
+    Parameters:
+    -----------
+    base_collator : DataCollatorForSeq2Seq
+        HuggingFace collator to delegate to after truncation.
+
+    input_length : int, default=512
+        Maximum encoder sequence length.
+
+    target_length : int, default=512
+        Maximum decoder/label sequence length.
+
+    Example:
+    --------
+        >>> from transformers import DataCollatorForSeq2Seq
+        >>> base = DataCollatorForSeq2Seq(tokenizer, model=model)
+        >>> collator = CappedSeq2SeqCollator(
+        ...     base_collator=base,
+        ...     input_length=512,
+        ...     target_length=128,
+        ... )
     """
 
     base_collator: DataCollatorForSeq2Seq

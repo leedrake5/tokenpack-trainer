@@ -1,6 +1,31 @@
+"""
+Seq2seq evaluation metrics for token-aware training.
+
+This module provides make_seq2seq_compute_metrics(), a factory function that
+creates a compute_metrics callable for HuggingFace Trainer evaluation.
+
+Metrics computed:
+- BLEU: Bilingual Evaluation Understudy (translation quality)
+- chrF: Character-level F-score (robust to morphological variation)
+- METEOR: Metric for Evaluation of Translation with Explicit ORdering
+          (English targets only by default, uses WordNet for synonyms)
+- gen_len: Average generation length in tokens
+
+Usage:
+------
+    >>> from tokenpack_trainer import make_seq2seq_compute_metrics
+    >>> compute_metrics = make_seq2seq_compute_metrics(
+    ...     tokenizer=tokenizer,
+    ...     eval_dataset=eval_dataset,  # optional, for METEOR filtering
+    ... )
+    >>> trainer = TokenPackTrainer(..., compute_metrics=compute_metrics)
+
+Note: Requires optional dependencies: pip install tokenpack-trainer[metrics]
+"""
+
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional
 
 import numpy as np
 

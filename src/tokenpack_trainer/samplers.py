@@ -1,3 +1,18 @@
+"""
+Length-bucketed batch sampling for token-aware training.
+
+This module provides LengthBucketedBatchSampler, which groups dataset examples
+by sequence length and packs them into batches based on token count rather than
+example count. This minimizes padding waste for variable-length sequences.
+
+The sampler works in two phases:
+1. Bucketing: Group examples by length into buckets (e.g., lengths 1-16, 17-32, ...)
+2. Packing: Fill batches within each bucket until token budget is reached
+
+This approach is particularly effective for datasets with high length variance,
+such as cuneiform texts (avg ~13 tokens, some reaching thousands).
+"""
+
 import math
 import random
 from collections import defaultdict
@@ -6,9 +21,53 @@ from torch.utils.data import Sampler
 
 class LengthBucketedBatchSampler(Sampler):
     """
-    Buckets by length and packs indices so that:
-      - sum(lengths in batch) <= max_tokens_per_batch
-      - optionally: max(length in batch) <= max_length_in_batch
+    Batch sampler that groups examples by length and packs to a token budget.
+
+    Instead of fixed batch_size, this sampler ensures:
+        sum(lengths in batch) <= max_tokens_per_batch
+
+    This eliminates wasted computation on padding tokens, especially for
+    datasets with highly variable sequence lengths.
+
+    Parameters:
+    -----------
+    lengths : Iterable[int]
+        Sequence length for each example in the dataset. Must be indexable
+        with the same ordering as the dataset.
+
+    max_tokens_per_batch : int
+        Maximum total tokens per batch. Batches are filled greedily until
+        this budget would be exceeded.
+
+    bucket_size : int, default=16
+        Width of length buckets. Smaller = tighter grouping, less padding.
+        For short sequences (avg <20 tokens), try 4-8.
+
+    shuffle : bool, default=True
+        Whether to shuffle bucket order and examples within buckets.
+
+    drop_last : bool, default=False
+        Whether to drop incomplete final batches.
+
+    long_behavior : {"truncate", "skip", "single"}, default="truncate"
+        How to handle examples longer than max_tokens_per_batch:
+        - "truncate": Include in batch (will be truncated by collator)
+        - "skip": Exclude from all batches
+        - "single": Put in a batch by itself
+
+    max_length_in_batch : int, optional
+        Maximum sequence length allowed in any batch. Examples exceeding
+        this are handled according to long_behavior.
+
+    Example:
+    --------
+        >>> lengths = [len(ex["input_ids"]) for ex in dataset]
+        >>> sampler = LengthBucketedBatchSampler(
+        ...     lengths=lengths,
+        ...     max_tokens_per_batch=4096,
+        ...     bucket_size=8,
+        ... )
+        >>> dataloader = DataLoader(dataset, batch_sampler=sampler, ...)
     """
 
     def __init__(
@@ -18,7 +77,7 @@ class LengthBucketedBatchSampler(Sampler):
         bucket_size: int = 16,
         shuffle: bool = True,
         drop_last: bool = False,
-        long_behavior: str = "truncate",  # {"truncate", "skip", "single"}
+        long_behavior: str = "truncate",
         max_length_in_batch: int | None = None,
     ):
         assert long_behavior in {"truncate", "skip", "single"}

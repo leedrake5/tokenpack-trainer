@@ -1,15 +1,62 @@
-import torch
-from transformers import Seq2SeqTrainer
-from torch.nn.utils.rnn import pad_sequence
+"""
+TokenPack Trainer - Token-aware batch processing for efficient seq2seq training.
+
+This module provides TokenPackTrainer, a drop-in replacement for HuggingFace's
+Seq2SeqTrainer that uses token-based batching instead of fixed batch sizes.
+
+Key Concepts:
+-------------
+1. Token Budgeting: Instead of batch_size × max_seq_length, batches are formed
+   by sum(tokens_in_batch) ≤ token_budget. This eliminates padding waste for
+   variable-length sequences.
+
+2. Two-Level Budgeting:
+   - Batch level: max_tokens_per_batch controls the sampler (how many examples
+     are grouped together from the dataset)
+   - Microbatch level: max_tokens_per_microbatch controls how examples within
+     a batch are split for GPU memory management
+
+3. Adaptive OOM Handling: The trainer learns stable microbatch sizes per "regime"
+   (groups of similar sequence lengths) and automatically adjusts on OOM.
+
+4. Gradient Equivalence: Microbatch gradients are accumulated to produce
+   mathematically equivalent gradients to full-batch training.
+
+Architecture:
+-------------
+    Dataset → LengthBucketedBatchSampler → DataLoader → TokenPackTrainer
+                     ↓                                         ↓
+              Groups by length                          Splits into microbatches
+              Packs to token budget                     Handles OOM adaptively
+
+Example:
+--------
+    >>> from tokenpack_trainer import TokenPackTrainer
+    >>> trainer = TokenPackTrainer(
+    ...     model=model,
+    ...     args=training_args,
+    ...     train_dataset=dataset,
+    ...     max_tokens_per_batch=16384,      # Sampler budget
+    ...     max_tokens_per_microbatch=4096,  # GPU memory budget
+    ...     max_encoder_len=512,
+    ...     max_decoder_len=128,
+    ... )
+"""
+
+import os
 import time
 from typing import Any, List, Optional
-from transformers.utils import logging
-from torch.utils.data import DataLoader
-logger = logging.get_logger(__name__)
-import os
+
 import numpy as np
+import torch
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
+from transformers import Seq2SeqTrainer
+from transformers.utils import logging
 
 from .samplers import LengthBucketedBatchSampler
+
+logger = logging.get_logger(__name__)
 
 class CUDAPrefetcher:
     """
@@ -69,18 +116,54 @@ class CUDAPrefetcher:
 
 class TokenPackTrainer(Seq2SeqTrainer):
     """
-    Trainer that:
-      - (optionally) truncates encoder/decoder sequences to hard caps,
-      - splits each batch into token-budgeted microbatches (enc_len + dec_len),
-      - tracks/logs max lengths seen so far.
+    Token-aware Seq2Seq trainer with adaptive microbatching and OOM recovery.
 
-    If use_cpu_microbatch = True:
-      - keep full HF batch on CPU for planning,
-      - move only microbatches to GPU via _to_device.
+    This trainer extends HuggingFace's Seq2SeqTrainer to handle variable-length
+    sequences efficiently by:
 
-    If use_cpu_microbatch = False:
-      - use HF/Accelerate's normal device placement,
-      - microbatch on whatever device inputs are already on (typically GPU).
+    1. Packing batches by token count instead of example count
+    2. Splitting batches into microbatches that fit GPU memory
+    3. Learning optimal microbatch sizes per sequence length regime
+    4. Automatically recovering from OOM errors
+
+    Key Parameters:
+    ---------------
+    max_tokens_per_batch : int
+        Maximum total tokens per batch for the dataloader sampler.
+        Controls how many examples are grouped together. Default: None (uses HF default).
+
+    max_tokens_per_microbatch : int
+        Maximum tokens per microbatch for GPU processing. Smaller = less memory,
+        more microbatches. Start with ~4096, increase if no OOMs. Default: 400.
+
+    max_encoder_len / max_decoder_len : int, optional
+        Hard truncation limits for encoder/decoder sequences.
+
+    use_cpu_microbatch : bool
+        If True (default), keep batches on CPU and transfer microbatches to GPU.
+        Uses prefetching to overlap transfer with computation.
+        If False, use standard HF device placement.
+
+    eval_mode : str, optional
+        "hf" or None: Use standard HF evaluation (faster, no generation).
+        "token_aware_metrics": Use token-aware eval with generation for BLEU/chrF.
+
+    Adaptive OOM Parameters:
+    ------------------------
+    oom_max_retries : int
+        Max retry attempts on OOM before skipping batch. Default: 3.
+
+    oom_shrink_B : float
+        Factor to shrink batch size on OOM. Default: 0.5.
+
+    oom_shrink_tokens : float
+        Factor to shrink token budget on OOM. Default: 0.85.
+
+    Debugging:
+    ----------
+    Use get_regime_stats() to inspect learned adaptive limits:
+        >>> stats = trainer.get_regime_stats()
+        >>> print(stats['regimes'])  # Per-regime B/T limits
     """
     
         # --- Compatibility shim: silence processing_class deprecation, use processing_class internally ---
@@ -151,29 +234,33 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.oom_skip_batch_on_fail = bool(oom_skip_batch_on_fail)
         self.sampler_bucket_size = int(sampler_bucket_size)
 
-        self._oom_events = 0
-        self._oom_skipped_batches = 0
+        # --- OOM tracking ---
+        self._oom_events = 0           # Total OOM events across all batches
+        self._oom_skipped_batches = 0  # Batches skipped after exhausting retries
 
-        self._regime_limits = {}  # key -> {"B": int|None, "T": int, "stable": int}
-        self._regime_bucket_size = 128   # effective-length bucket size (tokens); tune 64/128/256
-        self._regime_ramp_every = 10
-        self._regime_ramp_B = 1.25
-        self._regime_ramp_T = 1.10
+        # --- Adaptive Regime Management ---
+        # Regimes group sequences by length to learn stable microbatch limits.
+        # Key = bucket of max effective length, Value = {"B": batch_size, "T": token_budget, "stable": success_count}
+        self._regime_limits = {}
+        self._regime_bucket_size = 128   # Bucket width in tokens (groups similar lengths)
+        self._regime_ramp_every = 10     # Ramp limits after N consecutive successes
+        self._regime_ramp_B = 1.25       # Factor to increase B on ramp
+        self._regime_ramp_T = 1.10       # Factor to increase T on ramp
         self._regime_min_B = getattr(self, "oom_min_B", 1)
         self._regime_min_T = getattr(self, "oom_min_tokens", 64)
 
-        # Defaults used to initialize new regimes
+        # Initial values for new regimes (from user config)
         self._regime_default_B = self.max_examples_per_microbatch
         self._regime_default_T = self.max_tokens_per_microbatch
 
-        # running maxima
+        # --- Sequence length tracking for diagnostics ---
         self._max_seen_enc_len = 0
         self._max_seen_dec_len = 0
         self._max_seen_total_len = 0
-        self._num_trunc_hits = 0
+        self._num_trunc_hits = 0  # Count of sequences that hit truncation limits
 
+        # Upper bounds to prevent runaway growth during adaptation
         self._regime_max_T = int(max_tokens_per_microbatch * 4) if max_tokens_per_microbatch is not None else (1 << 62)
-
         self._regime_max_B = 1024
 
 
@@ -1679,11 +1766,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 out[k] = v
         return out
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+        """
+        Compute loss, filtering out length column and ensuring contiguous tensors.
+
+        Note: num_items_in_batch is accepted for compatibility with transformers>=4.46
+        but not used (we handle loss normalization via microbatch token weighting).
+        """
         if self.length_column_name in inputs:
             inputs = {k: v for k, v in inputs.items() if k != self.length_column_name}
 
-        # 🔹 critical: view() in HF loss expects contiguous
+        # HF loss computation uses view() which requires contiguous tensors
         inputs = self._contiguous_inputs(inputs)
 
         outputs = model(**inputs)
