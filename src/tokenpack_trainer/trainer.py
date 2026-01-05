@@ -1145,6 +1145,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # If no token budget or we explicitly want HF-style eval, use default
         mode = self._normalize_eval_mode(getattr(self, "eval_mode", None))
         if mode is None or self.max_tokens_per_batch is None:
+            # HF's get_eval_dataloader uses self.data_collator, but we want
+            # to respect self.eval_data_collator if the user provided one.
+            # Temporarily swap collators so HF uses the right one.
+            if self.eval_data_collator is not None:
+                orig_collator = self.data_collator
+                self.data_collator = self.eval_data_collator
+                try:
+                    return super().get_eval_dataloader(eval_dataset)
+                finally:
+                    self.data_collator = orig_collator
             return super().get_eval_dataloader(eval_dataset)
 
         # Otherwise: token-aware eval DataLoader (length-bucketed)
@@ -1730,11 +1740,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     "eval_mode='token_aware_metrics' requires compute_metrics to be set. "
                     "Use eval_mode='token_aware_loss' for loss-only."
                 )
-            return self._token_aware_evaluate(
+            metrics = self._token_aware_evaluate(
                 eval_dataset=eval_dataset,
                 max_eval_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
                 desc="eval (token-aware)",
             )
+            # Log metrics (HF's evaluate does this internally, but we need to do it explicitly)
+            self.log(metrics)
+            self.control.should_log = False  # Prevent double-logging
+            return metrics
 
         # ----------------------------
         # 2) Auto mode
