@@ -121,11 +121,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
         eval_data_collator=None,
         sampler_bucket_size: int = 8,  # bucket size for length-bucketed sampling (smaller = tighter grouping)
         padding_aware_budget: bool = False,  # if True, budget by max_len * num_examples (actual memory) vs sum of lengths
+        max_eval_generate_examples: int | None = None,  # max examples per generate call (None = no limit, uses token budget only)
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.eval_data_collator = eval_data_collator
         self.padding_aware_budget = bool(padding_aware_budget)
+        self.max_eval_generate_examples = max_eval_generate_examples  # None = use full batch when possible
         self.max_tokens_per_microbatch = int(max_tokens_per_microbatch)
         self.max_encoder_len = int(max_encoder_len) if max_encoder_len is not None else None
         self.max_decoder_len = int(max_decoder_len) if max_decoder_len is not None else None
@@ -809,7 +811,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
         ignore_keys: Optional[List[str]] = None,
     ):
         # If caller wants logits/labels, let HF handle it
-        if not prediction_loss_only or self.max_tokens_per_microbatch is None:
+        # Also use HF default when eval_mode is None/"hf" to avoid loss normalization mismatch
+        # (HF aggregates losses by example count, not token count)
+        eval_mode = getattr(self, "eval_mode", None)
+        use_hf_default = (
+            not prediction_loss_only
+            or self.max_tokens_per_microbatch is None
+            or eval_mode is None  # HF mode - let HF handle loss aggregation
+        )
+        if use_hf_default:
             return super().prediction_step(
                 model,
                 inputs,
@@ -1161,31 +1171,30 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 batch_gpu = self._prepare_inputs(batch)
 
                # FAST PATH: if everything fits comfortably, generate once for the whole batch
-                # (avoids microbatch splitting overhead)
-                if (
-                    self.max_eval_tokens_per_microbatch is not None
-                    and "attention_mask" in batch_gpu
-                    and "labels" in batch_gpu
-                ):
-                    # estimate tokens (cheap)
-                    enc = int(batch_gpu["attention_mask"].sum().item())
-                    dec = int((batch_gpu["labels"] != -100).sum().item())
-                    eff = enc + 2.0 * dec
+                # (avoids microbatch splitting overhead - critical for throughput)
+                # For generation, we can be more aggressive than training since no gradients
+                B = int(batch_gpu["input_ids"].size(0))
+                max_gen_examples = getattr(self, "max_eval_generate_examples", None)
+                fits_B = (max_gen_examples is None) or (B <= max_gen_examples)
 
-                    # also respect max_examples_per_microbatch if set
-                    B = int(batch_gpu["input_ids"].size(0))
-                    fits_B = (self.max_examples_per_microbatch is None) or (B <= self.max_examples_per_microbatch)
-
-                    if eff <= self.max_eval_tokens_per_microbatch and fits_B:
-                        # Single generate call for the whole batch
-                        gen_inputs = {k: v for k, v in batch_gpu.items() if k not in ignore_keys}
+                if fits_B and "attention_mask" in batch_gpu and "labels" in batch_gpu:
+                    # Single generate call for the whole batch
+                    gen_inputs = {k: v for k, v in batch_gpu.items() if k not in ignore_keys}
+                    try:
                         gen_out = self.model.generate(**gen_inputs, **gen_kwargs)
-
                         all_preds.append(gen_out.detach().cpu().numpy())
                         all_labels.append(batch_gpu["labels"].detach().cpu().numpy())
-
                         self._eval_on_success()
                         continue
+                    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                        if not self._is_cuda_oom(e):
+                            raise
+                        # OOM on fast path - fall through to microbatching
+                        self._eval_oom_cleanup()
+                        if max_gen_examples is None:
+                            self.max_eval_generate_examples = B // 2  # adaptive shrink
+                        else:
+                            self.max_eval_generate_examples = max(1, max_gen_examples // 2)
   
                 if self.use_cpu_microbatch:
                     plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
@@ -1200,10 +1209,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         orig_use_cache = getattr(self.model.config, "use_cache", True)
                         self.model.config.use_cache = True
 
+                        # For generation, use larger batches than training (no gradients)
+                        orig_max_B = self.max_examples_per_microbatch
+                        gen_limit = getattr(self, "max_eval_generate_examples", None)
+                        if gen_limit is not None:
+                            self.max_examples_per_microbatch = gen_limit
+
                         microbatches = self._make_microbatches(
                             plan_inputs,
                             max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
                         )
+                        self.max_examples_per_microbatch = orig_max_B  # restore
 
                         # IMPORTANT: reset per attempt (fixes double-append after partial OOM)
                         batch_pred_chunks = []
