@@ -119,10 +119,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
         oom_min_tokens: int = 64,
         oom_skip_batch_on_fail: bool = True, # if retries exhausted, just skip batch
         eval_data_collator=None,
+        sampler_bucket_size: int = 8,  # bucket size for length-bucketed sampling (smaller = tighter grouping)
+        padding_aware_budget: bool = False,  # if True, budget by max_len * num_examples (actual memory) vs sum of lengths
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.eval_data_collator = eval_data_collator
+        self.padding_aware_budget = bool(padding_aware_budget)
         self.max_tokens_per_microbatch = int(max_tokens_per_microbatch)
         self.max_encoder_len = int(max_encoder_len) if max_encoder_len is not None else None
         self.max_decoder_len = int(max_decoder_len) if max_decoder_len is not None else None
@@ -144,6 +147,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.oom_min_B = int(oom_min_B)
         self.oom_min_tokens = int(oom_min_tokens)
         self.oom_skip_batch_on_fail = bool(oom_skip_batch_on_fail)
+        self.sampler_bucket_size = int(sampler_bucket_size)
 
         self._oom_events = 0
         self._oom_skipped_batches = 0
@@ -448,7 +452,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             batch_sampler = LengthBucketedBatchSampler(
                 lengths=lengths_for_sampler,
                 max_tokens_per_batch=self.max_tokens_per_batch,
-                bucket_size=16,
+                bucket_size=self.sampler_bucket_size,
                 shuffle=True,
                 drop_last=False,
                 long_behavior="truncate",
@@ -698,7 +702,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             })
 
 
-    def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None):
+    def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None, return_lengths: bool = False):
         # Compute lengths
         enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
 
@@ -709,31 +713,49 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         budget = int(max_tokens_per_microbatch or self.max_tokens_per_microbatch)
         max_B = self.max_examples_per_microbatch  # may be None
+        padding_aware = getattr(self, "padding_aware_budget", False)
 
         microbatches = []
         cur_indices: list[int] = []
         cur_tokens = 0
+        cur_max_len = 0  # for padding-aware mode
 
-        #sorted_indices = sorted(range(N), key=lambda i: lengths[i])
+        # Sort by length to minimize padding waste within microbatches
+        sorted_indices = sorted(range(N), key=lambda i: lengths[i])
 
-        for i in range(N):
+        for i in sorted_indices:
             L = lengths[i]
 
-            too_many_tokens = cur_indices and (cur_tokens + L) > budget
+            if padding_aware:
+                # Padding-aware: cost is max_len * num_examples (actual tensor size)
+                new_max = max(cur_max_len, L)
+                new_count = len(cur_indices) + 1
+                padded_cost = new_max * new_count
+                too_many_tokens = cur_indices and padded_cost > budget
+            else:
+                # Default: cost is sum of effective lengths
+                too_many_tokens = cur_indices and (cur_tokens + L) > budget
+
             too_many_examples = max_B is not None and len(cur_indices) >= max_B
 
             if too_many_tokens or too_many_examples:
                 microbatches.append(cur_indices)
                 cur_indices = [i]
                 cur_tokens = L
+                cur_max_len = L
             else:
                 cur_indices.append(i)
                 cur_tokens += L
+                cur_max_len = max(cur_max_len, L)
 
         if cur_indices:
             microbatches.append(cur_indices)
 
-        return [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
+        result = [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
+
+        if return_lengths:
+            return result, enc_len, dec_len
+        return result
 
     def _plan_microbatches(self, inputs):
         """
@@ -907,7 +929,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         batch_sampler = LengthBucketedBatchSampler(
             lengths=lengths_for_sampler,
             max_tokens_per_batch=self.max_tokens_per_batch,
-            bucket_size=16,
+            bucket_size=self.sampler_bucket_size,
             shuffle=False,
             drop_last=False,
             long_behavior="truncate",
@@ -1540,9 +1562,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     # >>> apply per-regime best limits BEFORE planning microbatches
                     self._apply_regime_limits(regime_key)
 
-                    _ = self._compute_lengths_enc_dec(inputs_work)
                     inputs_work = self._truncate_batch(inputs_work)
-                    microbatches = self._make_microbatches(inputs_work)
+                    microbatches, enc_len, dec_len = self._make_microbatches(inputs_work, return_lengths=True)
 
                 else:
                     # We don't have CPU tensors by default; easiest is to still derive a key on CPU
@@ -1556,10 +1577,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                     inputs_work = self._prepare_inputs(inputs)
                     inputs_work = self._truncate_batch(inputs_work)
-                    _ = self._compute_lengths_enc_dec(inputs_work)
-                    microbatches = self._make_microbatches(inputs_work)
+                    microbatches, enc_len, dec_len = self._make_microbatches(inputs_work, return_lengths=True)
 
-                enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_work)
                 eff_tokens = int((enc_len + 2.0 * dec_len).sum().item())
 
                 num_micro = max(len(microbatches), 1)

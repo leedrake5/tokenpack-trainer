@@ -216,6 +216,7 @@ class T5SpanCorruptionCollatorFast:
             "input_ids": inputs,
             "attention_mask": attention_mask,
             "labels": labels,
+            "input_length": attention_mask.sum(dim=-1),  # pre-computed for token-aware batching
         }
 
 from dataclasses import dataclass
@@ -273,4 +274,10 @@ class CappedSeq2SeqCollator:
 
             capped_features.append(f_new)
 
-        return self.base_collator(capped_features)
+        batch = self.base_collator(capped_features)
+
+        # Add pre-computed input_length for token-aware batching
+        if "attention_mask" in batch and isinstance(batch["attention_mask"], torch.Tensor):
+            batch["input_length"] = batch["attention_mask"].sum(dim=-1)
+
+        return batch

@@ -19,7 +19,7 @@ class LengthBucketedBatchSampler(Sampler):
         shuffle: bool = True,
         drop_last: bool = False,
         long_behavior: str = "truncate",  # {"truncate", "skip", "single"}
-        max_length_in_batch: int | None = None,  # NEW
+        max_length_in_batch: int | None = None,
     ):
         assert long_behavior in {"truncate", "skip", "single"}
 
@@ -38,6 +38,72 @@ class LengthBucketedBatchSampler(Sampler):
 
         self.bucket_ids = sorted(buckets.keys())
         self.buckets = {b: idxs for b, idxs in buckets.items()}
+
+        # Pre-compute exact batch count (without shuffling) for accurate __len__
+        self._num_batches = self._count_batches()
+
+    def _count_batches(self) -> int:
+        """Count batches by simulating iteration without shuffling."""
+        count = 0
+        for b in self.bucket_ids:
+            idxs = self.buckets[b]
+
+            current_batch_size = 0
+            current_tokens = 0
+            current_max = 0
+
+            for i in idxs:
+                L = self.lengths[i]
+
+                # Handle examples that exceed max_length_in_batch
+                if self.max_length_in_batch is not None and L > self.max_length_in_batch:
+                    if self.long_behavior == "skip":
+                        continue
+                    elif self.long_behavior == "single":
+                        if current_batch_size > 0 and not self.drop_last:
+                            count += 1
+                        count += 1  # the single-item batch
+                        current_batch_size, current_tokens, current_max = 0, 0, 0
+                        continue
+
+                # Handle examples that exceed max_tokens_per_batch
+                if L > self.max_tokens_per_batch:
+                    if self.long_behavior == "skip":
+                        continue
+                    elif self.long_behavior == "single":
+                        if current_batch_size > 0 and not self.drop_last:
+                            count += 1
+                        count += 1
+                        current_batch_size, current_tokens, current_max = 0, 0, 0
+                        continue
+
+                if current_batch_size == 0:
+                    current_batch_size = 1
+                    current_tokens = L
+                    current_max = L
+                    continue
+
+                would_exceed_sum = (current_tokens + L > self.max_tokens_per_batch)
+                would_exceed_max = (
+                    self.max_length_in_batch is not None
+                    and max(current_max, L) > self.max_length_in_batch
+                )
+
+                if would_exceed_sum or would_exceed_max:
+                    if not self.drop_last:
+                        count += 1
+                    current_batch_size = 1
+                    current_tokens = L
+                    current_max = L
+                else:
+                    current_batch_size += 1
+                    current_tokens += L
+                    current_max = max(current_max, L)
+
+            if current_batch_size > 0 and not self.drop_last:
+                count += 1
+
+        return max(1, count)
 
     def __iter__(self):
         bucket_ids = list(self.bucket_ids)
@@ -107,8 +173,4 @@ class LengthBucketedBatchSampler(Sampler):
                 yield current_batch
 
     def __len__(self):
-        # Still an estimate; OK for DataLoader but tqdm totals may be off.
-        n = len(self.lengths)
-        avg_len = sum(self.lengths) / max(1, n)
-        approx_per_batch = max(1, int(self.max_tokens_per_batch // max(1, int(avg_len))))
-        return max(1, n // approx_per_batch)
+        return self._num_batches
