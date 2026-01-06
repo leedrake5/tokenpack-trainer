@@ -72,6 +72,32 @@ def _filter_for_generate(d: dict, ignore: set[str]) -> dict:
         out = {k: v for k, v in out.items() if k in _FWD_KEYS}
     return out
 
+def _strip_for_generate(batch: dict, ignore_keys: set[str] | None = None) -> dict:
+    """
+    Return a dict safe to pass into model.generate():
+    - removes keys in ignore_keys
+    - removes any non-tensor values (strings/lists/etc.)
+    """
+    if ignore_keys is None:
+        ignore_keys = set()
+
+    out = {}
+    for k, v in batch.items():
+        if k in ignore_keys:
+            continue
+        # generate() only wants tensors (and a few scalar kwargs, which we pass separately)
+        # batch dict should be tensor-only anyway; this prevents 'task' / stray strings from crashing
+        try:
+            import torch
+            is_tensor = torch.is_tensor(v)
+        except Exception:
+            is_tensor = False
+
+        if is_tensor:
+            out[k] = v
+
+    return out
+
 class CUDAPrefetcher:
     """
     Wrap a DataLoader to asynchronously move each batch to GPU on a side stream.
