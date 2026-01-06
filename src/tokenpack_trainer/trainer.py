@@ -1268,7 +1268,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
     ):
         import time, random, numpy as np, torch
         from tqdm.auto import tqdm
-
+        all_meteor_ok = []
         py_state = random.getstate()
         np_state = np.random.get_state()
 
@@ -1485,12 +1485,22 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                             batch_pred_chunks.append(gen_out.cpu().numpy())
                             batch_label_chunks.append(mb["labels"].cpu().numpy())
+                            if "meteor_ok" in mb:
+                                all_meteor_ok.append(mb["meteor_ok"].cpu().numpy())
+                            else:
+                                all_meteor_ok.append(np.ones((mb["labels"].size(0),), dtype=np.int64))
 
                             del gen_out, gen_inputs_mb, mb
 
                         # success → commit
-                        all_preds.extend(batch_pred_chunks)
-                        all_labels.extend(batch_label_chunks)
+                        all_preds.append(gen_out.detach().cpu().numpy())
+                        all_labels.append(batch_gpu["labels"].detach().cpu().numpy())
+
+                        if "meteor_ok" in batch_gpu:
+                            all_meteor_ok.append(batch_gpu["meteor_ok"].detach().cpu().numpy())
+                        else:
+                            # default: meteor on everything
+                            all_meteor_ok.append(np.ones((batch_size,), dtype=np.int64))
                         last_err = None
 
                         # ADAPTIVE RAMP (place it here: only after a successful batch)
@@ -1590,7 +1600,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     # No metrics function provided: return loss-only metrics
                     raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
                 else:
-                    raw_metrics = compute_metrics_fn((preds, labels))
+                    meteor_ok = np.concatenate(all_meteor_ok, axis=0)
+                    raw_metrics = compute_metrics_fn((preds, labels, meteor_ok))
 
                 # (N, max_pred_len), (N, max_label_len)
                 #raw_metrics = self.compute_metrics((preds, labels))
