@@ -58,6 +58,20 @@ from .samplers import LengthBucketedBatchSampler
 
 logger = logging.get_logger(__name__)
 
+import inspect
+
+# compute ONCE
+try:
+    _FWD_KEYS = set(inspect.signature(self.model.forward).parameters.keys())
+except Exception:
+    _FWD_KEYS = None  # fallback: don't filter by signature
+
+def _filter_for_generate(d: dict, ignore: set[str]) -> dict:
+    out = {k: v for k, v in d.items() if k not in ignore}
+    if _FWD_KEYS is not None:
+        out = {k: v for k, v in out.items() if k in _FWD_KEYS}
+    return out
+
 class CUDAPrefetcher:
     """
     Wrap a DataLoader to asynchronously move each batch to GPU on a side stream.
@@ -1266,9 +1280,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         max_eval_tokens_per_microbatch: int | None = None,
         desc: str = "Eval (token-aware)",
     ):
-        import time, random, numpy as np, torch, inspect
-        from tqdm.auto import tqdm
-        from typing import Any
+        import time, random, numpy as np, torch
+        from tqdm import tqdm  # <-- not tqdm.auto
 
         all_meteor_ok = []
 
@@ -1276,27 +1289,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         np_state = np.random.get_state()
 
         devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
-
-        # Helper: aggressively filter kwargs before calling generate()
-        # Place: used exactly where gen_inputs / gen_inputs_mb are built.
-        def _filter_for_generate(d: dict, ignore: set[str]) -> dict:
-            # 1) Drop known ignore keys
-            out = {k: v for k, v in d.items() if k not in ignore}
-
-            # 2) Extra safety: only keep what model.forward accepts
-            # (prevents future crashes if some new key leaks in)
-            try:
-                fwd_params = set(inspect.signature(self.model.forward).parameters.keys())
-                out = {k: v for k, v in out.items() if k in fwd_params}
-            except Exception:
-                # If inspection fails for any reason, keep the ignore-based filtering
-                pass
-
-            return out
-
         with torch.random.fork_rng(devices=devices):
             try:
-                # Deterministic eval RNG (inside fork_rng)
                 torch.manual_seed(0)
                 np.random.seed(0)
                 random.seed(0)
@@ -1308,43 +1302,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 dataloader = self.get_eval_dataloader(eval_dataset)
 
-                # --- loss-only path ---
-                if getattr(self, "compute_metrics", None) is None:
-                    total_eval_loss = 0.0
-                    total_eval_tokens = 0
-                    num_steps = 0
-                    num_examples = 0
-                    start_time = time.time()
+                # ---- If max_eval_tokens_per_microbatch passed, override just for this call
+                if max_eval_tokens_per_microbatch is not None:
+                    self.max_eval_tokens_per_microbatch = max_eval_tokens_per_microbatch
 
-                    for batch in tqdm(dataloader, desc=desc, leave=False):
-                        num_steps += 1
-                        labels = batch.get("labels", None)
-                        if labels is None:
-                            raise ValueError("Eval dataset must have labels to compute eval_loss.")
-
-                        with torch.no_grad():
-                            loss, _, _ = self.prediction_step(
-                                self.model, batch, prediction_loss_only=True, ignore_keys=None
-                            )
-
-                        num_tokens = int((labels.detach().to("cpu") != -100).sum().item())
-                        if loss is not None and num_tokens > 0:
-                            total_eval_loss += float(loss.item()) * num_tokens
-                            total_eval_tokens += num_tokens
-
-                        num_examples += int(labels.size(0))
-
-                    runtime = time.time() - start_time
-                    eval_loss = total_eval_loss / total_eval_tokens if total_eval_tokens > 0 else float("nan")
-
-                    return {
-                        "eval_loss": float(eval_loss),
-                        "eval_runtime": float(runtime),
-                        "eval_samples_per_second": float(num_examples / runtime) if runtime > 0 else 0.0,
-                        "eval_steps_per_second": float(num_steps / runtime) if runtime > 0 else 0.0,
-                    }
-
-                # 2) Build generation kwargs like HF does
+                # -------- generation kwargs --------
                 gen_kwargs: dict[str, Any] = {}
                 if self.args.generation_max_length is not None:
                     gen_kwargs["max_length"] = self.args.generation_max_length
@@ -1353,9 +1315,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 if getattr(self.args, "do_sample", False):
                     gen_kwargs["do_sample"] = True
-                    if self.args.top_k is not None:
+                    if getattr(self.args, "top_k", None) is not None:
                         gen_kwargs["top_k"] = self.args.top_k
-                    if self.args.top_p is not None:
+                    if getattr(self.args, "top_p", None) is not None:
                         gen_kwargs["top_p"] = self.args.top_p
 
                 if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
@@ -1363,20 +1325,31 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     tmp.update(gen_kwargs)
                     gen_kwargs = tmp
 
-                # 3) Loop + collect preds/labels/meteor flags
-                all_preds: list[np.ndarray] = []
-                all_labels: list[np.ndarray] = []
+                # -------- accumulators --------
+                all_preds = []
+                all_labels = []
 
                 num_steps = 0
                 num_examples = 0
                 total_eval_loss = 0.0
                 total_eval_tokens = 0
-                start_time = time.time()
 
-                for batch in tqdm(dataloader, desc=desc, leave=False):
+                start_time = time.time()
+                disable_bar = bool(getattr(self.args, "disable_tqdm", False))
+
+                # IMPORTANT: ignore_keys must exclude meteor_ok so it never reaches generate()
+                ignore_keys = {
+                    "labels",
+                    self.length_column_name,
+                    "decoder_input_ids",
+                    "decoder_attention_mask",
+                    "meteor_ok",
+                }
+
+                for batch in tqdm(dataloader, desc=desc, leave=True, disable=disable_bar):
                     num_steps += 1
 
-                    # 1) loss (microbatch-aware prediction_step)
+                    # ----- loss (microbatch-aware prediction_step) -----
                     with torch.no_grad():
                         loss, _, _ = self.prediction_step(
                             self.model,
@@ -1395,45 +1368,36 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         total_eval_loss += float(loss.item()) * num_tokens
                         total_eval_tokens += num_tokens
 
-                    batch_size = labels.size(0)
-                    num_examples += int(batch_size)
+                    batch_size = int(labels.size(0))
+                    num_examples += batch_size
 
-                    ignore_keys = {
-                        "labels",
-                        self.length_column_name,
-                        "decoder_input_ids",
-                        "decoder_attention_mask",
-                        "meteor_ok",
-                    }
-
-                    # 2) prepare for generation
+                    # ----- prepare inputs for generation -----
                     batch_gpu = self._prepare_inputs(batch)
 
-                    # FAST PATH
+                    # collect meteor_ok for this batch (but DO NOT pass into generate)
+                    if "meteor_ok" in batch_gpu:
+                        batch_meteor = batch_gpu["meteor_ok"].detach().cpu().numpy()
+                    else:
+                        batch_meteor = np.ones((batch_size,), dtype=np.int64)
+
+                    # FAST PATH: generate whole batch if allowed
                     B = int(batch_gpu["input_ids"].size(0))
                     max_gen_examples = getattr(self, "max_eval_generate_examples", None)
                     fits_B = (max_gen_examples is None) or (B <= max_gen_examples)
 
                     if fits_B and "attention_mask" in batch_gpu and "labels" in batch_gpu:
-                        gen_inputs = _filter_for_generate(batch_gpu, ignore_keys)
+                        gen_inputs = _strip_for_generate(batch_gpu, ignore_keys)
                         try:
                             gen_out = self.model.generate(**gen_inputs, **gen_kwargs)
+                            if gen_out.ndim == 1:
+                                gen_out = gen_out.unsqueeze(0)
 
-                            pred_ids = gen_out.detach().cpu().numpy()
-                            lab_ids  = batch_gpu["labels"].detach().cpu().numpy()
-
-                            # commit arrays
-                            all_preds.append(pred_ids)
-                            all_labels.append(lab_ids)
-
-                            if "meteor_ok" in batch_gpu:
-                                all_meteor_ok.append(batch_gpu["meteor_ok"].detach().cpu().numpy())
-                            else:
-                                all_meteor_ok.append(np.ones((B,), dtype=np.int64))
+                            all_preds.append(gen_out.detach().cpu().numpy())
+                            all_labels.append(batch_gpu["labels"].detach().cpu().numpy())
+                            all_meteor_ok.append(batch_meteor)
 
                             self._eval_on_success()
                             continue
-
                         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                             if not self._is_cuda_oom(e):
                                 raise
@@ -1444,7 +1408,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                                 self.max_eval_generate_examples = max(1, max_gen_examples // 2)
                             # fall through to microbatching
 
-                    # Microbatch plan
+                    # ----- microbatch path -----
                     if self.use_cpu_microbatch:
                         plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
                     else:
@@ -1457,6 +1421,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                             orig_use_cache = getattr(self.model.config, "use_cache", True)
                             self.model.config.use_cache = True
 
+                            # allow larger B for eval generation if set
                             orig_max_B = self.max_examples_per_microbatch
                             gen_limit = getattr(self, "max_eval_generate_examples", None)
                             if gen_limit is not None:
@@ -1468,33 +1433,37 @@ class TokenPackTrainer(Seq2SeqTrainer):
                             )
                             self.max_examples_per_microbatch = orig_max_B
 
-                            batch_pred_chunks: list[np.ndarray] = []
-                            batch_label_chunks: list[np.ndarray] = []
-                            batch_meteor_chunks: list[np.ndarray] = []
+                            batch_pred_chunks = []
+                            batch_label_chunks = []
+                            batch_meteor_chunks = []
 
                             for mb in microbatches:
                                 if self.use_cpu_microbatch:
                                     mb = self._to_device(mb)
 
-                                gen_inputs_mb = _filter_for_generate(mb, ignore_keys)
+                                mb_B = int(mb["input_ids"].size(0))
+
+                                # meteor_ok per-microbatch
+                                if "meteor_ok" in mb:
+                                    mb_meteor = mb["meteor_ok"].detach().cpu().numpy()
+                                else:
+                                    mb_meteor = np.ones((mb_B,), dtype=np.int64)
+
+                                gen_inputs_mb = _strip_for_generate(mb, ignore_keys)
                                 gen_out = self.model.generate(**gen_inputs_mb, **gen_kwargs)
                                 if gen_out.ndim == 1:
                                     gen_out = gen_out.unsqueeze(0)
 
                                 batch_pred_chunks.append(gen_out.detach().cpu().numpy())
                                 batch_label_chunks.append(mb["labels"].detach().cpu().numpy())
-
-                                if "meteor_ok" in mb:
-                                    batch_meteor_chunks.append(mb["meteor_ok"].detach().cpu().numpy())
-                                else:
-                                    batch_meteor_chunks.append(np.ones((mb["labels"].size(0),), dtype=np.int64))
+                                batch_meteor_chunks.append(mb_meteor)
 
                                 del gen_out, gen_inputs_mb, mb
 
-                            # success → commit *exactly once*
+                            # success → commit all chunks
                             all_preds.extend(batch_pred_chunks)
                             all_labels.extend(batch_label_chunks)
-                            all_meteor_ok.append(np.concatenate(batch_meteor_chunks, axis=0))
+                            all_meteor_ok.extend(batch_meteor_chunks)
 
                             last_err = None
                             self._eval_on_success()
@@ -1537,14 +1506,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 runtime = time.time() - start_time if num_steps > 0 else 0.0
 
-                # 4) Concatenate + compute metrics
+                # ----- compute metrics -----
                 if len(all_preds) == 0:
                     raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
                 else:
+                    # pad preds to common length
                     max_pred_len = max(p.shape[1] for p in all_preds)
-                    pad_id = self.processing_class.pad_token_id
-                    if pad_id is None:
-                        pad_id = 0
+                    pad_id = self.processing_class.pad_token_id or 0
 
                     padded_preds = []
                     for p in all_preds:
@@ -1553,6 +1521,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         padded_preds.append(p)
                     preds = np.concatenate(padded_preds, axis=0)
 
+                    # pad labels to common length
                     max_label_len = max(l.shape[1] for l in all_labels)
                     padded_labels = []
                     for l in all_labels:
@@ -1561,11 +1530,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         padded_labels.append(l)
                     labels = np.concatenate(padded_labels, axis=0)
 
+                    meteor_ok = np.concatenate(all_meteor_ok, axis=0) if len(all_meteor_ok) else np.ones((labels.shape[0],), dtype=np.int64)
+
                     compute_metrics_fn = getattr(self, "compute_metrics", None)
                     if compute_metrics_fn is None:
                         raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
                     else:
-                        meteor_ok = np.concatenate(all_meteor_ok, axis=0)
                         raw_metrics = compute_metrics_fn((preds, labels, meteor_ok))
 
                 eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
@@ -1577,7 +1547,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     "eval_meteor": float(raw_metrics.get("meteor", 0.0)),
                     "eval_gen_len": float(raw_metrics.get("gen_len", 0.0)),
                 }
-
                 if runtime > 0 and num_steps > 0:
                     metrics["eval_runtime"] = float(runtime)
                     metrics["eval_samples_per_second"] = float(num_examples / runtime)
@@ -1586,7 +1555,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 return metrics
 
             finally:
-                # fork_rng restores torch+c u d a automatically; restore python/numpy explicitly
                 np.random.set_state(np_state)
                 random.setstate(py_state)
             
