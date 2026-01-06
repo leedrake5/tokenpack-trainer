@@ -1427,7 +1427,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     try:
                         gen_out = self.model.generate(**gen_inputs, **gen_kwargs)
                         pred_ids = gen_out.detach().cpu().numpy()
-                        lab_ids  = mb["labels"].detach().cpu().numpy()  # or batch_gpu[...] for fast path
+                        lab_ids = batch_gpu["labels"].detach().cpu().numpy()  # or batch_gpu[...] for fast path
                         CHUNK = 512
                         for i in range(0, len(pred_ids), CHUNK):
                             pred_texts.extend(self.processing_class.batch_decode(pred_ids[i:i+CHUNK], skip_special_tokens=True))
@@ -1493,8 +1493,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
                             del gen_out, gen_inputs_mb, mb
 
                         # success → commit
-                        all_preds.append(gen_out.detach().cpu().numpy())
-                        all_labels.append(batch_gpu["labels"].detach().cpu().numpy())
+                        all_preds.extend(batch_pred_chunks)
+                        all_labels.extend(batch_label_chunks)
 
                         if "meteor_ok" in batch_gpu:
                             all_meteor_ok.append(batch_gpu["meteor_ok"].detach().cpu().numpy())
