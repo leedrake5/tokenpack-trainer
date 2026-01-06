@@ -1266,13 +1266,34 @@ class TokenPackTrainer(Seq2SeqTrainer):
         max_eval_tokens_per_microbatch: int | None = None,
         desc: str = "Eval (token-aware)",
     ):
-        import time, random, numpy as np, torch
+        import time, random, numpy as np, torch, inspect
         from tqdm.auto import tqdm
+        from typing import Any
+
         all_meteor_ok = []
+
         py_state = random.getstate()
         np_state = np.random.get_state()
 
         devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+
+        # Helper: aggressively filter kwargs before calling generate()
+        # Place: used exactly where gen_inputs / gen_inputs_mb are built.
+        def _filter_for_generate(d: dict, ignore: set[str]) -> dict:
+            # 1) Drop known ignore keys
+            out = {k: v for k, v in d.items() if k not in ignore}
+
+            # 2) Extra safety: only keep what model.forward accepts
+            # (prevents future crashes if some new key leaks in)
+            try:
+                fwd_params = set(inspect.signature(self.model.forward).parameters.keys())
+                out = {k: v for k, v in out.items() if k in fwd_params}
+            except Exception:
+                # If inspection fails for any reason, keep the ignore-based filtering
+                pass
+
+            return out
+
         with torch.random.fork_rng(devices=devices):
             try:
                 # Deterministic eval RNG (inside fork_rng)
@@ -1306,8 +1327,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                                 self.model, batch, prediction_loss_only=True, ignore_keys=None
                             )
 
-                        # NOTE: best is to use tokens actually used in prediction_step,
-                        # but this is OK if prediction_step doesn't change labels.
                         num_tokens = int((labels.detach().to("cpu") != -100).sum().item())
                         if loss is not None and num_tokens > 0:
                             total_eval_loss += float(loss.item()) * num_tokens
@@ -1318,316 +1337,258 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     runtime = time.time() - start_time
                     eval_loss = total_eval_loss / total_eval_tokens if total_eval_tokens > 0 else float("nan")
 
-                    metrics = {
+                    return {
                         "eval_loss": float(eval_loss),
                         "eval_runtime": float(runtime),
                         "eval_samples_per_second": float(num_examples / runtime) if runtime > 0 else 0.0,
                         "eval_steps_per_second": float(num_steps / runtime) if runtime > 0 else 0.0,
                     }
-                    return metrics
-       
-            finally:
-                # fork_rng restores torch + cuda automatically
-                np.random.set_state(np_state)
-                random.setstate(py_state)
 
-            # 2) Build generation kwargs like HF does
-            gen_kwargs: dict[str, Any] = {}
+                # 2) Build generation kwargs like HF does
+                gen_kwargs: dict[str, Any] = {}
+                if self.args.generation_max_length is not None:
+                    gen_kwargs["max_length"] = self.args.generation_max_length
+                if self.args.generation_num_beams is not None:
+                    gen_kwargs["num_beams"] = self.args.generation_num_beams
 
-            if self.args.generation_max_length is not None:
-                gen_kwargs["max_length"] = self.args.generation_max_length
-            if self.args.generation_num_beams is not None:
-                gen_kwargs["num_beams"] = self.args.generation_num_beams
+                if getattr(self.args, "do_sample", False):
+                    gen_kwargs["do_sample"] = True
+                    if self.args.top_k is not None:
+                        gen_kwargs["top_k"] = self.args.top_k
+                    if self.args.top_p is not None:
+                        gen_kwargs["top_p"] = self.args.top_p
 
-            if getattr(self.args, "do_sample", False):
-                gen_kwargs["do_sample"] = True
-                if self.args.top_k is not None:
-                    gen_kwargs["top_k"] = self.args.top_k
-                if self.args.top_p is not None:
-                    gen_kwargs["top_p"] = self.args.top_p
+                if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
+                    tmp = self._gen_kwargs.copy()
+                    tmp.update(gen_kwargs)
+                    gen_kwargs = tmp
 
-            # Merge with any internally-prepared _gen_kwargs
-            if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
-                tmp = self._gen_kwargs.copy()
-                tmp.update(gen_kwargs)
-                gen_kwargs = tmp
+                # 3) Loop + collect preds/labels/meteor flags
+                all_preds: list[np.ndarray] = []
+                all_labels: list[np.ndarray] = []
 
-            # 3) Loop with tqdm + collect preds/labels
-            all_preds = []
-            all_labels = []
+                num_steps = 0
+                num_examples = 0
+                total_eval_loss = 0.0
+                total_eval_tokens = 0
+                start_time = time.time()
 
-            num_steps = 0
-            num_examples = 0
+                for batch in tqdm(dataloader, desc=desc, leave=False):
+                    num_steps += 1
 
-            total_eval_loss = 0.0
-            total_eval_tokens = 0
-
-            start_time = time.time()
-
-            for batch in tqdm(dataloader, desc=desc, leave=False):
-                num_steps += 1
-
-                # 1) Loss with our microbatch-aware prediction_step
-                with torch.no_grad():
-                    loss, _, _ = self.prediction_step(
-                        self.model,
-                        batch,
-                        prediction_loss_only=True,
-                        ignore_keys=None,
-                    )
-
-                labels = batch.get("labels", None)
-                if labels is None:
-                    raise ValueError("Eval dataset must have labels for metric computation.")
-
-                if loss is not None:
-                    # Move labels to CPU just for counting tokens
-                    labels_cpu = labels.detach().to("cpu")
-                    num_tokens = int((labels_cpu != -100).sum().item())
-                    total_eval_loss += float(loss.item()) * num_tokens
-                    total_eval_tokens += num_tokens
-
-                batch_size = labels.size(0)
-                num_examples += int(batch_size)
-
-
-                ignore_keys = {
-                    "labels",
-                    self.length_column_name,
-                    "decoder_input_ids",
-                    "decoder_attention_mask",
-                }
-                
-                # 2) Now prepare inputs for generation (separate from loss)
-                # Prepare once
-                batch_gpu = self._prepare_inputs(batch)
-
-               # FAST PATH: if everything fits comfortably, generate once for the whole batch
-                # (avoids microbatch splitting overhead - critical for throughput)
-                # For generation, we can be more aggressive than training since no gradients
-                B = int(batch_gpu["input_ids"].size(0))
-                max_gen_examples = getattr(self, "max_eval_generate_examples", None)
-                fits_B = (max_gen_examples is None) or (B <= max_gen_examples)
-
-                pred_texts = []
-                label_texts = []
-
-                def decode_labels(lbl_ids):
-                    # lbl_ids: (B, T) int numpy or torch cpu
-                    # replace -100 with pad before decode
-                    lbl_ids = np.where(lbl_ids == -100, self.processing_class.pad_token_id, lbl_ids)
-                    return self.processing_class.batch_decode(lbl_ids, skip_special_tokens=True)
-
-                def decode_preds(pred_ids):
-                    return self.processing_class.batch_decode(pred_ids, skip_special_tokens=True)
-
-                if fits_B and "attention_mask" in batch_gpu and "labels" in batch_gpu:
-                    # Single generate call for the whole batch
-                    gen_inputs = {k: v for k, v in batch_gpu.items() if k not in ignore_keys}
-                    try:
-                        gen_out = self.model.generate(**gen_inputs, **gen_kwargs)
-                        pred_ids = gen_out.detach().cpu().numpy()
-                        lab_ids = batch_gpu["labels"].detach().cpu().numpy()  # or batch_gpu[...] for fast path
-                        CHUNK = 512
-                        for i in range(0, len(pred_ids), CHUNK):
-                            pred_texts.extend(self.processing_class.batch_decode(pred_ids[i:i+CHUNK], skip_special_tokens=True))
-                        label_texts.extend(decode_labels(lab_ids))
-                        self._eval_on_success()
-                        continue
-                    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                        if not self._is_cuda_oom(e):
-                            raise
-                        # OOM on fast path - fall through to microbatching
-                        self._eval_oom_cleanup()
-                        if max_gen_examples is None:
-                            self.max_eval_generate_examples = B // 2  # adaptive shrink
-                        else:
-                            self.max_eval_generate_examples = max(1, max_gen_examples // 2)
-  
-                if self.use_cpu_microbatch:
-                    plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
-                else:
-                    plan_inputs = self._truncate_batch(batch_gpu)
-
-                last_err = None
-
-                for attempt in range(self.oom_max_retries + 1):
-                    try:
-                        # (optional but recommended) enable cache for generation
-                        orig_use_cache = getattr(self.model.config, "use_cache", True)
-                        self.model.config.use_cache = True
-
-                        # For generation, use larger batches than training (no gradients)
-                        orig_max_B = self.max_examples_per_microbatch
-                        gen_limit = getattr(self, "max_eval_generate_examples", None)
-                        if gen_limit is not None:
-                            self.max_examples_per_microbatch = gen_limit
-
-                        microbatches = self._make_microbatches(
-                            plan_inputs,
-                            max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
+                    # 1) loss (microbatch-aware prediction_step)
+                    with torch.no_grad():
+                        loss, _, _ = self.prediction_step(
+                            self.model,
+                            batch,
+                            prediction_loss_only=True,
+                            ignore_keys=None,
                         )
-                        self.max_examples_per_microbatch = orig_max_B  # restore
 
-                        # IMPORTANT: reset per attempt (fixes double-append after partial OOM)
-                        batch_pred_chunks = []
-                        batch_label_chunks = []
+                    labels = batch.get("labels", None)
+                    if labels is None:
+                        raise ValueError("Eval dataset must have labels for metric computation.")
 
-                        for mb in microbatches:
-                            if self.use_cpu_microbatch:
-                                mb = self._to_device(mb)  # CPU→GPU only in this mode
+                    if loss is not None:
+                        labels_cpu = labels.detach().to("cpu")
+                        num_tokens = int((labels_cpu != -100).sum().item())
+                        total_eval_loss += float(loss.item()) * num_tokens
+                        total_eval_tokens += num_tokens
 
-                            gen_inputs_mb = {k: v for k, v in mb.items() if k not in ignore_keys}
-                            gen_out = self.model.generate(**gen_inputs_mb, **gen_kwargs)
+                    batch_size = labels.size(0)
+                    num_examples += int(batch_size)
 
-                            if gen_out.ndim == 1:
-                                gen_out = gen_out.unsqueeze(0)
+                    ignore_keys = {
+                        "labels",
+                        self.length_column_name,
+                        "decoder_input_ids",
+                        "decoder_attention_mask",
+                        "meteor_ok",
+                    }
 
-                            batch_pred_chunks.append(gen_out.cpu().numpy())
-                            batch_label_chunks.append(mb["labels"].cpu().numpy())
-                            if "meteor_ok" in mb:
-                                all_meteor_ok.append(mb["meteor_ok"].cpu().numpy())
+                    # 2) prepare for generation
+                    batch_gpu = self._prepare_inputs(batch)
+
+                    # FAST PATH
+                    B = int(batch_gpu["input_ids"].size(0))
+                    max_gen_examples = getattr(self, "max_eval_generate_examples", None)
+                    fits_B = (max_gen_examples is None) or (B <= max_gen_examples)
+
+                    if fits_B and "attention_mask" in batch_gpu and "labels" in batch_gpu:
+                        gen_inputs = _filter_for_generate(batch_gpu, ignore_keys)
+                        try:
+                            gen_out = self.model.generate(**gen_inputs, **gen_kwargs)
+
+                            pred_ids = gen_out.detach().cpu().numpy()
+                            lab_ids  = batch_gpu["labels"].detach().cpu().numpy()
+
+                            # commit arrays
+                            all_preds.append(pred_ids)
+                            all_labels.append(lab_ids)
+
+                            if "meteor_ok" in batch_gpu:
+                                all_meteor_ok.append(batch_gpu["meteor_ok"].detach().cpu().numpy())
                             else:
-                                all_meteor_ok.append(np.ones((mb["labels"].size(0),), dtype=np.int64))
+                                all_meteor_ok.append(np.ones((B,), dtype=np.int64))
 
-                            del gen_out, gen_inputs_mb, mb
+                            self._eval_on_success()
+                            continue
 
-                        # success → commit
-                        all_preds.extend(batch_pred_chunks)
-                        all_labels.extend(batch_label_chunks)
+                        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                            if not self._is_cuda_oom(e):
+                                raise
+                            self._eval_oom_cleanup()
+                            if max_gen_examples is None:
+                                self.max_eval_generate_examples = max(1, B // 2)
+                            else:
+                                self.max_eval_generate_examples = max(1, max_gen_examples // 2)
+                            # fall through to microbatching
 
-                        if "meteor_ok" in batch_gpu:
-                            all_meteor_ok.append(batch_gpu["meteor_ok"].detach().cpu().numpy())
-                        else:
-                            # default: meteor on everything
-                            all_meteor_ok.append(np.ones((batch_size,), dtype=np.int64))
-                        last_err = None
+                    # Microbatch plan
+                    if self.use_cpu_microbatch:
+                        plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
+                    else:
+                        plan_inputs = self._truncate_batch(batch_gpu)
 
-                        # ADAPTIVE RAMP (place it here: only after a successful batch)
-                        self._eval_on_success()
+                    last_err = None
 
-                        break
+                    for attempt in range(self.oom_max_retries + 1):
+                        try:
+                            orig_use_cache = getattr(self.model.config, "use_cache", True)
+                            self.model.config.use_cache = True
 
-                    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                        if not self._is_cuda_oom(e):
-                            raise
-                        last_err = e
+                            orig_max_B = self.max_examples_per_microbatch
+                            gen_limit = getattr(self, "max_eval_generate_examples", None)
+                            if gen_limit is not None:
+                                self.max_examples_per_microbatch = gen_limit
 
-                        self._eval_on_oom()           # reset stability counter
-                        self._eval_oom_cleanup()
-                        changed = self._shrink_eval_limits()
+                            microbatches = self._make_microbatches(
+                                plan_inputs,
+                                max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
+                            )
+                            self.max_examples_per_microbatch = orig_max_B
 
-                        if self.control.should_log:
-                            self.log({
-                                "eval_oom_event": 1.0,
-                                "eval_oom_attempt": float(attempt),
-                                "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
-                                "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
-                                "eval_changed_limits": float(changed),
-                                "eval_stable": float(getattr(self, "_eval_stable", 0)),
-                            })
+                            batch_pred_chunks: list[np.ndarray] = []
+                            batch_label_chunks: list[np.ndarray] = []
+                            batch_meteor_chunks: list[np.ndarray] = []
 
-                        if not changed:
+                            for mb in microbatches:
+                                if self.use_cpu_microbatch:
+                                    mb = self._to_device(mb)
+
+                                gen_inputs_mb = _filter_for_generate(mb, ignore_keys)
+                                gen_out = self.model.generate(**gen_inputs_mb, **gen_kwargs)
+                                if gen_out.ndim == 1:
+                                    gen_out = gen_out.unsqueeze(0)
+
+                                batch_pred_chunks.append(gen_out.detach().cpu().numpy())
+                                batch_label_chunks.append(mb["labels"].detach().cpu().numpy())
+
+                                if "meteor_ok" in mb:
+                                    batch_meteor_chunks.append(mb["meteor_ok"].detach().cpu().numpy())
+                                else:
+                                    batch_meteor_chunks.append(np.ones((mb["labels"].size(0),), dtype=np.int64))
+
+                                del gen_out, gen_inputs_mb, mb
+
+                            # success → commit *exactly once*
+                            all_preds.extend(batch_pred_chunks)
+                            all_labels.extend(batch_label_chunks)
+                            all_meteor_ok.append(np.concatenate(batch_meteor_chunks, axis=0))
+
+                            last_err = None
+                            self._eval_on_success()
                             break
 
-                    finally:
-                        # restore cache flag
-                        try:
-                            self.model.config.use_cache = orig_use_cache
-                        except Exception:
-                            pass
+                        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                            if not self._is_cuda_oom(e):
+                                raise
+                            last_err = e
 
-                if last_err is not None:
-                    if getattr(self, "oom_skip_batch_on_fail", True):
-                        if self.control.should_log:
-                            self.log({"eval_oom_skipped_batch": 1.0})
-                        continue
-                    raise last_err
+                            self._eval_on_oom()
+                            self._eval_oom_cleanup()
+                            changed = self._shrink_eval_limits()
 
-                self.model.config.use_cache = orig_use_cache
+                            if self.control.should_log:
+                                self.log({
+                                    "eval_oom_event": 1.0,
+                                    "eval_oom_attempt": float(attempt),
+                                    "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
+                                    "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
+                                    "eval_changed_limits": float(changed),
+                                    "eval_stable": float(getattr(self, "_eval_stable", 0)),
+                                })
 
-            end_time = time.time()
-            runtime = end_time - start_time if num_steps > 0 else 0.0
+                            if not changed:
+                                break
 
-            # 4) Concatenate + call compute_metrics
-            if len(all_preds) == 0:
-                # No batches? Return zeros instead of crashing.
-                raw_metrics = {
-                    "bleu": 0.0,
-                    "chrf": 0.0,
-                    "meteor": 0.0,
-                    "gen_len": 0.0,
-                }
-            else:
-                # ---- PAD PREDICTIONS TO COMMON LENGTH ----
-                # all_preds: list of (B_i, L_pred_i)
-                max_pred_len = max(p.shape[1] for p in all_preds)
-                pad_id = self.processing_class.pad_token_id
-                if pad_id is None:
-                    pad_id = 0  # very safe fallback
+                        finally:
+                            try:
+                                self.model.config.use_cache = orig_use_cache
+                            except Exception:
+                                pass
 
-                padded_preds = []
-                for p in all_preds:
-                    if p.shape[1] < max_pred_len:
-                        pad_width = max_pred_len - p.shape[1]
-                        p = np.pad(
-                            p,
-                            pad_width=((0, 0), (0, pad_width)),
-                            mode="constant",
-                            constant_values=pad_id,
-                        )
-                    padded_preds.append(p)
-                preds = np.concatenate(padded_preds, axis=0)
+                    if last_err is not None:
+                        if getattr(self, "oom_skip_batch_on_fail", True):
+                            if self.control.should_log:
+                                self.log({"eval_oom_skipped_batch": 1.0})
+                            continue
+                        raise last_err
 
-                # ---- PAD LABELS TO COMMON LENGTH ----
-                # all_labels: list of (B_i, L_label_i)
-                max_label_len = max(l.shape[1] for l in all_labels)
-                padded_labels = []
-                for l in all_labels:
-                    if l.shape[1] < max_label_len:
-                        pad_width = max_label_len - l.shape[1]
-                        l = np.pad(
-                            l,
-                            pad_width=((0, 0), (0, pad_width)),
-                            mode="constant",
-                            constant_values=-100,  # ignore index
-                        )
-                    padded_labels.append(l)
-                labels = np.concatenate(padded_labels, axis=0)
+                runtime = time.time() - start_time if num_steps > 0 else 0.0
 
-                compute_metrics_fn = getattr(self, "compute_metrics", None)
-                if compute_metrics_fn is None:
-                    # No metrics function provided: return loss-only metrics
+                # 4) Concatenate + compute metrics
+                if len(all_preds) == 0:
                     raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
                 else:
-                    meteor_ok = np.concatenate(all_meteor_ok, axis=0)
-                    raw_metrics = compute_metrics_fn((preds, labels, meteor_ok))
+                    max_pred_len = max(p.shape[1] for p in all_preds)
+                    pad_id = self.processing_class.pad_token_id
+                    if pad_id is None:
+                        pad_id = 0
 
-                # (N, max_pred_len), (N, max_label_len)
-                #raw_metrics = self.compute_metrics((preds, labels))
-                # raw_metrics is assumed to contain {"bleu": ..., "chrf": ..., "meteor": ..., "gen_len": ...}
+                    padded_preds = []
+                    for p in all_preds:
+                        if p.shape[1] < max_pred_len:
+                            p = np.pad(p, ((0, 0), (0, max_pred_len - p.shape[1])), mode="constant", constant_values=pad_id)
+                        padded_preds.append(p)
+                    preds = np.concatenate(padded_preds, axis=0)
 
-            # 5) Convert to HF-style eval_* keys + runtime stats
-            eval_loss = (
-                total_eval_loss / total_eval_tokens
-                if total_eval_tokens > 0
-                else float("nan")
-            )
+                    max_label_len = max(l.shape[1] for l in all_labels)
+                    padded_labels = []
+                    for l in all_labels:
+                        if l.shape[1] < max_label_len:
+                            l = np.pad(l, ((0, 0), (0, max_label_len - l.shape[1])), mode="constant", constant_values=-100)
+                        padded_labels.append(l)
+                    labels = np.concatenate(padded_labels, axis=0)
 
-            metrics = {
-                "eval_loss":   float(eval_loss),
-                "eval_bleu":   float(raw_metrics.get("bleu", 0.0)),
-                "eval_chrf":   float(raw_metrics.get("chrf", 0.0)),
-                "eval_meteor": float(raw_metrics.get("meteor", 0.0)),
-                "eval_gen_len": float(raw_metrics.get("gen_len", 0.0)),
-            }
+                    compute_metrics_fn = getattr(self, "compute_metrics", None)
+                    if compute_metrics_fn is None:
+                        raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
+                    else:
+                        meteor_ok = np.concatenate(all_meteor_ok, axis=0)
+                        raw_metrics = compute_metrics_fn((preds, labels, meteor_ok))
 
-            if runtime > 0 and num_steps > 0:
-                metrics["eval_runtime"] = float(runtime)
-                metrics["eval_samples_per_second"] = float(num_examples / runtime)
-                metrics["eval_steps_per_second"] = float(num_steps / runtime)
+                eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
 
-            return metrics
+                metrics = {
+                    "eval_loss": float(eval_loss),
+                    "eval_bleu": float(raw_metrics.get("bleu", 0.0)),
+                    "eval_chrf": float(raw_metrics.get("chrf", 0.0)),
+                    "eval_meteor": float(raw_metrics.get("meteor", 0.0)),
+                    "eval_gen_len": float(raw_metrics.get("gen_len", 0.0)),
+                }
+
+                if runtime > 0 and num_steps > 0:
+                    metrics["eval_runtime"] = float(runtime)
+                    metrics["eval_samples_per_second"] = float(num_examples / runtime)
+                    metrics["eval_steps_per_second"] = float(num_steps / runtime)
+
+                return metrics
+
+            finally:
+                # fork_rng restores torch+c u d a automatically; restore python/numpy explicitly
+                np.random.set_state(np_state)
+                random.setstate(py_state)
             
         
     # --------------------------------------------------------------
