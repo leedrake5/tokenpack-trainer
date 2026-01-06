@@ -1409,13 +1409,29 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 max_gen_examples = getattr(self, "max_eval_generate_examples", None)
                 fits_B = (max_gen_examples is None) or (B <= max_gen_examples)
 
+                pred_texts = []
+                label_texts = []
+
+                def decode_labels(lbl_ids):
+                    # lbl_ids: (B, T) int numpy or torch cpu
+                    # replace -100 with pad before decode
+                    lbl_ids = np.where(lbl_ids == -100, self.processing_class.pad_token_id, lbl_ids)
+                    return self.processing_class.batch_decode(lbl_ids, skip_special_tokens=True)
+
+                def decode_preds(pred_ids):
+                    return self.processing_class.batch_decode(pred_ids, skip_special_tokens=True)
+
                 if fits_B and "attention_mask" in batch_gpu and "labels" in batch_gpu:
                     # Single generate call for the whole batch
                     gen_inputs = {k: v for k, v in batch_gpu.items() if k not in ignore_keys}
                     try:
                         gen_out = self.model.generate(**gen_inputs, **gen_kwargs)
-                        all_preds.append(gen_out.detach().cpu().numpy())
-                        all_labels.append(batch_gpu["labels"].detach().cpu().numpy())
+                        pred_ids = gen_out.detach().cpu().numpy()
+                        lab_ids  = mb["labels"].detach().cpu().numpy()  # or batch_gpu[...] for fast path
+                        CHUNK = 512
+                        for i in range(0, len(pred_ids), CHUNK):
+                            pred_texts.extend(self.processing_class.batch_decode(pred_ids[i:i+CHUNK], skip_special_tokens=True))
+                        label_texts.extend(decode_labels(lab_ids))
                         self._eval_on_success()
                         continue
                     except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
