@@ -1495,23 +1495,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         
         gen_kwargs = self._build_gen_kwargs()
 
-        def _gather_pair(pred_ids: torch.Tensor, label_ids: torch.Tensor, pad_id: int):
-            # labels: replace -100 with pad before gather so shapes are sane
-            labs = torch.where(label_ids != -100, label_ids, torch.full_like(label_ids, pad_id))
-
-            # pad to same length across local batch for gather
-            max_pred = pred_ids.size(1)
-            max_lab  = labs.size(1)
-            L = max(max_pred, max_lab)
-            pred_ids = _pad_to_len(pred_ids, pad_id, L)
-            labs     = _pad_to_len(labs,     pad_id, L)
-
-            # gather across processes
-            pred_g = self.accelerator.gather_for_metrics(pred_ids)
-            lab_g  = self.accelerator.gather_for_metrics(labs)
-            return pred_g, lab_g
-
-
         def _broadcast_tensor_from_main(t: torch.Tensor) -> torch.Tensor:
             """
             Broadcast a tensor from rank 0 to all ranks.
@@ -1624,18 +1607,18 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 out = out.unsqueeze(0)
             return out   # ← REQUIRED
 
-        # Store metric objects in a dict to avoid closure issues with reassigned variables
+        # Store metric objects and accumulated predictions/references
+        # We accumulate decoded strings and compute metrics ONCE at the end (much faster)
         metric_state = {
             "bleu_obj": bleu_obj,
             "chrf_obj": chrf_obj,
             "meteor_obj": meteor_obj,
             "metric_examples": 0,
-            "gen_call_count": 0,
+            "all_preds": [],  # accumulate all predictions
+            "all_refs": [],   # accumulate all references
         }
 
         def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
-            metric_state["gen_call_count"] += 1
-
             _bleu = metric_state["bleu_obj"]
             _chrf = metric_state["chrf_obj"]
             _meteor = metric_state["meteor_obj"]
@@ -1650,6 +1633,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if not is_main:
                 return
 
+            # Move to CPU before decoding for efficiency
+            if pred_g.device.type != 'cpu':
+                pred_g = pred_g.cpu()
+            if lab_g.device.type != 'cpu':
+                lab_g = lab_g.cpu()
+
             preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
             refs_txt  = self.processing_class.batch_decode(lab_g,  skip_special_tokens=True)
 
@@ -1659,11 +1648,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if len(preds) == 0:
                 return
 
+            # Accumulate instead of calling add_batch every time (MUCH faster)
             metric_state["metric_examples"] += len(preds)
-            if _bleu is not None: _bleu.add_batch(predictions=preds, references=refs)
-            if _chrf is not None: _chrf.add_batch(predictions=preds, references=refs)
-            if _meteor is not None:
-                _meteor.add_batch(predictions=preds, references=[r[0] for r in refs])
+            metric_state["all_preds"].extend(preds)
+            metric_state["all_refs"].extend(refs)
 
         start_time = time.time()
 
@@ -1789,25 +1777,39 @@ class TokenPackTrainer(Seq2SeqTrainer):
         _chrf_obj = metric_state["chrf_obj"]
         _meteor_obj = metric_state["meteor_obj"]
         _metric_examples = metric_state["metric_examples"]
-        _gen_call_count = metric_state["gen_call_count"]
+        _all_preds = metric_state["all_preds"]
+        _all_refs = metric_state["all_refs"]
 
         if wants_builtin:
-            if is_main and _metric_examples > 0:
+            if is_main and _metric_examples > 0 and len(_all_preds) > 0:
+                # Compute metrics ONCE on all accumulated predictions (much faster than streaming)
                 if _bleu_obj is not None:
-                    bleu_res = _bleu_obj.compute(tokenize=self.builtin_metrics_tokenize,
-                                                lowercase=self.builtin_metrics_lowercase)
+                    bleu_res = _bleu_obj.compute(
+                        predictions=_all_preds,
+                        references=_all_refs,
+                        tokenize=self.builtin_metrics_tokenize,
+                        lowercase=self.builtin_metrics_lowercase
+                    )
                     metrics["eval_bleu"] = float(bleu_res["score"])
                 else:
                     metrics["eval_bleu"] = float("nan")
 
                 if _chrf_obj is not None:
-                    chrf_res = _chrf_obj.compute()
+                    chrf_res = _chrf_obj.compute(
+                        predictions=_all_preds,
+                        references=_all_refs
+                    )
                     metrics["eval_chrf"] = float(chrf_res["score"])
                 else:
                     metrics["eval_chrf"] = float("nan")
 
                 if _meteor_obj is not None:
-                    mres = _meteor_obj.compute()
+                    # METEOR expects flat references, not nested
+                    flat_refs = [r[0] for r in _all_refs]
+                    mres = _meteor_obj.compute(
+                        predictions=_all_preds,
+                        references=flat_refs
+                    )
                     metrics["eval_meteor"] = float(mres["meteor"])
                 else:
                     metrics["eval_meteor"] = float("nan")
