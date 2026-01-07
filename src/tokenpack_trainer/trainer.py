@@ -1306,284 +1306,335 @@ class TokenPackTrainer(Seq2SeqTrainer):
         max_eval_tokens_per_microbatch: int | None = None,
         desc: str = "Eval (token-aware)",
     ):
-        import time, random, numpy as np, torch
-        from tqdm import tqdm  # <-- not tqdm.auto
+        """
+        Token-aware evaluation that is responsive by default.
 
-        all_meteor_ok = []
+        Behavior:
+          - Always computes token-weighted eval_loss
+          - Only runs generation if (predict_with_generate=True) OR metrics are requested
+          - Metrics sources:
+              * user compute_metrics (if provided) -- computed STREAMING is not possible via HF API
+                so we DO NOT call it here.
+              * built-in metrics (BLEU/chrF/METEOR) if self.builtin_metrics includes them
+                -- computed streaming via evaluate.add_batch()
 
-        py_state = random.getstate()
-        np_state = np.random.get_state()
+        Notes:
+          - Avoids "tqdm 100% then hang" by not doing giant end-of-epoch concat+decode.
+          - METEOR is slow: only run if explicitly included in builtin_metrics.
+        """
+        import time, random
+        import numpy as np
+        import torch
+        from tqdm import tqdm
 
-        devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
-        with torch.random.fork_rng(devices=devices):
+        # ---- pick dataset
+        if eval_dataset is None:
+            eval_dataset = self.eval_dataset
+        if eval_dataset is None:
+            raise ValueError("Need an eval_dataset for token-aware evaluation.")
+
+        # ---- override eval token budget for this call if requested
+        if max_eval_tokens_per_microbatch is not None:
+            self.max_eval_tokens_per_microbatch = int(max_eval_tokens_per_microbatch)
+
+        # ---- determine what we are doing
+        wants_generate = bool(getattr(self.args, "predict_with_generate", False))
+        wants_builtin = bool(getattr(self, "builtin_metrics", ()))  # tuple[str,...]
+        do_generate = wants_generate or wants_builtin
+
+        # ---- gen kwargs
+        gen_kwargs: dict[str, Any] = {}
+        if getattr(self.args, "generation_max_length", None) is not None:
+            gen_kwargs["max_length"] = int(self.args.generation_max_length)
+        if getattr(self.args, "generation_num_beams", None) is not None:
+            gen_kwargs["num_beams"] = int(self.args.generation_num_beams)
+        if getattr(self.args, "do_sample", False):
+            gen_kwargs["do_sample"] = True
+            if getattr(self.args, "top_k", None) is not None:
+                gen_kwargs["top_k"] = int(self.args.top_k)
+            if getattr(self.args, "top_p", None) is not None:
+                gen_kwargs["top_p"] = float(self.args.top_p)
+        if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
+            tmp = dict(self._gen_kwargs)
+            tmp.update(gen_kwargs)
+            gen_kwargs = tmp
+
+        # ---- streaming metric objects (rank0 only if distributed)
+        is_rank0 = bool(getattr(self, "is_world_process_zero", lambda: True)())
+        bleu_obj = chrf_obj = meteor_obj = None
+        t_decode = t_bleu = t_chrf = t_meteor = 0.0
+
+        if do_generate and wants_builtin and is_rank0:
+            import evaluate
+            want = set(k.lower() for k in self.builtin_metrics)
+            if "bleu" in want:
+                bleu_obj = evaluate.load("sacrebleu")
+            if "chrf" in want:
+                chrf_obj = evaluate.load("chrf")
+            if "meteor" in want:
+                meteor_obj = evaluate.load("meteor")
+
+        # ---- loss accumulators
+        total_eval_loss = 0.0
+        total_eval_tokens = 0
+        num_steps = 0
+        num_examples = 0
+
+        # ---- dataloader
+        dataloader = self.get_eval_dataloader(eval_dataset)
+        disable_bar = bool(getattr(self.args, "disable_tqdm", False))
+
+        # ---- misc
+        pad_id = getattr(self.processing_class, "pad_token_id", None) or 0
+
+        # IMPORTANT: never pass these into generate()
+        ignore_keys = {
+            "labels",
+            self.length_column_name,
+            "decoder_input_ids",
+            "decoder_attention_mask",
+            "meteor_ok",
+        }
+
+        def _labels_to_text(labels_2d: torch.Tensor) -> list[str]:
+            labs = labels_2d.detach()
+            labs = torch.where(labs != -100, labs, torch.full_like(labs, pad_id))
+            return self.processing_class.batch_decode(labs, skip_special_tokens=True)
+
+        def _do_generate(mb: dict) -> torch.Tensor:
+            gen_inputs = _strip_for_generate(mb, ignore_keys)
+            with torch.inference_mode():
+                out = self.model.generate(**gen_inputs, **gen_kwargs)
+            if out.ndim == 1:
+                out = out.unsqueeze(0)
+            return out
+
+        start_time = time.time()
+
+        for batch in tqdm(dataloader, desc=desc, leave=True, disable=disable_bar):
+            num_steps += 1
+            labels = batch.get("labels", None)
+            if labels is None:
+                raise ValueError("Eval dataset must have labels for token-aware evaluation.")
+
+            # ---- loss (token-weighted, using your prediction_step path)
+            with torch.no_grad():
+                loss, _, _ = self.prediction_step(
+                    self.model,
+                    batch,
+                    prediction_loss_only=True,
+                    ignore_keys=None,
+                )
+
+            if loss is not None:
+                labels_cpu = labels.detach().to("cpu")
+                ntok = int((labels_cpu != -100).sum().item())
+                if ntok > 0:
+                    total_eval_loss += float(loss.item()) * ntok
+                    total_eval_tokens += ntok
+
+            num_examples += int(labels.size(0))
+
+            # ---- optional generation + streaming metrics
+            if not do_generate:
+                continue
+
+            batch_gpu = self._prepare_inputs(batch)
+
+            # optional meteor mask (aligned)
+            if "meteor_ok" in batch_gpu:
+                meteor_ok = batch_gpu["meteor_ok"].detach().cpu().numpy().astype(bool)
+            else:
+                meteor_ok = np.ones((int(labels.size(0)),), dtype=bool)
+
+            # try fast-path: generate whole batch
+            B = int(batch_gpu["input_ids"].size(0))
+            max_gen_examples = getattr(self, "max_eval_generate_examples", None)
+            fits_B = (max_gen_examples is None) or (B <= int(max_gen_examples))
+
             try:
-                torch.manual_seed(0)
-                np.random.seed(0)
-                random.seed(0)
+                if fits_B:
+                    gen_ids = _do_generate(batch_gpu)
+                    # streaming builtin metrics
+                    if is_rank0 and (bleu_obj or chrf_obj or meteor_obj):
+                        t0 = time.perf_counter()
+                        preds_txt = self.processing_class.batch_decode(gen_ids, skip_special_tokens=True)
+                        refs_txt  = _labels_to_text(batch_gpu["labels"])
+                        t_decode += (time.perf_counter() - t0)
 
-                if eval_dataset is None:
-                    eval_dataset = self.eval_dataset
-                if eval_dataset is None:
-                    raise ValueError("Need an eval_dataset for token-aware evaluation.")
+                        preds = [p.strip() for p in preds_txt]
+                        refs  = [[r.strip()] for r in refs_txt]
 
-                dataloader = self.get_eval_dataloader(eval_dataset)
+                        if bleu_obj:
+                            t0 = time.perf_counter()
+                            bleu_obj.add_batch(predictions=preds, references=refs)
+                            t_bleu += (time.perf_counter() - t0)
 
-                # ---- If max_eval_tokens_per_microbatch passed, override just for this call
-                if max_eval_tokens_per_microbatch is not None:
-                    self.max_eval_tokens_per_microbatch = max_eval_tokens_per_microbatch
+                        if chrf_obj:
+                            t0 = time.perf_counter()
+                            chrf_obj.add_batch(predictions=preds, references=refs)
+                            t_chrf += (time.perf_counter() - t0)
 
-                # -------- generation kwargs --------
-                gen_kwargs: dict[str, Any] = {}
-                if self.args.generation_max_length is not None:
-                    gen_kwargs["max_length"] = self.args.generation_max_length
-                if self.args.generation_num_beams is not None:
-                    gen_kwargs["num_beams"] = self.args.generation_num_beams
+                        if meteor_obj:
+                            mpreds = [p for p, ok in zip(preds, meteor_ok) if ok]
+                            mrefs  = [r[0] for r, ok in zip(refs,  meteor_ok) if ok]
+                            if mpreds:
+                                t0 = time.perf_counter()
+                                meteor_obj.add_batch(predictions=mpreds, references=mrefs)
+                                t_meteor += (time.perf_counter() - t0)
 
-                if getattr(self.args, "do_sample", False):
-                    gen_kwargs["do_sample"] = True
-                    if getattr(self.args, "top_k", None) is not None:
-                        gen_kwargs["top_k"] = self.args.top_k
-                    if getattr(self.args, "top_p", None) is not None:
-                        gen_kwargs["top_p"] = self.args.top_p
+                    self._eval_on_success()
+                    continue
 
-                if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
-                    tmp = self._gen_kwargs.copy()
-                    tmp.update(gen_kwargs)
-                    gen_kwargs = tmp
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                if not self._is_cuda_oom(e):
+                    raise
+                self._eval_oom_cleanup()
+                if max_gen_examples is None:
+                    self.max_eval_generate_examples = max(1, B // 2)
+                else:
+                    self.max_eval_generate_examples = max(1, int(max_gen_examples) // 2)
+                # fall through to microbatching
 
-                # -------- accumulators --------
-                all_preds = []
-                all_labels = []
+            # microbatch generation path (OOM-safe)
+            if self.use_cpu_microbatch:
+                plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
+            else:
+                plan_inputs = self._truncate_batch(batch_gpu)
 
-                num_steps = 0
-                num_examples = 0
-                total_eval_loss = 0.0
-                total_eval_tokens = 0
+            last_err = None
+            for attempt in range(int(self.oom_max_retries) + 1):
+                try:
+                    orig_use_cache = getattr(self.model.config, "use_cache", True)
+                    self.model.config.use_cache = True
 
-                start_time = time.time()
-                disable_bar = bool(getattr(self.args, "disable_tqdm", False))
+                    orig_max_B = self.max_examples_per_microbatch
+                    gen_limit = getattr(self, "max_eval_generate_examples", None)
+                    if gen_limit is not None:
+                        self.max_examples_per_microbatch = int(gen_limit)
 
-                # IMPORTANT: ignore_keys must exclude meteor_ok so it never reaches generate()
-                ignore_keys = {
-                    "labels",
-                    self.length_column_name,
-                    "decoder_input_ids",
-                    "decoder_attention_mask",
-                    "meteor_ok",
-                }
+                    microbatches = self._make_microbatches(
+                        plan_inputs,
+                        max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
+                    )
+                    self.max_examples_per_microbatch = orig_max_B
 
-                for batch in tqdm(dataloader, desc=desc, leave=True, disable=disable_bar):
-                    num_steps += 1
+                    mb_iter = self._prefetch_microbatches(microbatches) if self.use_cpu_microbatch else iter(microbatches)
 
-                    # ----- loss (microbatch-aware prediction_step) -----
-                    with torch.no_grad():
-                        loss, _, _ = self.prediction_step(
-                            self.model,
-                            batch,
-                            prediction_loss_only=True,
-                            ignore_keys=None,
-                        )
+                    for mb in mb_iter:
+                        gen_ids = _do_generate(mb)
 
-                    labels = batch.get("labels", None)
-                    if labels is None:
-                        raise ValueError("Eval dataset must have labels for metric computation.")
-
-                    if loss is not None:
-                        labels_cpu = labels.detach().to("cpu")
-                        num_tokens = int((labels_cpu != -100).sum().item())
-                        total_eval_loss += float(loss.item()) * num_tokens
-                        total_eval_tokens += num_tokens
-
-                    batch_size = int(labels.size(0))
-                    num_examples += batch_size
-
-                    # ----- prepare inputs for generation -----
-                    batch_gpu = self._prepare_inputs(batch)
-
-                    # collect meteor_ok for this batch (but DO NOT pass into generate)
-                    if "meteor_ok" in batch_gpu:
-                        batch_meteor = batch_gpu["meteor_ok"].detach().cpu().numpy()
-                    else:
-                        batch_meteor = np.ones((batch_size,), dtype=np.int64)
-
-                    # FAST PATH: generate whole batch if allowed
-                    B = int(batch_gpu["input_ids"].size(0))
-                    max_gen_examples = getattr(self, "max_eval_generate_examples", None)
-                    fits_B = (max_gen_examples is None) or (B <= max_gen_examples)
-
-                    if fits_B and "attention_mask" in batch_gpu and "labels" in batch_gpu:
-                        gen_inputs = _strip_for_generate(batch_gpu, ignore_keys)
-                        try:
-                            gen_out = self.model.generate(**gen_inputs, **gen_kwargs)
-                            if gen_out.ndim == 1:
-                                gen_out = gen_out.unsqueeze(0)
-
-                            all_preds.append(gen_out.detach().cpu().numpy())
-                            all_labels.append(batch_gpu["labels"].detach().cpu().numpy())
-                            all_meteor_ok.append(batch_meteor)
-
-                            self._eval_on_success()
-                            continue
-                        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                            if not self._is_cuda_oom(e):
-                                raise
-                            self._eval_oom_cleanup()
-                            if max_gen_examples is None:
-                                self.max_eval_generate_examples = max(1, B // 2)
+                        if is_rank0 and (bleu_obj or chrf_obj or meteor_obj):
+                            mbB = int(mb["input_ids"].size(0))
+                            if "meteor_ok" in mb:
+                                mb_ok = mb["meteor_ok"].detach().cpu().numpy().astype(bool)
                             else:
-                                self.max_eval_generate_examples = max(1, max_gen_examples // 2)
-                            # fall through to microbatching
+                                mb_ok = np.ones((mbB,), dtype=bool)
 
-                    # ----- microbatch path -----
-                    if self.use_cpu_microbatch:
-                        plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
-                    else:
-                        plan_inputs = self._truncate_batch(batch_gpu)
+                            t0 = time.perf_counter()
+                            preds_txt = self.processing_class.batch_decode(gen_ids, skip_special_tokens=True)
+                            refs_txt  = _labels_to_text(mb["labels"])
+                            t_decode += (time.perf_counter() - t0)
+
+                            preds = [p.strip() for p in preds_txt]
+                            refs  = [[r.strip()] for r in refs_txt]
+
+                            if bleu_obj:
+                                t0 = time.perf_counter()
+                                bleu_obj.add_batch(predictions=preds, references=refs)
+                                t_bleu += (time.perf_counter() - t0)
+
+                            if chrf_obj:
+                                t0 = time.perf_counter()
+                                chrf_obj.add_batch(predictions=preds, references=refs)
+                                t_chrf += (time.perf_counter() - t0)
+
+                            if meteor_obj:
+                                mpreds = [p for p, ok in zip(preds, mb_ok) if ok]
+                                mrefs  = [r[0] for r, ok in zip(refs,  mb_ok) if ok]
+                                if mpreds:
+                                    t0 = time.perf_counter()
+                                    meteor_obj.add_batch(predictions=mpreds, references=mrefs)
+                                    t_meteor += (time.perf_counter() - t0)
 
                     last_err = None
+                    self._eval_on_success()
+                    break
 
-                    for attempt in range(self.oom_max_retries + 1):
-                        try:
-                            orig_use_cache = getattr(self.model.config, "use_cache", True)
-                            self.model.config.use_cache = True
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                    if not self._is_cuda_oom(e):
+                        raise
+                    last_err = e
+                    self._eval_on_oom()
+                    self._eval_oom_cleanup()
+                    changed = self._shrink_eval_limits()
 
-                            # allow larger B for eval generation if set
-                            orig_max_B = self.max_examples_per_microbatch
-                            gen_limit = getattr(self, "max_eval_generate_examples", None)
-                            if gen_limit is not None:
-                                self.max_examples_per_microbatch = gen_limit
+                    if self.control.should_log:
+                        self.log({
+                            "eval_oom_event": 1.0,
+                            "eval_oom_attempt": float(attempt),
+                            "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
+                            "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
+                            "eval_changed_limits": float(changed),
+                        })
 
-                            microbatches = self._make_microbatches(
-                                plan_inputs,
-                                max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
-                            )
-                            self.max_examples_per_microbatch = orig_max_B
+                    if not changed:
+                        break
 
-                            batch_pred_chunks = []
-                            batch_label_chunks = []
-                            batch_meteor_chunks = []
+                finally:
+                    try:
+                        self.model.config.use_cache = orig_use_cache
+                    except Exception:
+                        pass
 
-                            for mb in microbatches:
-                                if self.use_cpu_microbatch:
-                                    mb = self._to_device(mb)
+            if last_err is not None:
+                if getattr(self, "oom_skip_batch_on_fail", True):
+                    if self.control.should_log:
+                        self.log({"eval_oom_skipped_batch": 1.0})
+                    continue
+                raise last_err
 
-                                mb_B = int(mb["input_ids"].size(0))
+        runtime = time.time() - start_time if num_steps > 0 else 0.0
+        eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
 
-                                # meteor_ok per-microbatch
-                                if "meteor_ok" in mb:
-                                    mb_meteor = mb["meteor_ok"].detach().cpu().numpy()
-                                else:
-                                    mb_meteor = np.ones((mb_B,), dtype=np.int64)
+        metrics = {"eval_loss": float(eval_loss)}
 
-                                gen_inputs_mb = _strip_for_generate(mb, ignore_keys)
-                                gen_out = self.model.generate(**gen_inputs_mb, **gen_kwargs)
-                                if gen_out.ndim == 1:
-                                    gen_out = gen_out.unsqueeze(0)
+        # finalize builtin metrics (rank0 only)
+        if is_rank0 and (bleu_obj or chrf_obj or meteor_obj):
+            if bleu_obj:
+                bleu_res = bleu_obj.compute(
+                    tokenize=getattr(self, "builtin_metrics_tokenize", "13a"),
+                    lowercase=bool(getattr(self, "builtin_metrics_lowercase", False)),
+                )
+                metrics["eval_bleu"] = float(bleu_res["score"])
+            if chrf_obj:
+                chrf_res = chrf_obj.compute()
+                metrics["eval_chrf"] = float(chrf_res["score"])
+            if meteor_obj:
+                mres = meteor_obj.compute()
+                metrics["eval_meteor"] = float(mres["meteor"])
 
-                                batch_pred_chunks.append(gen_out.detach().cpu().numpy())
-                                batch_label_chunks.append(mb["labels"].detach().cpu().numpy())
-                                batch_meteor_chunks.append(mb_meteor)
+            total_metric_time = t_decode + t_bleu + t_chrf + t_meteor
+            metrics.update({
+                "t_decode_s": float(round(t_decode, 3)),
+                "t_bleu_s": float(round(t_bleu, 3)),
+                "t_chrf_s": float(round(t_chrf, 3)),
+                "t_meteor_s": float(round(t_meteor, 3)),
+                "t_meteor_pct": float(round((t_meteor / total_metric_time * 100.0), 1)) if total_metric_time > 0 else 0.0,
+            })
+        else:
+            # keep keys present if you want stable logs
+            if wants_builtin:
+                metrics.setdefault("eval_bleu", float("nan"))
+                metrics.setdefault("eval_chrf", float("nan"))
+                metrics.setdefault("eval_meteor", float("nan"))
 
-                                del gen_out, gen_inputs_mb, mb
+        if runtime > 0 and num_steps > 0:
+            metrics["eval_runtime"] = float(runtime)
+            metrics["eval_samples_per_second"] = float(num_examples / runtime)
+            metrics["eval_steps_per_second"] = float(num_steps / runtime)
 
-                            # success → commit all chunks
-                            all_preds.extend(batch_pred_chunks)
-                            all_labels.extend(batch_label_chunks)
-                            all_meteor_ok.extend(batch_meteor_chunks)
-
-                            last_err = None
-                            self._eval_on_success()
-                            break
-
-                        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                            if not self._is_cuda_oom(e):
-                                raise
-                            last_err = e
-
-                            self._eval_on_oom()
-                            self._eval_oom_cleanup()
-                            changed = self._shrink_eval_limits()
-
-                            if self.control.should_log:
-                                self.log({
-                                    "eval_oom_event": 1.0,
-                                    "eval_oom_attempt": float(attempt),
-                                    "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
-                                    "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
-                                    "eval_changed_limits": float(changed),
-                                    "eval_stable": float(getattr(self, "_eval_stable", 0)),
-                                })
-
-                            if not changed:
-                                break
-
-                        finally:
-                            try:
-                                self.model.config.use_cache = orig_use_cache
-                            except Exception:
-                                pass
-
-                    if last_err is not None:
-                        if getattr(self, "oom_skip_batch_on_fail", True):
-                            if self.control.should_log:
-                                self.log({"eval_oom_skipped_batch": 1.0})
-                            continue
-                        raise last_err
-
-                runtime = time.time() - start_time if num_steps > 0 else 0.0
-
-                # ----- compute metrics -----
-                if len(all_preds) == 0:
-                    raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
-                else:
-                    # pad preds to common length
-                    max_pred_len = max(p.shape[1] for p in all_preds)
-                    pad_id = self.processing_class.pad_token_id or 0
-
-                    padded_preds = []
-                    for p in all_preds:
-                        if p.shape[1] < max_pred_len:
-                            p = np.pad(p, ((0, 0), (0, max_pred_len - p.shape[1])), mode="constant", constant_values=pad_id)
-                        padded_preds.append(p)
-                    preds = np.concatenate(padded_preds, axis=0)
-
-                    # pad labels to common length
-                    max_label_len = max(l.shape[1] for l in all_labels)
-                    padded_labels = []
-                    for l in all_labels:
-                        if l.shape[1] < max_label_len:
-                            l = np.pad(l, ((0, 0), (0, max_label_len - l.shape[1])), mode="constant", constant_values=-100)
-                        padded_labels.append(l)
-                    labels = np.concatenate(padded_labels, axis=0)
-
-                    meteor_ok = np.concatenate(all_meteor_ok, axis=0) if len(all_meteor_ok) else np.ones((labels.shape[0],), dtype=np.int64)
-
-                    compute_metrics_fn = getattr(self, "compute_metrics", None)
-                    if compute_metrics_fn is None:
-                        raw_metrics = {"bleu": 0.0, "chrf": 0.0, "meteor": 0.0, "gen_len": 0.0}
-                    else:
-                        raw_metrics = compute_metrics_fn((preds, labels, meteor_ok))
-
-                eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
-
-                metrics = {
-                    "eval_loss": float(eval_loss),
-                    "eval_bleu": float(raw_metrics.get("bleu", 0.0)),
-                    "eval_chrf": float(raw_metrics.get("chrf", 0.0)),
-                    "eval_meteor": float(raw_metrics.get("meteor", 0.0)),
-                    "eval_gen_len": float(raw_metrics.get("gen_len", 0.0)),
-                }
-                if runtime > 0 and num_steps > 0:
-                    metrics["eval_runtime"] = float(runtime)
-                    metrics["eval_samples_per_second"] = float(num_examples / runtime)
-                    metrics["eval_steps_per_second"] = float(num_steps / runtime)
-
-                return metrics
-
-            finally:
-                np.random.set_state(np_state)
-                random.setstate(py_state)
-            
+        return metrics
         
     # --------------------------------------------------------------
     # OOM handling + emergency checkpoint
@@ -1688,11 +1739,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
         eval_mode: str | None = None,
     ):
         """
-        eval_mode:
-          - None / "hf" / "vanilla" / "huggingface": use standard HF evaluation_loop
-          - "token_aware_loss": token-weighted loss-only (no preds)
-          - "token_aware_metrics": token-aware generation/preds + compute_metrics
-          - "auto": (optional) use token-aware loss-only when no metrics/generate, otherwise HF
+        Modes:
+          - None/"hf"/"vanilla": pure HF super().evaluate (respects predict_with_generate + compute_metrics)
+          - "token_aware_loss": token-weighted loss only (fast, no generate)
+          - "token_aware_metrics": token-aware eval that computes loss always and
+                optionally generation + built-in metrics (if requested)
+          - "auto": if predict_with_generate or builtin_metrics -> token_aware_metrics else token_aware_loss
         """
         eval_dataset = eval_dataset or self.eval_dataset
         if eval_dataset is None:
@@ -1702,51 +1754,59 @@ class TokenPackTrainer(Seq2SeqTrainer):
         mode = self._normalize_eval_mode(requested)
 
         wants_generate = bool(getattr(self.args, "predict_with_generate", False))
-        has_metrics = getattr(self, "compute_metrics", None) is not None
+        wants_builtin = bool(getattr(self, "builtin_metrics", ()))
+        has_user_metrics = getattr(self, "compute_metrics", None) is not None
 
-        # ----------------------------
-        # Explicit token-aware modes
-        # ----------------------------
-        if mode == "token_aware_loss":
-            if wants_generate or has_metrics:
-                raise ValueError(
-                    "eval_mode='token_aware_loss' is loss-only. "
-                    "Set predict_with_generate=False and compute_metrics=None "
-                    "or use eval_mode='token_aware_metrics'."
-                )
-            return self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
-
-        if mode == "token_aware_metrics":
-            if not has_metrics:
-                raise ValueError(
-                    "eval_mode='token_aware_metrics' requires compute_metrics to be set. "
-                    "Use eval_mode='token_aware_loss' for loss-only."
-                )
-            metrics = self._token_aware_evaluate(
-                eval_dataset=eval_dataset,
-                max_eval_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
-                desc="eval (token-aware)",
-            )
-            # Log metrics (HF's evaluate does this internally, but we need to do it explicitly)
-            self.log(metrics)
-            self.control.should_log = False  # Prevent double-logging
-            return metrics
-
-        # ----------------------------
-        # 2) Auto mode
-        # ----------------------------
-        if mode == "auto":
-            if (not wants_generate) and (not has_metrics):
-                return self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+        # ---- 1) HF path (fully HF)
+        if mode is None:
             return super().evaluate(
                 eval_dataset=eval_dataset,
                 ignore_keys=ignore_keys,
                 metric_key_prefix=metric_key_prefix,
             )
 
-        # ----------------------------
-        # 3) Pure HF behavior
-        # ----------------------------
+        # ---- 2) token-aware loss-only
+        if mode == "token_aware_loss":
+            # Force no-generate semantics for token-aware loss-only
+            if wants_generate:
+                # don't mutate args permanently; just call your loss-only helper
+                pass
+            return self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+
+        # ---- 3) token-aware metrics (responsive)
+        if mode == "token_aware_metrics":
+            # If user provided compute_metrics, you have two choices:
+            #   A) keep token-aware eval built-in metrics only (streaming)
+            #   B) fall back to HF so user compute_metrics runs
+            #
+            # For a package, the least surprising is:
+            #   - If user provided compute_metrics, and they asked for token-aware metrics,
+            #     we still DO token-aware eval, but we DO NOT call user compute_metrics (HF API isn't streaming).
+            #     We'll log a warning once.
+            if has_user_metrics and self.control.should_log:
+                self.log({"warn_compute_metrics_ignored_in_token_aware": 1.0})
+
+            metrics = self._token_aware_evaluate(
+                eval_dataset=eval_dataset,
+                max_eval_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
+                desc="eval (token-aware)",
+            )
+            self.log(metrics)
+            return metrics
+
+        # ---- 4) auto
+        if mode == "auto":
+            if wants_generate or wants_builtin:
+                metrics = self._token_aware_evaluate(
+                    eval_dataset=eval_dataset,
+                    max_eval_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
+                    desc="eval (token-aware)",
+                )
+                self.log(metrics)
+                return metrics
+            return self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+
+        # fallback: treat unknown as HF
         return super().evaluate(
             eval_dataset=eval_dataset,
             ignore_keys=ignore_keys,
