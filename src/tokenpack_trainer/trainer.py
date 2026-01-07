@@ -1544,8 +1544,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # On single process, always treat as main; otherwise check accelerator
         is_main = (num_proc == 1) or (acc is not None and bool(acc.is_main_process))
 
+        # Diagnostic output (always print for debugging)
+        print(f"[TokenPackTrainer._token_aware_evaluate] wants_generate={wants_generate}, "
+              f"wants_builtin={wants_builtin}, do_generate={do_generate}, "
+              f"is_main={is_main}, num_proc={num_proc}")
+
         bleu_obj = chrf_obj = meteor_obj = None
         metric_examples = 0
+        gen_call_count = 0  # Track how many times generation is attempted
 
         if do_generate and wants_builtin and is_main:
             import evaluate
@@ -1570,6 +1576,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 chrf_obj = evaluate.load("chrf")
             if "meteor" in want:
                 meteor_obj = evaluate.load("meteor")
+
+            print(f"[TokenPackTrainer._token_aware_evaluate] Loaded metrics: "
+                  f"bleu={bleu_obj is not None}, chrf={chrf_obj is not None}, "
+                  f"meteor={meteor_obj is not None}, want={want}")
 
             # If user asked for builtin metrics but none matched, warn loudly once
             if bleu_obj is None and chrf_obj is None and meteor_obj is None:
@@ -1617,14 +1627,20 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return out   # ← REQUIRED
 
         def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
-            nonlocal metric_examples
+            nonlocal metric_examples, gen_call_count
+            gen_call_count += 1
+
             if not (bleu_obj or chrf_obj or meteor_obj):
+                if gen_call_count <= 3:  # Only print first few times
+                    print(f"[_add_streaming_metrics] No metric objects available, returning early")
                 return
 
             # gather if multi-proc; no-op on 1 GPU
             pred_g, lab_g = self._gather_pair_for_metrics(gen_ids, labels, pad_id)
 
             if not is_main:
+                if gen_call_count <= 3:
+                    print(f"[_add_streaming_metrics] Not main process, returning early")
                 return
 
             preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
@@ -1634,9 +1650,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
             refs  = [[r.strip()] for r in refs_txt]
 
             if len(preds) == 0:
+                if gen_call_count <= 3:
+                    print(f"[_add_streaming_metrics] No predictions decoded, returning early")
                 return
 
             metric_examples += len(preds)
+            if gen_call_count <= 3:
+                print(f"[_add_streaming_metrics] Added {len(preds)} examples, total={metric_examples}")
             if bleu_obj: bleu_obj.add_batch(predictions=preds, references=refs)
             if chrf_obj: chrf_obj.add_batch(predictions=preds, references=refs)
             if meteor_obj:
@@ -1671,13 +1691,21 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 batch_for_gen = self._truncate_batch(self._prepare_inputs(batch))
             # ---- fast path generate whole batch ----
             try:
+                if num_steps <= 3:
+                    print(f"[TokenPackTrainer] Step {num_steps}: Attempting generation, "
+                          f"batch input_ids shape={batch_for_gen.get('input_ids', torch.empty(0)).shape}")
                 gen_ids = _do_generate(batch_for_gen)
+                if num_steps <= 3:
+                    print(f"[TokenPackTrainer] Step {num_steps}: Generation succeeded, "
+                          f"gen_ids shape={gen_ids.shape}")
                 _add_streaming_metrics(gen_ids, batch_for_gen["labels"])
                 self._eval_on_success()
                 continue
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 if not self._is_cuda_oom(e):
+                    print(f"[TokenPackTrainer] Non-OOM exception in generation: {type(e).__name__}: {e}")
                     raise
+                print(f"[TokenPackTrainer] OOM in fast path, falling back to microbatching")
                 self._eval_oom_cleanup()
                 # fall through to microbatching
 
@@ -1807,6 +1835,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 # Warn if we expected metrics but got none (helps debug)
                 if is_main and metric_examples == 0:
+                    print(f"[TokenPackTrainer] DIAGNOSTIC: metric_examples=0 despite expecting metrics. "
+                          f"gen_call_count={gen_call_count}, bleu_obj={bleu_obj is not None}, "
+                          f"chrf_obj={chrf_obj is not None}, is_main={is_main}")
                     logger.warning(
                         f"[TokenPackTrainer] Expected metrics but metric_examples=0. "
                         f"bleu_obj={bleu_obj is not None}, chrf_obj={chrf_obj is not None}, "
