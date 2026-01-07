@@ -60,14 +60,22 @@ logger = logging.get_logger(__name__)
 
 import inspect
 
+import inspect
+import torch
+import torch.nn.functional as F
+
 _ALWAYS_ALLOW = {
-    # Common model forward inputs (not exhaustive, but safe)
     "input_ids", "attention_mask", "inputs_embeds",
     "decoder_input_ids", "decoder_attention_mask",
     "encoder_outputs", "past_key_values",
     "use_cache", "head_mask", "decoder_head_mask", "cross_attn_head_mask",
     "output_attentions", "output_hidden_states", "return_dict",
 }
+
+def _pad_to_len(x: torch.Tensor, pad: int, L: int) -> torch.Tensor:
+    if x.size(1) == L:
+        return x
+    return F.pad(x, (0, L - x.size(1)), value=pad)
 
 def _is_tensorish(x) -> bool:
     return torch.is_tensor(x)
@@ -310,8 +318,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.builtin_metrics_tokenize = str(builtin_metrics_tokenize)
         self.builtin_metrics_lowercase = bool(builtin_metrics_lowercase)
 
-
-        self._cached_forward_keys: set[str] | None = None
+        self._cached_forward_keys = None
 
 
         if getattr(self, "processing_class", None) is None:
@@ -392,6 +399,70 @@ class TokenPackTrainer(Seq2SeqTrainer):
             raise ValueError(
                 "Invalid TokenPackTrainer configuration:\n  - " + "\n  - ".join(errors)
             )
+
+    def _pad_to_len(x: torch.Tensor, pad: int, L: int) -> torch.Tensor:
+        if x.size(1) == L:
+            return x
+        return F.pad(x, (0, L - x.size(1)), value=pad)
+
+
+    def _forward_keys(self):
+        if self._cached_forward_keys is not None:
+            return self._cached_forward_keys
+        try:
+            sig = inspect.signature(self.model.forward)
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                self._cached_forward_keys = None
+            else:
+                self._cached_forward_keys = set(sig.parameters.keys())
+        except Exception:
+            self._cached_forward_keys = None
+        return self._cached_forward_keys
+
+    def _filter_for_generate(self, batch: dict, ignore: set[str] | None = None) -> dict:
+        if ignore is None:
+            ignore = set()
+        fwd_keys = self._forward_keys()
+        out = {}
+        for k, v in batch.items():
+            if k in ignore:
+                continue
+            if not torch.is_tensor(v):
+                continue
+            if fwd_keys is None:
+                out[k] = v
+            else:
+                if (k in fwd_keys) or (k in _ALWAYS_ALLOW):
+                    out[k] = v
+        return out
+
+    def _gather_pair_for_metrics(self, pred_ids: torch.Tensor, label_ids: torch.Tensor, pad_id: int):
+        """
+        Returns gathered (pred_ids, labels) across processes if needed.
+        On single GPU, returns inputs unchanged.
+        """
+        # replace -100 with pad for decode
+        labs = torch.where(label_ids != -100, label_ids, torch.full_like(label_ids, pad_id))
+
+        # Ensure 2D
+        if pred_ids.ndim == 1:
+            pred_ids = pred_ids.unsqueeze(0)
+        if labs.ndim == 1:
+            labs = labs.unsqueeze(0)
+
+        # pad to same length locally
+        L = max(pred_ids.size(1), labs.size(1))
+        pred_ids = _pad_to_len(pred_ids, pad_id, L)
+        labs     = _pad_to_len(labs,     pad_id, L)
+
+        # multi-proc only
+        acc = getattr(self, "accelerator", None)
+        if acc is None or getattr(acc, "num_processes", 1) == 1:
+            return pred_ids, labs
+
+        pred_g = acc.gather_for_metrics(pred_ids)
+        labs_g = acc.gather_for_metrics(labs)
+        return pred_g, labs_g
 
     def _forward_keys(self) -> set[str] | None:
         """
@@ -1393,12 +1464,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         import torch
         from tqdm import tqdm
         
-        def _pad_to_len(x: torch.Tensor, pad: int, L: int) -> torch.Tensor:
-            if x.size(1) == L:
-                return x
-            pad_amt = L - x.size(1)
-            return torch.nn.functional.pad(x, (0, pad_amt), value=pad)
-
         def _gather_pair(pred_ids: torch.Tensor, label_ids: torch.Tensor, pad_id: int):
             # labels: replace -100 with pad before gather so shapes are sane
             labs = torch.where(label_ids != -100, label_ids, torch.full_like(label_ids, pad_id))
@@ -1427,32 +1492,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         # ---- determine what we are doing
         wants_generate = bool(getattr(self.args, "predict_with_generate", False))
-        wants_builtin = bool(getattr(self, "builtin_metrics", ()))  # tuple[str,...]
+        wants_builtin = bool(getattr(self, "builtin_metrics", ()))
         do_generate = wants_generate or wants_builtin
 
-        # ---- gen kwargs
-        gen_kwargs: dict[str, Any] = {}
-        if getattr(self.args, "generation_max_length", None) is not None:
-            gen_kwargs["max_length"] = int(self.args.generation_max_length)
-        if getattr(self.args, "generation_num_beams", None) is not None:
-            gen_kwargs["num_beams"] = int(self.args.generation_num_beams)
-        if getattr(self.args, "do_sample", False):
-            gen_kwargs["do_sample"] = True
-            if getattr(self.args, "top_k", None) is not None:
-                gen_kwargs["top_k"] = int(self.args.top_k)
-            if getattr(self.args, "top_p", None) is not None:
-                gen_kwargs["top_p"] = float(self.args.top_p)
-        if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
-            tmp = dict(self._gen_kwargs)
-            tmp.update(gen_kwargs)
-            gen_kwargs = tmp
+        acc = getattr(self, "accelerator", None)
+        num_proc = getattr(acc, "num_processes", 1) if acc is not None else 1
+        is_main = bool(acc.is_main_process) if acc is not None else True
 
-        # ---- streaming metric objects (rank0 only if distributed)
-        is_rank0 = bool(getattr(self, "accelerator", None) and self.accelerator.is_main_process)
         bleu_obj = chrf_obj = meteor_obj = None
-        t_decode = t_bleu = t_chrf = t_meteor = 0.0
+        metric_examples = 0
 
-        if do_generate and wants_builtin and is_rank0:
+        if do_generate and wants_builtin and is_main:
             import evaluate
             want = set(k.lower() for k in self.builtin_metrics)
             if "bleu" in want:
@@ -1462,20 +1512,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if "meteor" in want:
                 meteor_obj = evaluate.load("meteor")
 
-        # ---- loss accumulators
         total_eval_loss = 0.0
         total_eval_tokens = 0
         num_steps = 0
         num_examples = 0
+        metrics = {}
 
-        # ---- dataloader
         dataloader = self.get_eval_dataloader(eval_dataset)
-        disable_bar = bool(getattr(self.args, "disable_tqdm", False))
-
-        # ---- misc
         pad_id = getattr(self.processing_class, "pad_token_id", None) or 0
 
-        # IMPORTANT: never pass these into generate()
         ignore_keys = {
             "labels",
             self.length_column_name,
@@ -1484,89 +1529,75 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "meteor_ok",
         }
 
-        def _labels_to_text(labels_2d: torch.Tensor) -> list[str]:
-            labs = labels_2d.detach()
-            labs = torch.where(labs != -100, labs, torch.full_like(labs, pad_id))
-            return self.processing_class.batch_decode(labs, skip_special_tokens=True)
-
-        def _do_generate(mb: dict) -> torch.Tensor:
-            gen_inputs = self._filter_for_generate(batch_gpu, ignore_keys)
-            out = self.model.generate(**gen_inputs, **gen_kwargs)
+        def _do_generate(mb_gpu: dict) -> torch.Tensor:
+            gen_inputs = self._filter_for_generate(mb_gpu, ignore_keys)
+            with torch.inference_mode():
+                out = self.model.generate(**gen_inputs, **gen_kwargs)
+            if out.ndim == 1:
+                out = out.unsqueeze(0)
             return out
+
+        def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
+            nonlocal metric_examples
+            if not (bleu_obj or chrf_obj or meteor_obj):
+                return
+
+            # gather if multi-proc; no-op on 1 GPU
+            pred_g, lab_g = self._gather_pair_for_metrics(gen_ids, labels, pad_id)
+
+            if not is_main:
+                return
+
+            preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
+            refs_txt  = self.processing_class.batch_decode(lab_g,  skip_special_tokens=True)
+
+            preds = [p.strip() for p in preds_txt]
+            refs  = [[r.strip()] for r in refs_txt]
+
+            if len(preds) == 0:
+                return
+
+            metric_examples += len(preds)
+            if bleu_obj: bleu_obj.add_batch(predictions=preds, references=refs)
+            if chrf_obj: chrf_obj.add_batch(predictions=preds, references=refs)
+            if meteor_obj:
+                meteor_obj.add_batch(predictions=preds, references=[r[0] for r in refs])
 
         start_time = time.time()
 
-        for batch in tqdm(dataloader, desc=desc, leave=True, disable=disable_bar):
+        for batch in tqdm(dataloader, desc=desc, leave=True, disable=bool(getattr(self.args, "disable_tqdm", False))):
             num_steps += 1
             labels = batch.get("labels", None)
             if labels is None:
                 raise ValueError("Eval dataset must have labels for token-aware evaluation.")
 
-            # ---- loss (token-weighted, using your prediction_step path)
+            # loss (your token-weighted path)
             with torch.no_grad():
-                loss, _, _ = self.prediction_step(
-                    self.model,
-                    batch,
-                    prediction_loss_only=True,
-                    ignore_keys=None,
-                )
+                loss, _, _ = self.prediction_step(self.model, batch, prediction_loss_only=True)
 
             if loss is not None:
-                labels_cpu = labels.detach().to("cpu")
-                ntok = int((labels_cpu != -100).sum().item())
+                ntok = int((labels.detach().to("cpu") != -100).sum().item())
                 if ntok > 0:
                     total_eval_loss += float(loss.item()) * ntok
                     total_eval_tokens += ntok
 
             num_examples += int(labels.size(0))
 
-            # ---- optional generation + streaming metrics
             if not do_generate:
                 continue
 
             batch_gpu = self._prepare_inputs(batch)
 
-            # optional meteor mask (aligned)
-            if "meteor_ok" in batch_gpu:
-                meteor_ok = batch_gpu["meteor_ok"].detach().cpu().numpy().astype(bool)
-            else:
-                meteor_ok = np.ones((int(labels.size(0)),), dtype=bool)
-
-            # try fast-path: generate whole batch
-            B = int(batch_gpu["input_ids"].size(0))
-            max_gen_examples = getattr(self, "max_eval_generate_examples", None)
-            fits_B = (max_gen_examples is None) or (B <= int(max_gen_examples))
-
+            # ---- fast path generate whole batch ----
             try:
-                if fits_B:
-                    gen_ids = _do_generate(batch_gpu)
-                    # streaming builtin metrics
-                    if bleu_obj or chrf_obj or meteor_obj:
-                        # make sure tensors are on device for gather
-                        pred_g, lab_g = _gather_pair(gen_ids.to(self.args.device), mb["labels"].to(self.args.device), pad_id)
-
-                        if self.accelerator.is_main_process:
-                            preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
-                            refs_txt  = self.processing_class.batch_decode(lab_g,  skip_special_tokens=True)
-
-                            preds = [p.strip() for p in preds_txt]
-                            refs  = [[r.strip()] for r in refs_txt]
-                            if bleu_obj: bleu_obj.add_batch(predictions=preds, references=refs)
-                            if chrf_obj: chrf_obj.add_batch(predictions=preds, references=refs)
-                            if meteor_obj:
-                                meteor_obj.add_batch(predictions=[p for p in preds], references=[r[0] for r in refs])
-
-                    self._eval_on_success()
-                    continue
-
+                gen_ids = _do_generate(batch_gpu)
+                _add_streaming_metrics(gen_ids, batch_gpu["labels"])
+                self._eval_on_success()
+                continue
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 if not self._is_cuda_oom(e):
                     raise
                 self._eval_oom_cleanup()
-                if max_gen_examples is None:
-                    self.max_eval_generate_examples = max(1, B // 2)
-                else:
-                    self.max_eval_generate_examples = max(1, int(max_gen_examples) // 2)
                 # fall through to microbatching
 
             # microbatch generation path (OOM-safe)
@@ -1666,45 +1697,45 @@ class TokenPackTrainer(Seq2SeqTrainer):
         metrics["eval_bleu"] = float(bleu_t.item())
         metrics["eval_chrf"] = float(chrf_t.item())
 
+
         runtime = time.time() - start_time if num_steps > 0 else 0.0
         eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
 
-        metrics = {"eval_loss": float(eval_loss)}
-
-        # finalize builtin metrics (rank0 only)
-        if is_rank0 and (bleu_obj or chrf_obj or meteor_obj):
-            if bleu_obj:
-                bleu_res = bleu_obj.compute(
-                    tokenize=getattr(self, "builtin_metrics_tokenize", "13a"),
-                    lowercase=bool(getattr(self, "builtin_metrics_lowercase", False)),
-                )
-                metrics["eval_bleu"] = float(bleu_res["score"])
-            if chrf_obj:
-                chrf_res = chrf_obj.compute()
-                metrics["eval_chrf"] = float(chrf_res["score"])
-            if meteor_obj:
-                mres = meteor_obj.compute()
-                metrics["eval_meteor"] = float(mres["meteor"])
-
-            total_metric_time = t_decode + t_bleu + t_chrf + t_meteor
-            metrics.update({
-                "t_decode_s": float(round(t_decode, 3)),
-                "t_bleu_s": float(round(t_bleu, 3)),
-                "t_chrf_s": float(round(t_chrf, 3)),
-                "t_meteor_s": float(round(t_meteor, 3)),
-                "t_meteor_pct": float(round((t_meteor / total_metric_time * 100.0), 1)) if total_metric_time > 0 else 0.0,
-            })
-        else:
-            # keep keys present if you want stable logs
-            if wants_builtin:
-                metrics.setdefault("eval_bleu", float("nan"))
-                metrics.setdefault("eval_chrf", float("nan"))
-                metrics.setdefault("eval_meteor", float("nan"))
-
-        if runtime > 0 and num_steps > 0:
+        metrics["eval_loss"] = float(eval_loss)
+        if runtime > 0:
             metrics["eval_runtime"] = float(runtime)
             metrics["eval_samples_per_second"] = float(num_examples / runtime)
             metrics["eval_steps_per_second"] = float(num_steps / runtime)
+
+        # finalize metrics (main only in multi-proc, but we still return on all ranks)
+        if wants_builtin:
+            if is_main and metric_examples > 0:
+                if bleu_obj:
+                    bleu_res = bleu_obj.compute(tokenize=self.builtin_metrics_tokenize,
+                                                lowercase=self.builtin_metrics_lowercase)
+                    metrics["eval_bleu"] = float(bleu_res["score"])
+                else:
+                    metrics["eval_bleu"] = float("nan")
+
+                if chrf_obj:
+                    chrf_res = chrf_obj.compute()
+                    metrics["eval_chrf"] = float(chrf_res["score"])
+                else:
+                    metrics["eval_chrf"] = float("nan")
+
+                if meteor_obj:
+                    mres = meteor_obj.compute()
+                    metrics["eval_meteor"] = float(mres["meteor"])
+                else:
+                    metrics["eval_meteor"] = float("nan")
+
+                metrics["metric_examples"] = float(metric_examples)
+            else:
+                # On non-main ranks (multi-proc) or if nothing was added:
+                metrics.setdefault("eval_bleu", float("nan"))
+                metrics.setdefault("eval_chrf", float("nan"))
+                metrics.setdefault("eval_meteor", float("nan"))
+                metrics.setdefault("metric_examples", float(metric_examples))
 
         return metrics
         
