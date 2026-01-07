@@ -1548,13 +1548,34 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         if do_generate and wants_builtin and is_main:
             import evaluate
-            want = set(k.lower() for k in self.builtin_metrics)
+
+            # Normalize + accept common aliases
+            raw = list(self.builtin_metrics or ())
+            want = set(str(k).strip().lower() for k in raw)
+
+            aliases = {
+                "sacrebleu": "bleu",
+                "bleu1": "bleu",
+                "bleu-1": "bleu",
+                "chr_f": "chrf",
+                "chrf++": "chrf",
+                "chrfpp": "chrf",
+            }
+            want = set(aliases.get(k, k) for k in want)
+
             if "bleu" in want:
                 bleu_obj = evaluate.load("sacrebleu")
             if "chrf" in want:
                 chrf_obj = evaluate.load("chrf")
             if "meteor" in want:
                 meteor_obj = evaluate.load("meteor")
+
+            # If user asked for builtin metrics but none matched, warn loudly once
+            if bleu_obj is None and chrf_obj is None and meteor_obj is None:
+                if self.control.should_log:
+                    self.log({"warn_no_builtin_metrics_matched": 1.0})
+                # Optional: also print for local debugging
+                # print(f"[TokenPackTrainer] builtin_metrics={raw} normalized={sorted(want)} -> none matched")
 
         total_eval_loss = 0.0
         total_eval_tokens = 0
@@ -1630,12 +1651,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if not do_generate:
                 continue
 
-            batch_gpu = self._prepare_inputs(batch)
-
+            if self.use_cpu_microbatch:
+                batch_for_gen = self._to_device(self._truncate_batch(self._move_to_cpu(batch)))
+            else:
+                batch_for_gen = self._truncate_batch(self._prepare_inputs(batch))
             # ---- fast path generate whole batch ----
             try:
-                gen_ids = _do_generate(batch_gpu)
-                _add_streaming_metrics(gen_ids, batch_gpu["labels"])
+                gen_ids = _do_generate(batch_for_gen)
+                _add_streaming_metrics(gen_ids, batch_for_gen["labels"])
                 self._eval_on_success()
                 continue
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
