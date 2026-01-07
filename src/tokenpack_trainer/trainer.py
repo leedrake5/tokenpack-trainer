@@ -485,6 +485,26 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         return self._cached_forward_keys
 
+
+    def _build_gen_kwargs(self) -> dict:
+        gen_kwargs: dict[str, Any] = {}
+        if getattr(self.args, "generation_max_length", None) is not None:
+            gen_kwargs["max_length"] = int(self.args.generation_max_length)
+        if getattr(self.args, "generation_num_beams", None) is not None:
+            gen_kwargs["num_beams"] = int(self.args.generation_num_beams)
+        if getattr(self.args, "do_sample", False):
+            gen_kwargs["do_sample"] = True
+            if getattr(self.args, "top_k", None) is not None:
+                gen_kwargs["top_k"] = int(self.args.top_k)
+            if getattr(self.args, "top_p", None) is not None:
+                gen_kwargs["top_p"] = float(self.args.top_p)
+        # allow overrides
+        if hasattr(self, "_gen_kwargs") and isinstance(self._gen_kwargs, dict):
+            tmp = dict(self._gen_kwargs)
+            tmp.update(gen_kwargs)
+            gen_kwargs = tmp
+        return gen_kwargs
+
     def _filter_for_generate(
         self,
         batch: dict,
@@ -1464,6 +1484,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
         import torch
         from tqdm import tqdm
         
+        gen_kwargs = self._build_gen_kwargs()
+
+        def _do_generate(mb_gpu: dict) -> torch.Tensor:
+            gen_inputs = self._filter_for_generate(mb_gpu, ignore_keys)
+            with torch.inference_mode():
+                out = self.model.generate(**gen_inputs, **gen_kwargs)
+        
         def _gather_pair(pred_ids: torch.Tensor, label_ids: torch.Tensor, pad_id: int):
             # labels: replace -100 with pad before gather so shapes are sane
             labs = torch.where(label_ids != -100, label_ids, torch.full_like(label_ids, pad_id))
@@ -1532,7 +1559,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         def _do_generate(mb_gpu: dict) -> torch.Tensor:
             gen_inputs = self._filter_for_generate(mb_gpu, ignore_keys)
             with torch.inference_mode():
-                out = self.model.generate(**gen_inputs, **kwargs)
+                out = self.model.generate(**gen_inputs, **gen_kwargs)
             if out.ndim == 1:
                 out = out.unsqueeze(0)
             return out
