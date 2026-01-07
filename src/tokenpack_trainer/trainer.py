@@ -1541,7 +1541,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         acc = getattr(self, "accelerator", None)
         num_proc = getattr(acc, "num_processes", 1) if acc is not None else 1
-        is_main = bool(acc.is_main_process) if acc is not None else True
+        # On single process, always treat as main; otherwise check accelerator
+        is_main = (num_proc == 1) or (acc is not None and bool(acc.is_main_process))
 
         bleu_obj = chrf_obj = meteor_obj = None
         metric_examples = 0
@@ -1576,6 +1577,19 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self.log({"warn_no_builtin_metrics_matched": 1.0})
                 # Optional: also print for local debugging
                 # print(f"[TokenPackTrainer] builtin_metrics={raw} normalized={sorted(want)} -> none matched")
+
+            if self.debug:
+                logger.info(f"[TokenPackTrainer] Metric setup: bleu={bleu_obj is not None}, "
+                           f"chrf={chrf_obj is not None}, meteor={meteor_obj is not None}, "
+                           f"is_main={is_main}, num_proc={num_proc}")
+
+        # Warn if we expected to compute metrics but conditions weren't met
+        if do_generate and wants_builtin and not is_main:
+            logger.warning(
+                f"[TokenPackTrainer] builtin_metrics requested but is_main={is_main}. "
+                f"Metrics will only be computed on main process. "
+                f"(num_proc={num_proc}, acc={acc})"
+            )
 
         total_eval_loss = 0.0
         total_eval_tokens = 0
@@ -1669,9 +1683,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
             # microbatch generation path (OOM-safe)
             if self.use_cpu_microbatch:
-                plan_inputs = self._truncate_batch(self._move_to_cpu(batch_gpu))
+                plan_inputs = self._truncate_batch(self._move_to_cpu(batch))
             else:
-                plan_inputs = self._truncate_batch(batch_gpu)
+                plan_inputs = self._truncate_batch(batch)
 
             last_err = None
             for attempt in range(int(self.oom_max_retries) + 1):
@@ -1735,7 +1749,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 raise last_err
 
 
-        if self.accelerator.is_main_process:
+        if is_main:
             bleu = float(bleu_obj.compute(tokenize=self.builtin_metrics_tokenize,
                                           lowercase=self.builtin_metrics_lowercase)["score"]) if bleu_obj else float("nan")
             chrf = float(chrf_obj.compute()["score"]) if chrf_obj else float("nan")
@@ -1790,6 +1804,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 metrics.setdefault("eval_chrf", float("nan"))
                 metrics.setdefault("eval_meteor", float("nan"))
                 metrics.setdefault("metric_examples", float(metric_examples))
+
+                # Warn if we expected metrics but got none (helps debug)
+                if is_main and metric_examples == 0:
+                    logger.warning(
+                        f"[TokenPackTrainer] Expected metrics but metric_examples=0. "
+                        f"bleu_obj={bleu_obj is not None}, chrf_obj={chrf_obj is not None}, "
+                        f"do_generate={do_generate}, num_examples={num_examples}"
+                    )
 
         return metrics
         
