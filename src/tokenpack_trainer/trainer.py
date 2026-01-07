@@ -1652,7 +1652,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
             _chrf = metric_state["chrf_obj"]
             _meteor = metric_state["meteor_obj"]
 
-            if not (_bleu or _chrf or _meteor):
+            # Use explicit None checks - EvaluationModule objects are falsy when empty!
+            if _bleu is None and _chrf is None and _meteor is None:
                 if gen_call_count <= 3:
                     print(f"[_add_streaming_metrics] No metric objects available, returning early")
                 return
@@ -1679,9 +1680,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
             metric_state["metric_examples"] += len(preds)
             if gen_call_count <= 3:
                 print(f"[_add_streaming_metrics] Added {len(preds)} examples, total={metric_state['metric_examples']}")
-            if _bleu: _bleu.add_batch(predictions=preds, references=refs)
-            if _chrf: _chrf.add_batch(predictions=preds, references=refs)
-            if _meteor:
+            if _bleu is not None: _bleu.add_batch(predictions=preds, references=refs)
+            if _chrf is not None: _chrf.add_batch(predictions=preds, references=refs)
+            if _meteor is not None:
                 _meteor.add_batch(predictions=preds, references=[r[0] for r in refs])
 
         start_time = time.time()
@@ -1820,20 +1821,20 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         if wants_builtin:
             if is_main and _metric_examples > 0:
-                if _bleu_obj:
+                if _bleu_obj is not None:
                     bleu_res = _bleu_obj.compute(tokenize=self.builtin_metrics_tokenize,
                                                 lowercase=self.builtin_metrics_lowercase)
                     metrics["eval_bleu"] = float(bleu_res["score"])
                 else:
                     metrics["eval_bleu"] = float("nan")
 
-                if _chrf_obj:
+                if _chrf_obj is not None:
                     chrf_res = _chrf_obj.compute()
                     metrics["eval_chrf"] = float(chrf_res["score"])
                 else:
                     metrics["eval_chrf"] = float("nan")
 
-                if _meteor_obj:
+                if _meteor_obj is not None:
                     mres = _meteor_obj.compute()
                     metrics["eval_meteor"] = float(mres["meteor"])
                 else:
