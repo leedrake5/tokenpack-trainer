@@ -313,60 +313,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         self._cached_forward_keys: set[str] | None = None
 
-        def _forward_keys(self) -> set[str] | None:
-            """
-            Return keys accepted by model.forward(). Cached after first call.
-            If signature introspection fails, return None (meaning: don't signature-filter).
-            """
-            if self._cached_forward_keys is not None:
-                return self._cached_forward_keys
-
-            try:
-                sig = inspect.signature(self.model.forward)
-                keys = set(sig.parameters.keys())
-                # Some models use **kwargs; if so, signature filtering is pointless.
-                if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-                    self._cached_forward_keys = None
-                else:
-                    self._cached_forward_keys = keys
-            except Exception:
-                self._cached_forward_keys = None
-
-            return self._cached_forward_keys
-
-        def _filter_for_generate(
-            self,
-            batch: dict,
-            ignore: set[str] | None = None,
-        ) -> dict:
-            """
-            Return a dict safe to pass into model.generate():
-
-            - drop keys in ignore
-            - keep tensor values only
-            - optionally signature-filter to model.forward() accepted keys
-              (plus a small allowlist of common keys)
-            """
-            if ignore is None:
-                ignore = set()
-
-            out = {}
-            fwd_keys = self._forward_keys()
-
-            for k, v in batch.items():
-                if k in ignore:
-                    continue
-                if not _is_tensorish(v):
-                    continue
-
-                if fwd_keys is None:
-                    # introspection unavailable or model.forward has **kwargs
-                    out[k] = v
-                else:
-                    if (k in fwd_keys) or (k in _ALWAYS_ALLOW):
-                        out[k] = v
-
-            return out
 
         if getattr(self, "processing_class", None) is None:
             # fallback, just in case
@@ -446,6 +392,61 @@ class TokenPackTrainer(Seq2SeqTrainer):
             raise ValueError(
                 "Invalid TokenPackTrainer configuration:\n  - " + "\n  - ".join(errors)
             )
+
+    def _forward_keys(self) -> set[str] | None:
+        """
+        Return keys accepted by model.forward(). Cached after first call.
+        If signature introspection fails, return None (meaning: don't signature-filter).
+        """
+        if self._cached_forward_keys is not None:
+            return self._cached_forward_keys
+
+        try:
+            sig = inspect.signature(self.model.forward)
+            keys = set(sig.parameters.keys())
+            # Some models use **kwargs; if so, signature filtering is pointless.
+            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                self._cached_forward_keys = None
+            else:
+                self._cached_forward_keys = keys
+        except Exception:
+            self._cached_forward_keys = None
+
+        return self._cached_forward_keys
+
+    def _filter_for_generate(
+        self,
+        batch: dict,
+        ignore: set[str] | None = None,
+    ) -> dict:
+        """
+        Return a dict safe to pass into model.generate():
+
+        - drop keys in ignore
+        - keep tensor values only
+        - optionally signature-filter to model.forward() accepted keys
+          (plus a small allowlist of common keys)
+        """
+        if ignore is None:
+            ignore = set()
+
+        out = {}
+        fwd_keys = self._forward_keys()
+
+        for k, v in batch.items():
+            if k in ignore:
+                continue
+            if not _is_tensorish(v):
+                continue
+
+            if fwd_keys is None:
+                # introspection unavailable or model.forward has **kwargs
+                out[k] = v
+            else:
+                if (k in fwd_keys) or (k in _ALWAYS_ALLOW):
+                    out[k] = v
+
+        return out
 
     def _normalize_eval_mode(self, mode: str | None) -> str | None:
         if mode is None:
