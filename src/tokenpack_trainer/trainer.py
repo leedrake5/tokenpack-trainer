@@ -1550,8 +1550,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
               f"is_main={is_main}, num_proc={num_proc}")
 
         bleu_obj = chrf_obj = meteor_obj = None
-        metric_examples = 0
-        gen_call_count = 0  # Track how many times generation is attempted
 
         if do_generate and wants_builtin and is_main:
             import evaluate
@@ -1580,6 +1578,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             print(f"[TokenPackTrainer._token_aware_evaluate] Loaded metrics: "
                   f"bleu={bleu_obj is not None}, chrf={chrf_obj is not None}, "
                   f"meteor={meteor_obj is not None}, want={want}")
+            print(f"[TokenPackTrainer._token_aware_evaluate] DEBUG: id(bleu_obj)={id(bleu_obj)}")
 
             # If user asked for builtin metrics but none matched, warn loudly once
             if bleu_obj is None and chrf_obj is None and meteor_obj is None:
@@ -1626,12 +1625,26 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 out = out.unsqueeze(0)
             return out   # ← REQUIRED
 
-        def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
-            nonlocal metric_examples, gen_call_count
-            gen_call_count += 1
+        # Store metric objects in a dict to avoid closure issues with reassigned variables
+        print(f"[TokenPackTrainer] Creating metric_state with bleu_obj={bleu_obj is not None}, "
+              f"chrf_obj={chrf_obj is not None}, meteor_obj={meteor_obj is not None}")
+        metric_state = {
+            "bleu_obj": bleu_obj,
+            "chrf_obj": chrf_obj,
+            "meteor_obj": meteor_obj,
+            "metric_examples": 0,
+            "gen_call_count": 0,
+        }
 
-            if not (bleu_obj or chrf_obj or meteor_obj):
-                if gen_call_count <= 3:  # Only print first few times
+        def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
+            metric_state["gen_call_count"] += 1
+            gen_call_count = metric_state["gen_call_count"]
+            _bleu = metric_state["bleu_obj"]
+            _chrf = metric_state["chrf_obj"]
+            _meteor = metric_state["meteor_obj"]
+
+            if not (_bleu or _chrf or _meteor):
+                if gen_call_count <= 3:
                     print(f"[_add_streaming_metrics] No metric objects available, returning early")
                 return
 
@@ -1654,13 +1667,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     print(f"[_add_streaming_metrics] No predictions decoded, returning early")
                 return
 
-            metric_examples += len(preds)
+            metric_state["metric_examples"] += len(preds)
             if gen_call_count <= 3:
-                print(f"[_add_streaming_metrics] Added {len(preds)} examples, total={metric_examples}")
-            if bleu_obj: bleu_obj.add_batch(predictions=preds, references=refs)
-            if chrf_obj: chrf_obj.add_batch(predictions=preds, references=refs)
-            if meteor_obj:
-                meteor_obj.add_batch(predictions=preds, references=[r[0] for r in refs])
+                print(f"[_add_streaming_metrics] Added {len(preds)} examples, total={metric_state['metric_examples']}")
+            if _bleu: _bleu.add_batch(predictions=preds, references=refs)
+            if _chrf: _chrf.add_batch(predictions=preds, references=refs)
+            if _meteor:
+                _meteor.add_batch(predictions=preds, references=[r[0] for r in refs])
 
         start_time = time.time()
 
@@ -1777,22 +1790,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 raise last_err
 
 
-        if is_main:
-            bleu = float(bleu_obj.compute(tokenize=self.builtin_metrics_tokenize,
-                                          lowercase=self.builtin_metrics_lowercase)["score"]) if bleu_obj else float("nan")
-            chrf = float(chrf_obj.compute()["score"]) if chrf_obj else float("nan")
-        else:
-            bleu = chrf = float("nan")
-
-        # broadcast scalars
-        bleu_t = torch.tensor([bleu], device=self.args.device)
-        chrf_t = torch.tensor([chrf], device=self.args.device)
-
-        bleu_t = _broadcast_tensor_from_main(bleu_t)
-        chrf_t = _broadcast_tensor_from_main(chrf_t)
-
-        metrics["eval_bleu"] = float(bleu_t.item())
-        metrics["eval_chrf"] = float(chrf_t.item())
+        # Note: metrics are computed in the finalize section below using metric_state
 
         runtime = time.time() - start_time if num_steps > 0 else 0.0
         eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
@@ -1804,43 +1802,50 @@ class TokenPackTrainer(Seq2SeqTrainer):
             metrics["eval_steps_per_second"] = float(num_steps / runtime)
 
         # finalize metrics (main only in multi-proc, but we still return on all ranks)
+        # Use metric_state to get the updated values
+        _bleu_obj = metric_state["bleu_obj"]
+        _chrf_obj = metric_state["chrf_obj"]
+        _meteor_obj = metric_state["meteor_obj"]
+        _metric_examples = metric_state["metric_examples"]
+        _gen_call_count = metric_state["gen_call_count"]
+
         if wants_builtin:
-            if is_main and metric_examples > 0:
-                if bleu_obj:
-                    bleu_res = bleu_obj.compute(tokenize=self.builtin_metrics_tokenize,
+            if is_main and _metric_examples > 0:
+                if _bleu_obj:
+                    bleu_res = _bleu_obj.compute(tokenize=self.builtin_metrics_tokenize,
                                                 lowercase=self.builtin_metrics_lowercase)
                     metrics["eval_bleu"] = float(bleu_res["score"])
                 else:
                     metrics["eval_bleu"] = float("nan")
 
-                if chrf_obj:
-                    chrf_res = chrf_obj.compute()
+                if _chrf_obj:
+                    chrf_res = _chrf_obj.compute()
                     metrics["eval_chrf"] = float(chrf_res["score"])
                 else:
                     metrics["eval_chrf"] = float("nan")
 
-                if meteor_obj:
-                    mres = meteor_obj.compute()
+                if _meteor_obj:
+                    mres = _meteor_obj.compute()
                     metrics["eval_meteor"] = float(mres["meteor"])
                 else:
                     metrics["eval_meteor"] = float("nan")
 
-                metrics["metric_examples"] = float(metric_examples)
+                metrics["metric_examples"] = float(_metric_examples)
             else:
                 # On non-main ranks (multi-proc) or if nothing was added:
                 metrics.setdefault("eval_bleu", float("nan"))
                 metrics.setdefault("eval_chrf", float("nan"))
                 metrics.setdefault("eval_meteor", float("nan"))
-                metrics.setdefault("metric_examples", float(metric_examples))
+                metrics.setdefault("metric_examples", float(_metric_examples))
 
                 # Warn if we expected metrics but got none (helps debug)
-                if is_main and metric_examples == 0:
+                if is_main and _metric_examples == 0:
                     print(f"[TokenPackTrainer] DIAGNOSTIC: metric_examples=0 despite expecting metrics. "
-                          f"gen_call_count={gen_call_count}, bleu_obj={bleu_obj is not None}, "
-                          f"chrf_obj={chrf_obj is not None}, is_main={is_main}")
+                          f"gen_call_count={_gen_call_count}, bleu_obj={_bleu_obj is not None}, "
+                          f"chrf_obj={_chrf_obj is not None}, is_main={is_main}")
                     logger.warning(
                         f"[TokenPackTrainer] Expected metrics but metric_examples=0. "
-                        f"bleu_obj={bleu_obj is not None}, chrf_obj={chrf_obj is not None}, "
+                        f"bleu_obj={_bleu_obj is not None}, chrf_obj={_chrf_obj is not None}, "
                         f"do_generate={do_generate}, num_examples={num_examples}"
                     )
 
