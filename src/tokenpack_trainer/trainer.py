@@ -60,17 +60,17 @@ logger = logging.get_logger(__name__)
 
 import inspect
 
-# compute ONCE
-try:
-    _FWD_KEYS = set(inspect.signature(self.model.forward).parameters.keys())
-except Exception:
-    _FWD_KEYS = None  # fallback: don't filter by signature
+_ALWAYS_ALLOW = {
+    # Common model forward inputs (not exhaustive, but safe)
+    "input_ids", "attention_mask", "inputs_embeds",
+    "decoder_input_ids", "decoder_attention_mask",
+    "encoder_outputs", "past_key_values",
+    "use_cache", "head_mask", "decoder_head_mask", "cross_attn_head_mask",
+    "output_attentions", "output_hidden_states", "return_dict",
+}
 
-def _filter_for_generate(d: dict, ignore: set[str]) -> dict:
-    out = {k: v for k, v in d.items() if k not in ignore}
-    if _FWD_KEYS is not None:
-        out = {k: v for k, v in out.items() if k in _FWD_KEYS}
-    return out
+def _is_tensorish(x) -> bool:
+    return torch.is_tensor(x)
 
 def _strip_for_generate(batch: dict, ignore_keys: set[str] | None = None) -> dict:
     """
@@ -309,6 +309,64 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.builtin_metrics = tuple(builtin_metrics) if builtin_metrics else tuple()
         self.builtin_metrics_tokenize = str(builtin_metrics_tokenize)
         self.builtin_metrics_lowercase = bool(builtin_metrics_lowercase)
+
+
+        self._cached_forward_keys: set[str] | None = None
+
+        def _forward_keys(self) -> set[str] | None:
+            """
+            Return keys accepted by model.forward(). Cached after first call.
+            If signature introspection fails, return None (meaning: don't signature-filter).
+            """
+            if self._cached_forward_keys is not None:
+                return self._cached_forward_keys
+
+            try:
+                sig = inspect.signature(self.model.forward)
+                keys = set(sig.parameters.keys())
+                # Some models use **kwargs; if so, signature filtering is pointless.
+                if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+                    self._cached_forward_keys = None
+                else:
+                    self._cached_forward_keys = keys
+            except Exception:
+                self._cached_forward_keys = None
+
+            return self._cached_forward_keys
+
+        def _filter_for_generate(
+            self,
+            batch: dict,
+            ignore: set[str] | None = None,
+        ) -> dict:
+            """
+            Return a dict safe to pass into model.generate():
+
+            - drop keys in ignore
+            - keep tensor values only
+            - optionally signature-filter to model.forward() accepted keys
+              (plus a small allowlist of common keys)
+            """
+            if ignore is None:
+                ignore = set()
+
+            out = {}
+            fwd_keys = self._forward_keys()
+
+            for k, v in batch.items():
+                if k in ignore:
+                    continue
+                if not _is_tensorish(v):
+                    continue
+
+                if fwd_keys is None:
+                    # introspection unavailable or model.forward has **kwargs
+                    out[k] = v
+                else:
+                    if (k in fwd_keys) or (k in _ALWAYS_ALLOW):
+                        out[k] = v
+
+            return out
 
         if getattr(self, "processing_class", None) is None:
             # fallback, just in case
@@ -660,10 +718,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 if to_remove:
                     ds = ds.remove_columns(to_remove)
 
-            if hasattr(ds, "column_names"):
-                raw_lengths = ds[self.length_column_name]
+            # FAST: bypass formatting overhead
+            if hasattr(ds, "data") and hasattr(ds.data, "column_names") and self.length_column_name in ds.data.column_names:
+                raw_lengths = ds.data.column(self.length_column_name).to_pylist()
             else:
-                raw_lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
+                # fallback
+                raw_lengths = ds[self.length_column_name] if hasattr(ds, "column_names") else [ds[i][self.length_column_name] for i in range(len(ds))]
 
             if self.max_encoder_len is not None:
                 lengths_for_sampler = [
@@ -1331,6 +1391,28 @@ class TokenPackTrainer(Seq2SeqTrainer):
         import numpy as np
         import torch
         from tqdm import tqdm
+        
+        def _pad_to_len(x: torch.Tensor, pad: int, L: int) -> torch.Tensor:
+            if x.size(1) == L:
+                return x
+            pad_amt = L - x.size(1)
+            return torch.nn.functional.pad(x, (0, pad_amt), value=pad)
+
+        def _gather_pair(pred_ids: torch.Tensor, label_ids: torch.Tensor, pad_id: int):
+            # labels: replace -100 with pad before gather so shapes are sane
+            labs = torch.where(label_ids != -100, label_ids, torch.full_like(label_ids, pad_id))
+
+            # pad to same length across local batch for gather
+            max_pred = pred_ids.size(1)
+            max_lab  = labs.size(1)
+            L = max(max_pred, max_lab)
+            pred_ids = _pad_to_len(pred_ids, pad_id, L)
+            labs     = _pad_to_len(labs,     pad_id, L)
+
+            # gather across processes
+            pred_g = self.accelerator.gather_for_metrics(pred_ids)
+            lab_g  = self.accelerator.gather_for_metrics(labs)
+            return pred_g, lab_g
 
         # ---- pick dataset
         if eval_dataset is None:
@@ -1365,7 +1447,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             gen_kwargs = tmp
 
         # ---- streaming metric objects (rank0 only if distributed)
-        is_rank0 = bool(getattr(self, "is_world_process_zero", lambda: True)())
+        is_rank0 = bool(getattr(self, "accelerator", None) and self.accelerator.is_main_process)
         bleu_obj = chrf_obj = meteor_obj = None
         t_decode = t_bleu = t_chrf = t_meteor = 0.0
 
@@ -1407,11 +1489,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return self.processing_class.batch_decode(labs, skip_special_tokens=True)
 
         def _do_generate(mb: dict) -> torch.Tensor:
-            gen_inputs = _strip_for_generate(mb, ignore_keys)
-            with torch.inference_mode():
-                out = self.model.generate(**gen_inputs, **gen_kwargs)
-            if out.ndim == 1:
-                out = out.unsqueeze(0)
+            gen_inputs = self._filter_for_generate(batch_gpu, ignore_keys)
+            out = self.model.generate(**gen_inputs, **gen_kwargs)
             return out
 
         start_time = time.time()
@@ -1461,32 +1540,20 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 if fits_B:
                     gen_ids = _do_generate(batch_gpu)
                     # streaming builtin metrics
-                    if is_rank0 and (bleu_obj or chrf_obj or meteor_obj):
-                        t0 = time.perf_counter()
-                        preds_txt = self.processing_class.batch_decode(gen_ids, skip_special_tokens=True)
-                        refs_txt  = _labels_to_text(batch_gpu["labels"])
-                        t_decode += (time.perf_counter() - t0)
+                    if bleu_obj or chrf_obj or meteor_obj:
+                        # make sure tensors are on device for gather
+                        pred_g, lab_g = _gather_pair(gen_ids.to(self.args.device), mb["labels"].to(self.args.device), pad_id)
 
-                        preds = [p.strip() for p in preds_txt]
-                        refs  = [[r.strip()] for r in refs_txt]
+                        if self.accelerator.is_main_process:
+                            preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
+                            refs_txt  = self.processing_class.batch_decode(lab_g,  skip_special_tokens=True)
 
-                        if bleu_obj:
-                            t0 = time.perf_counter()
-                            bleu_obj.add_batch(predictions=preds, references=refs)
-                            t_bleu += (time.perf_counter() - t0)
-
-                        if chrf_obj:
-                            t0 = time.perf_counter()
-                            chrf_obj.add_batch(predictions=preds, references=refs)
-                            t_chrf += (time.perf_counter() - t0)
-
-                        if meteor_obj:
-                            mpreds = [p for p, ok in zip(preds, meteor_ok) if ok]
-                            mrefs  = [r[0] for r, ok in zip(refs,  meteor_ok) if ok]
-                            if mpreds:
-                                t0 = time.perf_counter()
-                                meteor_obj.add_batch(predictions=mpreds, references=mrefs)
-                                t_meteor += (time.perf_counter() - t0)
+                            preds = [p.strip() for p in preds_txt]
+                            refs  = [[r.strip()] for r in refs_txt]
+                            if bleu_obj: bleu_obj.add_batch(predictions=preds, references=refs)
+                            if chrf_obj: chrf_obj.add_batch(predictions=preds, references=refs)
+                            if meteor_obj:
+                                meteor_obj.add_batch(predictions=[p for p in preds], references=[r[0] for r in refs])
 
                     self._eval_on_success()
                     continue
@@ -1529,38 +1596,20 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     for mb in mb_iter:
                         gen_ids = _do_generate(mb)
 
-                        if is_rank0 and (bleu_obj or chrf_obj or meteor_obj):
-                            mbB = int(mb["input_ids"].size(0))
-                            if "meteor_ok" in mb:
-                                mb_ok = mb["meteor_ok"].detach().cpu().numpy().astype(bool)
-                            else:
-                                mb_ok = np.ones((mbB,), dtype=bool)
+                        if bleu_obj or chrf_obj or meteor_obj:
+                            # make sure tensors are on device for gather
+                            pred_g, lab_g = _gather_pair(gen_ids.to(self.args.device), mb["labels"].to(self.args.device), pad_id)
 
-                            t0 = time.perf_counter()
-                            preds_txt = self.processing_class.batch_decode(gen_ids, skip_special_tokens=True)
-                            refs_txt  = _labels_to_text(mb["labels"])
-                            t_decode += (time.perf_counter() - t0)
+                            if self.accelerator.is_main_process:
+                                preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
+                                refs_txt  = self.processing_class.batch_decode(lab_g,  skip_special_tokens=True)
 
-                            preds = [p.strip() for p in preds_txt]
-                            refs  = [[r.strip()] for r in refs_txt]
-
-                            if bleu_obj:
-                                t0 = time.perf_counter()
-                                bleu_obj.add_batch(predictions=preds, references=refs)
-                                t_bleu += (time.perf_counter() - t0)
-
-                            if chrf_obj:
-                                t0 = time.perf_counter()
-                                chrf_obj.add_batch(predictions=preds, references=refs)
-                                t_chrf += (time.perf_counter() - t0)
-
-                            if meteor_obj:
-                                mpreds = [p for p, ok in zip(preds, mb_ok) if ok]
-                                mrefs  = [r[0] for r, ok in zip(refs,  mb_ok) if ok]
-                                if mpreds:
-                                    t0 = time.perf_counter()
-                                    meteor_obj.add_batch(predictions=mpreds, references=mrefs)
-                                    t_meteor += (time.perf_counter() - t0)
+                                preds = [p.strip() for p in preds_txt]
+                                refs  = [[r.strip()] for r in refs_txt]
+                                if bleu_obj: bleu_obj.add_batch(predictions=preds, references=refs)
+                                if chrf_obj: chrf_obj.add_batch(predictions=preds, references=refs)
+                                if meteor_obj:
+                                    meteor_obj.add_batch(predictions=[p for p in preds], references=[r[0] for r in refs])
 
                     last_err = None
                     self._eval_on_success()
@@ -1598,6 +1647,23 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         self.log({"eval_oom_skipped_batch": 1.0})
                     continue
                 raise last_err
+
+
+        if self.accelerator.is_main_process:
+            bleu = float(bleu_obj.compute(tokenize=self.builtin_metrics_tokenize,
+                                          lowercase=self.builtin_metrics_lowercase)["score"]) if bleu_obj else float("nan")
+            chrf = float(chrf_obj.compute()["score"]) if chrf_obj else float("nan")
+        else:
+            bleu = chrf = float("nan")
+
+        # broadcast scalars
+        bleu_t = torch.tensor([bleu], device=self.args.device)
+        chrf_t = torch.tensor([chrf], device=self.args.device)
+        bleu_t = self.accelerator.broadcast(bleu_t, 0)
+        chrf_t = self.accelerator.broadcast(chrf_t, 0)
+
+        metrics["eval_bleu"] = float(bleu_t.item())
+        metrics["eval_chrf"] = float(chrf_t.item())
 
         runtime = time.time() - start_time if num_steps > 0 else 0.0
         eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
