@@ -1532,7 +1532,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         def _do_generate(mb_gpu: dict) -> torch.Tensor:
             gen_inputs = self._filter_for_generate(mb_gpu, ignore_keys)
             with torch.inference_mode():
-                out = self.model.generate(**gen_inputs, **gen_kwargs)
+                out = self.model.generate(**gen_inputs, **kwargs)
             if out.ndim == 1:
                 out = out.unsqueeze(0)
             return out
