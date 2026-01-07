@@ -245,6 +245,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
         sampler_bucket_size: int = 8,  # bucket size for length-bucketed sampling (smaller = tighter grouping)
         padding_aware_budget: bool = False,  # if True, budget by max_len * num_examples (actual memory) vs sum of lengths
         max_eval_generate_examples: int | None = None,  # max examples per generate call (None = no limit, uses token budget only)
+        builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
+        builtin_metrics_tokenize: str = "13a",
+        builtin_metrics_lowercase: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -303,7 +306,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self._regime_max_T = int(max_tokens_per_microbatch * 4) if max_tokens_per_microbatch is not None else (1 << 62)
         self._regime_max_B = 1024
 
-
+        self.builtin_metrics = tuple(builtin_metrics) if builtin_metrics else tuple()
+        self.builtin_metrics_tokenize = str(builtin_metrics_tokenize)
+        self.builtin_metrics_lowercase = bool(builtin_metrics_lowercase)
 
         if getattr(self, "processing_class", None) is None:
             # fallback, just in case
