@@ -1600,7 +1600,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 out = self.model.generate(**gen_inputs, **gen_kwargs)
             if out.ndim == 1:
                 out = out.unsqueeze(0)
-            return out
+            return out   # ← REQUIRED
 
         def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
             nonlocal metric_examples
