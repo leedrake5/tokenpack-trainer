@@ -1123,30 +1123,39 @@ class TokenPackTrainer(Seq2SeqTrainer):
             })
 
 
-    def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None, return_lengths: bool = False):
-        # Compute lengths
+     def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None, return_lengths: bool = False):
         enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
 
-        alpha = 2.0  # decoder weight
-        effective_len = enc_len + alpha * dec_len  # tensor, CPU or GPU
+        alpha = 2.0
+        effective_len = enc_len + alpha * dec_len
         N = int(effective_len.numel())
 
-        # Sort indices by length *on the tensor's device* (GPU if inputs on GPU)
-        order = torch.argsort(effective_len)
-        sorted_indices = order.to("cpu")  # tensor[int64] on CPU
-        eff_cpu = effective_len.to("cpu") # tensor on CPU (copies N numbers once)
+        budget = int(max_tokens_per_microbatch or self.max_tokens_per_microbatch)
+        max_B = self.max_examples_per_microbatch  # may be None
 
-        for i in sorted_indices.tolist():
-            L = int(eff_cpu[i].item())
+        # ✅ RE-ADD THIS (or keep it if it exists)
+        padding_aware = getattr(self, "padding_aware_budget", False)
+
+        microbatches = []
+        cur_indices: list[int] = []
+        cur_tokens = 0
+        cur_max_len = 0
+
+        # Fix 2: sort on-device; move only indices to CPU for Python loop
+        order = torch.argsort(effective_len)
+        sorted_indices = order.to("cpu").tolist()
+
+        for i in sorted_indices:
+            # optional: if you want to avoid GPU scalar syncs, use:
+            # eff_cpu = effective_len.to("cpu"); then L = int(eff_cpu[i].item())
+            L = int(effective_len[i].item())
 
             if padding_aware:
-                # Padding-aware: cost is max_len * num_examples (actual tensor size)
                 new_max = max(cur_max_len, L)
                 new_count = len(cur_indices) + 1
                 padded_cost = new_max * new_count
                 too_many_tokens = cur_indices and padded_cost > budget
             else:
-                # Default: cost is sum of effective lengths
                 too_many_tokens = cur_indices and (cur_tokens + L) > budget
 
             too_many_examples = max_B is not None and len(cur_indices) >= max_B
@@ -1165,7 +1174,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
             microbatches.append(cur_indices)
 
         result = [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
-
         if return_lengths:
             return result, enc_len, dec_len
         return result
