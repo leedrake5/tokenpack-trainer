@@ -1123,7 +1123,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
             })
 
 
-     def _make_microbatches(self, inputs, max_tokens_per_microbatch: int | None = None, return_lengths: bool = False):
+    def _make_microbatches(
+        self,
+        inputs,
+        max_tokens_per_microbatch: int | None = None,
+        return_lengths: bool = False,
+    ):
+        # Compute lengths
         enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
 
         alpha = 2.0
@@ -1132,8 +1138,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         budget = int(max_tokens_per_microbatch or self.max_tokens_per_microbatch)
         max_B = self.max_examples_per_microbatch  # may be None
-
-        # ✅ RE-ADD THIS (or keep it if it exists)
         padding_aware = getattr(self, "padding_aware_budget", False)
 
         microbatches = []
@@ -1141,14 +1145,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
         cur_tokens = 0
         cur_max_len = 0
 
-        # Fix 2: sort on-device; move only indices to CPU for Python loop
+        # --- Fix 2: GPU-side sort, CPU-side indices only ---
         order = torch.argsort(effective_len)
         sorted_indices = order.to("cpu").tolist()
 
+        # Optional optimization: copy lengths once to CPU
+        eff_cpu = effective_len.to("cpu")
+
         for i in sorted_indices:
-            # optional: if you want to avoid GPU scalar syncs, use:
-            # eff_cpu = effective_len.to("cpu"); then L = int(eff_cpu[i].item())
-            L = int(effective_len[i].item())
+            L = int(eff_cpu[i].item())
 
             if padding_aware:
                 new_max = max(cur_max_len, L)
@@ -1173,7 +1178,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if cur_indices:
             microbatches.append(cur_indices)
 
-        result = [self._compact_microbatch(self._slice_inputs(inputs, mb_idx)) for mb_idx in microbatches]
+        result = [
+            self._compact_microbatch(self._slice_inputs(inputs, mb_idx))
+            for mb_idx in microbatches
+        ]
+
         if return_lengths:
             return result, enc_len, dec_len
         return result
