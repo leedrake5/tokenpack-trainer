@@ -1694,21 +1694,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                     for mb in mb_iter:
                         gen_ids = _do_generate(mb)
-
-                        if bleu_obj or chrf_obj or meteor_obj:
-                            # make sure tensors are on device for gather
-                            pred_g, lab_g = _gather_pair(gen_ids.to(self.args.device), mb["labels"].to(self.args.device), pad_id)
-
-                            if self.accelerator.is_main_process:
-                                preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
-                                refs_txt  = self.processing_class.batch_decode(lab_g,  skip_special_tokens=True)
-
-                                preds = [p.strip() for p in preds_txt]
-                                refs  = [[r.strip()] for r in refs_txt]
-                                if bleu_obj: bleu_obj.add_batch(predictions=preds, references=refs)
-                                if chrf_obj: chrf_obj.add_batch(predictions=preds, references=refs)
-                                if meteor_obj:
-                                    meteor_obj.add_batch(predictions=[p for p in preds], references=[r[0] for r in refs])
+                        _add_streaming_metrics(gen_ids, mb["labels"])
+                        
 
                     last_err = None
                     self._eval_on_success()
