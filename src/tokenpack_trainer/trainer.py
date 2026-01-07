@@ -1544,11 +1544,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # On single process, always treat as main; otherwise check accelerator
         is_main = (num_proc == 1) or (acc is not None and bool(acc.is_main_process))
 
-        # Diagnostic output (always print for debugging)
-        print(f"[TokenPackTrainer._token_aware_evaluate] wants_generate={wants_generate}, "
-              f"wants_builtin={wants_builtin}, do_generate={do_generate}, "
-              f"is_main={is_main}, num_proc={num_proc}")
-
         bleu_obj = chrf_obj = meteor_obj = None
 
         if do_generate and wants_builtin and is_main:
@@ -1574,11 +1569,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 chrf_obj = evaluate.load("chrf")
             if "meteor" in want:
                 meteor_obj = evaluate.load("meteor")
-
-            print(f"[TokenPackTrainer._token_aware_evaluate] Loaded metrics: "
-                  f"bleu={bleu_obj is not None}, chrf={chrf_obj is not None}, "
-                  f"meteor={meteor_obj is not None}, want={want}")
-            print(f"[TokenPackTrainer._token_aware_evaluate] DEBUG: id(bleu_obj)={id(bleu_obj)}")
 
             # If user asked for builtin metrics but none matched, warn loudly once
             if bleu_obj is None and chrf_obj is None and meteor_obj is None:
@@ -1626,8 +1616,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return out   # ← REQUIRED
 
         # Store metric objects in a dict to avoid closure issues with reassigned variables
-        print(f"[TokenPackTrainer] Creating metric_state with bleu_obj={bleu_obj is not None}, "
-              f"chrf_obj={chrf_obj is not None}, meteor_obj={meteor_obj is not None}")
         metric_state = {
             "bleu_obj": bleu_obj,
             "chrf_obj": chrf_obj,
@@ -1635,18 +1623,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "metric_examples": 0,
             "gen_call_count": 0,
         }
-        print(f"[TokenPackTrainer] metric_state id={id(metric_state)}, bleu_obj value={metric_state['bleu_obj']}")
 
         def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
             metric_state["gen_call_count"] += 1
-            gen_call_count = metric_state["gen_call_count"]
-
-            # Debug: print the actual metric_state dict
-            if gen_call_count <= 3:
-                print(f"[_add_streaming_metrics] DEBUG: metric_state id={id(metric_state)}")
-                print(f"[_add_streaming_metrics] DEBUG: metric_state keys={list(metric_state.keys())}")
-                print(f"[_add_streaming_metrics] DEBUG: metric_state['bleu_obj']={metric_state.get('bleu_obj')}")
-                print(f"[_add_streaming_metrics] DEBUG: type(metric_state['bleu_obj'])={type(metric_state.get('bleu_obj'))}")
 
             _bleu = metric_state["bleu_obj"]
             _chrf = metric_state["chrf_obj"]
@@ -1654,16 +1633,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
             # Use explicit None checks - EvaluationModule objects are falsy when empty!
             if _bleu is None and _chrf is None and _meteor is None:
-                if gen_call_count <= 3:
-                    print(f"[_add_streaming_metrics] No metric objects available, returning early")
                 return
 
             # gather if multi-proc; no-op on 1 GPU
             pred_g, lab_g = self._gather_pair_for_metrics(gen_ids, labels, pad_id)
 
             if not is_main:
-                if gen_call_count <= 3:
-                    print(f"[_add_streaming_metrics] Not main process, returning early")
                 return
 
             preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
@@ -1673,13 +1648,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
             refs  = [[r.strip()] for r in refs_txt]
 
             if len(preds) == 0:
-                if gen_call_count <= 3:
-                    print(f"[_add_streaming_metrics] No predictions decoded, returning early")
                 return
 
             metric_state["metric_examples"] += len(preds)
-            if gen_call_count <= 3:
-                print(f"[_add_streaming_metrics] Added {len(preds)} examples, total={metric_state['metric_examples']}")
             if _bleu is not None: _bleu.add_batch(predictions=preds, references=refs)
             if _chrf is not None: _chrf.add_batch(predictions=preds, references=refs)
             if _meteor is not None:
@@ -1714,21 +1685,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 batch_for_gen = self._truncate_batch(self._prepare_inputs(batch))
             # ---- fast path generate whole batch ----
             try:
-                if num_steps <= 3:
-                    print(f"[TokenPackTrainer] Step {num_steps}: Attempting generation, "
-                          f"batch input_ids shape={batch_for_gen.get('input_ids', torch.empty(0)).shape}")
                 gen_ids = _do_generate(batch_for_gen)
-                if num_steps <= 3:
-                    print(f"[TokenPackTrainer] Step {num_steps}: Generation succeeded, "
-                          f"gen_ids shape={gen_ids.shape}")
                 _add_streaming_metrics(gen_ids, batch_for_gen["labels"])
                 self._eval_on_success()
                 continue
             except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                 if not self._is_cuda_oom(e):
-                    print(f"[TokenPackTrainer] Non-OOM exception in generation: {type(e).__name__}: {e}")
                     raise
-                print(f"[TokenPackTrainer] OOM in fast path, falling back to microbatching")
                 self._eval_oom_cleanup()
                 # fall through to microbatching
 
@@ -1849,10 +1812,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 metrics.setdefault("metric_examples", float(_metric_examples))
 
                 # Warn if we expected metrics but got none (helps debug)
-                if is_main and _metric_examples == 0:
-                    print(f"[TokenPackTrainer] DIAGNOSTIC: metric_examples=0 despite expecting metrics. "
-                          f"gen_call_count={_gen_call_count}, bleu_obj={_bleu_obj is not None}, "
-                          f"chrf_obj={_chrf_obj is not None}, is_main={is_main}")
+                if is_main and _metric_examples == 0 and (_bleu_obj is not None or _chrf_obj is not None):
                     logger.warning(
                         f"[TokenPackTrainer] Expected metrics but metric_examples=0. "
                         f"bleu_obj={_bleu_obj is not None}, chrf_obj={_chrf_obj is not None}, "
