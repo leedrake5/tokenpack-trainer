@@ -1635,10 +1635,19 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "metric_examples": 0,
             "gen_call_count": 0,
         }
+        print(f"[TokenPackTrainer] metric_state id={id(metric_state)}, bleu_obj value={metric_state['bleu_obj']}")
 
         def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
             metric_state["gen_call_count"] += 1
             gen_call_count = metric_state["gen_call_count"]
+
+            # Debug: print the actual metric_state dict
+            if gen_call_count <= 3:
+                print(f"[_add_streaming_metrics] DEBUG: metric_state id={id(metric_state)}")
+                print(f"[_add_streaming_metrics] DEBUG: metric_state keys={list(metric_state.keys())}")
+                print(f"[_add_streaming_metrics] DEBUG: metric_state['bleu_obj']={metric_state.get('bleu_obj')}")
+                print(f"[_add_streaming_metrics] DEBUG: type(metric_state['bleu_obj'])={type(metric_state.get('bleu_obj'))}")
+
             _bleu = metric_state["bleu_obj"]
             _chrf = metric_state["chrf_obj"]
             _meteor = metric_state["meteor_obj"]
