@@ -1128,24 +1128,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
         enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
 
         alpha = 2.0  # decoder weight
-        effective_len = enc_len + alpha * dec_len
-        lengths = [int(L) for L in effective_len.tolist()]
-        N = len(lengths)
+        effective_len = enc_len + alpha * dec_len  # tensor, CPU or GPU
+        N = int(effective_len.numel())
 
-        budget = int(max_tokens_per_microbatch or self.max_tokens_per_microbatch)
-        max_B = self.max_examples_per_microbatch  # may be None
-        padding_aware = getattr(self, "padding_aware_budget", False)
+        # Sort indices by length *on the tensor's device* (GPU if inputs on GPU)
+        order = torch.argsort(effective_len)
+        sorted_indices = order.to("cpu")  # tensor[int64] on CPU
+        eff_cpu = effective_len.to("cpu") # tensor on CPU (copies N numbers once)
 
-        microbatches = []
-        cur_indices: list[int] = []
-        cur_tokens = 0
-        cur_max_len = 0  # for padding-aware mode
-
-        # Sort by length to minimize padding waste within microbatches
-        sorted_indices = sorted(range(N), key=lambda i: lengths[i])
-
-        for i in sorted_indices:
-            L = lengths[i]
+        for i in sorted_indices.tolist():
+            L = int(eff_cpu[i].item())
 
             if padding_aware:
                 # Padding-aware: cost is max_len * num_examples (actual tensor size)
@@ -2024,6 +2016,23 @@ class TokenPackTrainer(Seq2SeqTrainer):
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
         return (loss, outputs) if return_outputs else loss
 
+
+    def _regime_key_from_inputs_any_device(self, inputs: dict) -> int:
+        # expects attention_mask and (optionally) labels as tensors on CPU or GPU
+        am = inputs["attention_mask"]
+        enc_len = am.sum(dim=-1)
+
+        labels = inputs.get("labels", None)
+        if labels is None or labels.ndim != 2:
+            dec_len = torch.zeros_like(enc_len)
+        else:
+            dec_len = (labels != -100).sum(dim=-1)
+
+        eff = enc_len + 2.0 * dec_len
+        mx = int(eff.max().item())  # <-- scalar sync only
+        bs = int(self._regime_bucket_size)
+        return int((mx + bs - 1) // bs) if bs > 0 else mx
+
     def training_step(self, model, inputs, num_items_in_batch=None):
         model.train()
 
@@ -2053,9 +2062,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 else:
                     # We don't have CPU tensors by default; easiest is to still derive a key on CPU
                     # from a detached copy. This is cheap because it's just masks/labels.
+                    # GPU-native path
                     if regime_key is None:
-                        tmp_cpu = self._move_to_cpu(inputs)
-                        regime_key = self._regime_key_from_inputs(tmp_cpu)
+                        regime_key = self._regime_key_from_inputs_any_device(inputs)  # no copy
+
+                    self._apply_regime_limits(regime_key)
+
+                    inputs_work = self._prepare_inputs(inputs)
+                    inputs_work = self._truncate_batch(inputs_work)
+                    microbatches, enc_len, dec_len = self._make_microbatches(inputs_work, return_lengths=True)
 
                     # >>> apply per-regime best limits BEFORE planning microbatches
                     self._apply_regime_limits(regime_key)
