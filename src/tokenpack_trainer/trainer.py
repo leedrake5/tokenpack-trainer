@@ -1486,11 +1486,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         
         gen_kwargs = self._build_gen_kwargs()
 
-        def _do_generate(mb_gpu: dict) -> torch.Tensor:
-            gen_inputs = self._filter_for_generate(mb_gpu, ignore_keys)
-            with torch.inference_mode():
-                out = self.model.generate(**gen_inputs, **gen_kwargs)
-        
         def _gather_pair(pred_ids: torch.Tensor, label_ids: torch.Tensor, pad_id: int):
             # labels: replace -100 with pad before gather so shapes are sane
             labs = torch.where(label_ids != -100, label_ids, torch.full_like(label_ids, pad_id))
@@ -1506,6 +1501,28 @@ class TokenPackTrainer(Seq2SeqTrainer):
             pred_g = self.accelerator.gather_for_metrics(pred_ids)
             lab_g  = self.accelerator.gather_for_metrics(labs)
             return pred_g, lab_g
+
+
+        def _broadcast_tensor_from_main(t: torch.Tensor) -> torch.Tensor:
+            """
+            Broadcast a tensor from rank 0 to all ranks.
+
+            - Single process: returns unchanged
+            - Multi-process: uses torch.distributed.broadcast if initialized
+            - Does NOT rely on Accelerator.broadcast (not present in older Accelerate)
+            """
+            acc = getattr(self, "accelerator", None)
+            num_proc = getattr(acc, "num_processes", 1) if acc is not None else 1
+            if num_proc == 1:
+                return t
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.broadcast(t, src=0)
+                return t
+
+            # If we get here, something is inconsistent (multi-proc but no dist init).
+            # Best effort: just return.
+            return t
 
         # ---- pick dataset
         if eval_dataset is None:
@@ -1718,12 +1735,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # broadcast scalars
         bleu_t = torch.tensor([bleu], device=self.args.device)
         chrf_t = torch.tensor([chrf], device=self.args.device)
-        bleu_t = self.accelerator.broadcast(bleu_t, 0)
-        chrf_t = self.accelerator.broadcast(chrf_t, 0)
+
+        bleu_t = _broadcast_tensor_from_main(bleu_t)
+        chrf_t = _broadcast_tensor_from_main(chrf_t)
 
         metrics["eval_bleu"] = float(bleu_t.item())
         metrics["eval_chrf"] = float(chrf_t.item())
-
 
         runtime = time.time() - start_time if num_steps > 0 else 0.0
         eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
