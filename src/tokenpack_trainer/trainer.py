@@ -256,12 +256,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
         builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
         builtin_metrics_tokenize: str = "13a",
         builtin_metrics_lowercase: bool = False,
+        max_metric_samples: int | None = 2000,  # Max samples for metric computation (None = all, default 2000 for speed)
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.eval_data_collator = eval_data_collator
         self.padding_aware_budget = bool(padding_aware_budget)
         self.max_eval_generate_examples = max_eval_generate_examples  # None = use full batch when possible
+        self.max_metric_samples = max_metric_samples  # Limit samples for metrics to avoid slow decode
         self.max_tokens_per_microbatch = int(max_tokens_per_microbatch)
         self.max_encoder_len = int(max_encoder_len) if max_encoder_len is not None else None
         self.max_decoder_len = int(max_decoder_len) if max_decoder_len is not None else None
@@ -318,6 +320,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.builtin_metrics_tokenize = str(builtin_metrics_tokenize)
         self.builtin_metrics_lowercase = bool(builtin_metrics_lowercase)
 
+        # Pre-load metric objects once (with logging suppressed) to avoid verbose output every eval
+        self._bleu_metric = None
+        self._chrf_metric = None
+        self._meteor_metric = None
+        if self.builtin_metrics:
+            self._load_builtin_metrics()
+
         self._cached_forward_keys = None
 
 
@@ -340,6 +349,56 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         # Validate parameter combinations
         self._validate_params()
+
+    def _load_builtin_metrics(self):
+        """Load metric objects once at init with logging suppressed."""
+        import logging
+        import warnings
+        import os
+
+        # Suppress evaluate library's verbose caching messages
+        evaluate_logger = logging.getLogger("evaluate")
+        old_level = evaluate_logger.level
+        evaluate_logger.setLevel(logging.ERROR)
+
+        # Suppress nltk download messages (used by METEOR)
+        nltk_logger = logging.getLogger("nltk")
+        nltk_old_level = nltk_logger.level
+        nltk_logger.setLevel(logging.ERROR)
+
+        # Also suppress stdout from nltk.download
+        old_nltk_quiet = os.environ.get("NLTK_DATA", None)
+
+        try:
+            import evaluate
+
+            # Normalize metric names
+            want = set(str(k).strip().lower() for k in self.builtin_metrics)
+            aliases = {
+                "sacrebleu": "bleu", "bleu1": "bleu", "bleu-1": "bleu",
+                "chr_f": "chrf", "chrf++": "chrf", "chrfpp": "chrf",
+            }
+            want = set(aliases.get(k, k) for k in want)
+
+            # Load with warnings suppressed
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+
+                if "bleu" in want:
+                    self._bleu_metric = evaluate.load("sacrebleu")
+                if "chrf" in want:
+                    self._chrf_metric = evaluate.load("chrf")
+                if "meteor" in want:
+                    # METEOR triggers nltk downloads - suppress those too
+                    import nltk
+                    nltk.download('wordnet', quiet=True)
+                    nltk.download('punkt_tab', quiet=True)
+                    nltk.download('omw-1.4', quiet=True)
+                    self._meteor_metric = evaluate.load("meteor")
+
+        finally:
+            evaluate_logger.setLevel(old_level)
+            nltk_logger.setLevel(nltk_old_level)
 
     def _validate_params(self):
         """Validate parameter combinations and fail fast on invalid configs."""
@@ -1536,43 +1595,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # On single process, always treat as main; otherwise check accelerator
         is_main = (num_proc == 1) or (acc is not None and bool(acc.is_main_process))
 
-        bleu_obj = chrf_obj = meteor_obj = None
+        # Use pre-loaded metrics (loaded once at __init__ to avoid verbose logging every eval)
+        bleu_obj = self._bleu_metric if (do_generate and wants_builtin and is_main) else None
+        chrf_obj = self._chrf_metric if (do_generate and wants_builtin and is_main) else None
+        meteor_obj = self._meteor_metric if (do_generate and wants_builtin and is_main) else None
 
-        if do_generate and wants_builtin and is_main:
-            import evaluate
-
-            # Normalize + accept common aliases
-            raw = list(self.builtin_metrics or ())
-            want = set(str(k).strip().lower() for k in raw)
-
-            aliases = {
-                "sacrebleu": "bleu",
-                "bleu1": "bleu",
-                "bleu-1": "bleu",
-                "chr_f": "chrf",
-                "chrf++": "chrf",
-                "chrfpp": "chrf",
-            }
-            want = set(aliases.get(k, k) for k in want)
-
-            if "bleu" in want:
-                bleu_obj = evaluate.load("sacrebleu")
-            if "chrf" in want:
-                chrf_obj = evaluate.load("chrf")
-            if "meteor" in want:
-                meteor_obj = evaluate.load("meteor")
-
-            # If user asked for builtin metrics but none matched, warn loudly once
-            if bleu_obj is None and chrf_obj is None and meteor_obj is None:
-                if self.control.should_log:
-                    self.log({"warn_no_builtin_metrics_matched": 1.0})
-                # Optional: also print for local debugging
-                # print(f"[TokenPackTrainer] builtin_metrics={raw} normalized={sorted(want)} -> none matched")
-
-            if self.debug:
-                logger.info(f"[TokenPackTrainer] Metric setup: bleu={bleu_obj is not None}, "
-                           f"chrf={chrf_obj is not None}, meteor={meteor_obj is not None}, "
-                           f"is_main={is_main}, num_proc={num_proc}")
+        if self.debug and is_main:
+            logger.info(f"[TokenPackTrainer] Metric setup: bleu={bleu_obj is not None}, "
+                       f"chrf={chrf_obj is not None}, meteor={meteor_obj is not None}, "
+                       f"is_main={is_main}, num_proc={num_proc}")
 
         # Warn if we expected to compute metrics but conditions weren't met
         if do_generate and wants_builtin and not is_main:
@@ -1788,7 +1819,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         predictions=_all_preds,
                         references=_all_refs,
                         tokenize=self.builtin_metrics_tokenize,
-                        lowercase=self.builtin_metrics_lowercase
+                        lowercase=self.builtin_metrics_lowercase,
+                        force=True  # Suppress "forgot to detokenize" warning - both preds and refs go through same decode
                     )
                     metrics["eval_bleu"] = float(bleu_res["score"])
                 else:
