@@ -1692,15 +1692,63 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if labels is None:
                 raise ValueError("Eval dataset must have labels for token-aware evaluation.")
 
-            # loss (your token-weighted path)
-            with torch.no_grad():
-                loss, _, _ = self.prediction_step(self.model, batch, prediction_loss_only=True)
+            # loss computation with OOM handling - try full batch first, fall back to microbatches
+            batch_loss = None
+            batch_ntok = 0
+            try:
+                with torch.no_grad():
+                    loss, _, _ = self.prediction_step(self.model, batch, prediction_loss_only=True)
+                if loss is not None:
+                    batch_ntok = int((labels.detach().cpu() != -100).sum().item())
+                    if batch_ntok > 0:
+                        batch_loss = float(loss.item())
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                if not self._is_cuda_oom(e):
+                    raise
+                # OOM on loss - fall back to microbatch loss computation
+                self._eval_oom_cleanup()
 
-            if loss is not None:
-                ntok = int((labels.detach().to("cpu") != -100).sum().item())
-                if ntok > 0:
-                    total_eval_loss += float(loss.item()) * ntok
-                    total_eval_tokens += ntok
+                # Compute loss in microbatches
+                if self.use_cpu_microbatch:
+                    loss_inputs = self._truncate_batch(self._move_to_cpu(batch))
+                else:
+                    loss_inputs = self._truncate_batch(batch)
+
+                loss_microbatches = self._make_microbatches(
+                    loss_inputs,
+                    max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
+                )
+
+                mb_loss_sum = 0.0
+                mb_tok_sum = 0
+                with torch.no_grad():
+                    for mb in loss_microbatches:
+                        if self.use_cpu_microbatch:
+                            mb = self._to_device(mb)
+                        else:
+                            mb = self._prepare_inputs(mb)
+                        try:
+                            mb_labels = mb.get("labels", None)
+                            loss_mb, _, _ = self.prediction_step(self.model, mb, prediction_loss_only=True)
+                            if loss_mb is not None and mb_labels is not None:
+                                mb_ntok = int((mb_labels.detach().cpu() != -100).sum().item())
+                                if mb_ntok > 0:
+                                    mb_loss_sum += float(loss_mb.item()) * mb_ntok
+                                    mb_tok_sum += mb_ntok
+                        except (RuntimeError, torch.cuda.OutOfMemoryError) as mb_e:
+                            if not self._is_cuda_oom(mb_e):
+                                raise
+                            self._eval_oom_cleanup()
+                            # Skip this microbatch on OOM
+                            continue
+
+                if mb_tok_sum > 0:
+                    batch_loss = mb_loss_sum / mb_tok_sum
+                    batch_ntok = mb_tok_sum
+
+            if batch_loss is not None and batch_ntok > 0:
+                total_eval_loss += batch_loss * batch_ntok
+                total_eval_tokens += batch_ntok
 
             num_examples += int(labels.size(0))
 
