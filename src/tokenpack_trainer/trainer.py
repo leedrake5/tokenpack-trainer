@@ -850,33 +850,78 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
-        dl = None  # <-- FIX: ensure it always exists in scope
-
-        # ---- build the DataLoader exactly as before ----
+        # ----------------------------
+        # 1) HF default path
+        # ----------------------------
         if self.max_tokens_per_batch is None:
             dl = super().get_train_dataloader()
+
+            # Optional GPU prefetch wrapper (only meaningful when HF places batches on GPU)
+            if torch.cuda.is_available() and not self.use_cpu_microbatch:
+                dl = CUDAPrefetcher(dl, self.args.device)
+
+            return dl
+
+        # ----------------------------
+        # 2) Token-budget sampler path
+        # ----------------------------
+        ds = self.train_dataset
+
+        # Only strip columns if HF would have done so; otherwise keep task/metadata for mixed collators
+        if hasattr(ds, "column_names") and getattr(self.args, "remove_unused_columns", True):
+            keep_cols = {
+                "input_ids",
+                "attention_mask",
+                "labels",
+                "decoder_input_ids",
+                "decoder_attention_mask",
+                self.length_column_name,
+                # safe extras
+                "task",
+                "len_allowed",
+                "meteor_ok",
+            }
+            to_remove = [c for c in ds.column_names if c not in keep_cols]
+            if to_remove:
+                ds = ds.remove_columns(to_remove)
+
+        # lengths used by sampler
+        if hasattr(ds, "column_names"):
+            if self.length_column_name not in ds.column_names:
+                raise ValueError(
+                    f"Column '{self.length_column_name}' doesn't exist in train_dataset. "
+                    f"Available columns: {ds.column_names}"
+                )
+            raw_lengths = ds[self.length_column_name]
         else:
-            ds = self.train_dataset
+            raw_lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
 
-            # (your existing optional column trimming goes here...)
+        if self.max_encoder_len is not None:
+            lengths_for_sampler = [min(int(L), self.max_encoder_len) for L in raw_lengths]
+        else:
+            lengths_for_sampler = [int(L) for L in raw_lengths]
 
-            # (your existing raw_lengths + sampler creation goes here...)
+        batch_sampler = LengthBucketedBatchSampler(
+            lengths=lengths_for_sampler,
+            max_tokens_per_batch=self.max_tokens_per_batch,
+            bucket_size=self.sampler_bucket_size,
+            shuffle=True,
+            drop_last=False,
+            long_behavior="truncate",
+            max_length_in_batch=self.max_encoder_len,
+        )
 
-            dl = DataLoader(
-                ds,
-                batch_sampler=batch_sampler,
-                collate_fn=self.data_collator,
-                num_workers=self.args.dataloader_num_workers,
-                pin_memory=self.args.dataloader_pin_memory,
-                persistent_workers=self.args.dataloader_persistent_workers,
-                prefetch_factor=getattr(self.args, "dataloader_prefetch_factor", 2),
-            )
+        dl = DataLoader(
+            ds,
+            batch_sampler=batch_sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            persistent_workers=self.args.dataloader_persistent_workers,
+            prefetch_factor=getattr(self.args, "dataloader_prefetch_factor", 2),
+        )
 
-        # <-- FIX: guard against any future path that leaves dl unset
-        if dl is None:
-            raise RuntimeError("get_train_dataloader() did not create a DataLoader (dl is None).")
-
-        # ---- OPTIONAL GPU prefetch wrapper ----
+        # Optional GPU prefetch wrapper
         if torch.cuda.is_available() and not self.use_cpu_microbatch:
             dl = CUDAPrefetcher(dl, self.args.device)
 
