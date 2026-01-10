@@ -1715,9 +1715,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if labels is None:
                 raise ValueError("Eval dataset must have labels for token-aware evaluation.")
 
-            am = batch.get("attention_mask", None)
-            if am is not None and torch.is_tensor(am) and am.numel() == 0:
-                # skip empty batch
+            # Skip truly empty batches (0 examples)
+            batch_size = labels.size(0) if torch.is_tensor(labels) else 0
+            if batch_size == 0:
                 continue
 
             # loss computation with OOM handling - try full batch first, fall back to microbatches
@@ -1871,6 +1871,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         runtime = time.time() - start_time if num_steps > 0 else 0.0
         eval_loss = (total_eval_loss / total_eval_tokens) if total_eval_tokens > 0 else float("nan")
+
+        # Warn if we processed steps but got no examples (indicates a problem)
+        if num_steps > 0 and num_examples == 0:
+            logger.warning(
+                f"[TokenPackTrainer] Processed {num_steps} eval steps but num_examples=0. "
+                f"Check that eval_dataset is not empty and batches contain data."
+            )
 
         metrics["eval_loss"] = float(eval_loss)
         if runtime > 0:
