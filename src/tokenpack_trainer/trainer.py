@@ -1711,6 +1711,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         for batch in tqdm(dataloader, desc=desc, leave=True, disable=bool(getattr(self.args, "disable_tqdm", False))):
             num_steps += 1
+
+            # Debug: print batch info for first few steps
+            if num_steps <= 3:
+                print(f"[DEBUG] Step {num_steps}: batch keys={list(batch.keys())}")
+                for k, v in batch.items():
+                    if torch.is_tensor(v):
+                        print(f"[DEBUG]   {k}: shape={v.shape}, dtype={v.dtype}")
+                    else:
+                        print(f"[DEBUG]   {k}: type={type(v)}")
+
             labels = batch.get("labels", None)
             if labels is None:
                 raise ValueError("Eval dataset must have labels for token-aware evaluation.")
@@ -1718,6 +1728,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
             # Skip truly empty batches (0 examples)
             batch_size = labels.size(0) if torch.is_tensor(labels) else 0
             if batch_size == 0:
+                if num_steps <= 3:
+                    print(f"[DEBUG] Step {num_steps}: Skipping empty batch (batch_size=0)")
                 continue
 
             # loss computation with OOM handling - try full batch first, fall back to microbatches
