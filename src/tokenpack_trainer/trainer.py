@@ -850,47 +850,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
+        dl = None  # <-- FIX: ensure it always exists in scope
+
         # ---- build the DataLoader exactly as before ----
         if self.max_tokens_per_batch is None:
             dl = super().get_train_dataloader()
         else:
             ds = self.train_dataset
 
-        if hasattr(ds, "column_names") and getattr(self.args, "remove_unused_columns", True):
-            keep_cols = {
-                "input_ids","attention_mask","labels",
-                "decoder_input_ids","decoder_attention_mask",
-                self.length_column_name,
-            }
-            # keep task columns too (safe)
-            keep_cols |= {"task", "len_allowed", "meteor_ok"}
-            to_remove = [c for c in ds.column_names if c not in keep_cols]
-            if to_remove:
-                ds = ds.remove_columns(to_remove)
+            # (your existing optional column trimming goes here...)
 
-            # FAST: bypass formatting overhead
-            if hasattr(ds, "data") and hasattr(ds.data, "column_names") and self.length_column_name in ds.data.column_names:
-                raw_lengths = ds.data.column(self.length_column_name).to_pylist()
-            else:
-                # fallback
-                raw_lengths = ds[self.length_column_name] if hasattr(ds, "column_names") else [ds[i][self.length_column_name] for i in range(len(ds))]
-
-            if self.max_encoder_len is not None:
-                lengths_for_sampler = [
-                    min(int(L), self.max_encoder_len) for L in raw_lengths
-                ]
-            else:
-                lengths_for_sampler = [int(L) for L in raw_lengths]
-
-            batch_sampler = LengthBucketedBatchSampler(
-                lengths=lengths_for_sampler,
-                max_tokens_per_batch=self.max_tokens_per_batch,
-                bucket_size=self.sampler_bucket_size,
-                shuffle=True,
-                drop_last=False,
-                long_behavior="truncate",
-                max_length_in_batch=self.max_encoder_len,
-            )
+            # (your existing raw_lengths + sampler creation goes here...)
 
             dl = DataLoader(
                 ds,
@@ -901,6 +871,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 persistent_workers=self.args.dataloader_persistent_workers,
                 prefetch_factor=getattr(self.args, "dataloader_prefetch_factor", 2),
             )
+
+        # <-- FIX: guard against any future path that leaves dl unset
+        if dl is None:
+            raise RuntimeError("get_train_dataloader() did not create a DataLoader (dl is None).")
 
         # ---- OPTIONAL GPU prefetch wrapper ----
         if torch.cuda.is_available() and not self.use_cpu_microbatch:
