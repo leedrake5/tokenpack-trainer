@@ -1456,6 +1456,18 @@ class TokenPackTrainer(Seq2SeqTrainer):
         else:
             lengths_for_sampler = [int(L) for L in raw_lengths]
 
+        # DEBUG: Check lengths and dataset
+        print(f"[DEBUG get_eval_dataloader] Dataset size: {len(eval_dataset)}")
+        print(f"[DEBUG get_eval_dataloader] length_column_name: {self.length_column_name}")
+        print(f"[DEBUG get_eval_dataloader] Column names: {getattr(eval_dataset, 'column_names', 'N/A')}")
+        print(f"[DEBUG get_eval_dataloader] len(raw_lengths): {len(raw_lengths)}")
+        print(f"[DEBUG get_eval_dataloader] raw_lengths[:5]: {raw_lengths[:5] if len(raw_lengths) >= 5 else raw_lengths}")
+        print(f"[DEBUG get_eval_dataloader] len(lengths_for_sampler): {len(lengths_for_sampler)}")
+        print(f"[DEBUG get_eval_dataloader] lengths_for_sampler[:5]: {lengths_for_sampler[:5] if len(lengths_for_sampler) >= 5 else lengths_for_sampler}")
+        print(f"[DEBUG get_eval_dataloader] max_tokens_per_batch: {self.max_tokens_per_batch}")
+        print(f"[DEBUG get_eval_dataloader] max_encoder_len: {self.max_encoder_len}")
+        print(f"[DEBUG get_eval_dataloader] sampler_bucket_size: {self.sampler_bucket_size}")
+
         batch_sampler = LengthBucketedBatchSampler(
             lengths=lengths_for_sampler,
             max_tokens_per_batch=self.max_tokens_per_batch,
@@ -1465,16 +1477,58 @@ class TokenPackTrainer(Seq2SeqTrainer):
             long_behavior="truncate",
             max_length_in_batch=self.max_encoder_len,
         )
-        
-        return DataLoader(
-            eval_dataset,
-            batch_sampler=batch_sampler,
-            collate_fn=(self.eval_data_collator or self.data_collator),
-            num_workers=self.args.dataloader_num_workers,
-            pin_memory=self.args.dataloader_pin_memory,
-            persistent_workers=self.args.dataloader_persistent_workers,
-            prefetch_factor=getattr(self.args, "dataloader_prefetch_factor", 2),
+
+        # DEBUG: Check what the sampler yields
+        sampler_batches = list(batch_sampler)
+        print(f"[DEBUG get_eval_dataloader] Number of batches from sampler: {len(sampler_batches)}")
+        if sampler_batches:
+            print(f"[DEBUG get_eval_dataloader] First batch indices: {sampler_batches[0]}")
+            print(f"[DEBUG get_eval_dataloader] First batch size: {len(sampler_batches[0])}")
+
+        # Re-create the sampler (iteration consumes it)
+        batch_sampler = LengthBucketedBatchSampler(
+            lengths=lengths_for_sampler,
+            max_tokens_per_batch=self.max_tokens_per_batch,
+            bucket_size=self.sampler_bucket_size,
+            shuffle=False,
+            drop_last=False,
+            long_behavior="truncate",
+            max_length_in_batch=self.max_encoder_len,
         )
+
+        # Wrap collate_fn to debug what it receives
+        original_collate = self.eval_data_collator or self.data_collator
+        debug_calls = [0]  # mutable to track call count
+        def debug_collate(features):
+            debug_calls[0] += 1
+            if debug_calls[0] <= 3:
+                print(f"[DEBUG collate] Call {debug_calls[0]}: received {len(features)} features")
+                if features:
+                    print(f"[DEBUG collate] First feature keys: {list(features[0].keys()) if isinstance(features[0], dict) else type(features[0])}")
+                    if isinstance(features[0], dict) and 'input_ids' in features[0]:
+                        print(f"[DEBUG collate] First feature input_ids len: {len(features[0]['input_ids'])}")
+            result = original_collate(features)
+            if debug_calls[0] <= 3:
+                print(f"[DEBUG collate] Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+                if isinstance(result, dict):
+                    for k, v in result.items():
+                        if hasattr(v, 'shape'):
+                            print(f"[DEBUG collate]   {k}: shape={v.shape}")
+            return result
+
+        num_workers = self.args.dataloader_num_workers
+        dl_kwargs = dict(
+            batch_sampler=batch_sampler,
+            collate_fn=debug_collate,
+            num_workers=num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+        # Only add these if num_workers > 0 (they cause issues otherwise)
+        if num_workers > 0:
+            dl_kwargs["persistent_workers"] = self.args.dataloader_persistent_workers
+            dl_kwargs["prefetch_factor"] = getattr(self.args, "dataloader_prefetch_factor", 2)
+
+        return DataLoader(eval_dataset, **dl_kwargs)
         
         
     # --------------------------------------------------------------
