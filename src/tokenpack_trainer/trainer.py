@@ -856,18 +856,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
         else:
             ds = self.train_dataset
 
-            if hasattr(ds, "column_names"):
-                keep_cols = {
-                    "input_ids",
-                    "attention_mask",
-                    "labels",
-                    "decoder_input_ids",
-                    "decoder_attention_mask",
-                    self.length_column_name,
-                }
-                to_remove = [c for c in ds.column_names if c not in keep_cols]
-                if to_remove:
-                    ds = ds.remove_columns(to_remove)
+        if hasattr(ds, "column_names") and getattr(self.args, "remove_unused_columns", True):
+            keep_cols = {
+                "input_ids","attention_mask","labels",
+                "decoder_input_ids","decoder_attention_mask",
+                self.length_column_name,
+            }
+            # keep task columns too (safe)
+            keep_cols |= {"task", "len_allowed", "meteor_ok"}
+            to_remove = [c for c in ds.column_names if c not in keep_cols]
+            if to_remove:
+                ds = ds.remove_columns(to_remove)
 
             # FAST: bypass formatting overhead
             if hasattr(ds, "data") and hasattr(ds.data, "column_names") and self.length_column_name in ds.data.column_names:
