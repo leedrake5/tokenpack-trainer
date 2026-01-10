@@ -1456,18 +1456,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         else:
             lengths_for_sampler = [int(L) for L in raw_lengths]
 
-        # DEBUG: Check lengths and dataset
-        print(f"[DEBUG get_eval_dataloader] Dataset size: {len(eval_dataset)}")
-        print(f"[DEBUG get_eval_dataloader] length_column_name: {self.length_column_name}")
-        print(f"[DEBUG get_eval_dataloader] Column names: {getattr(eval_dataset, 'column_names', 'N/A')}")
-        print(f"[DEBUG get_eval_dataloader] len(raw_lengths): {len(raw_lengths)}")
-        print(f"[DEBUG get_eval_dataloader] raw_lengths[:5]: {raw_lengths[:5] if len(raw_lengths) >= 5 else raw_lengths}")
-        print(f"[DEBUG get_eval_dataloader] len(lengths_for_sampler): {len(lengths_for_sampler)}")
-        print(f"[DEBUG get_eval_dataloader] lengths_for_sampler[:5]: {lengths_for_sampler[:5] if len(lengths_for_sampler) >= 5 else lengths_for_sampler}")
-        print(f"[DEBUG get_eval_dataloader] max_tokens_per_batch: {self.max_tokens_per_batch}")
-        print(f"[DEBUG get_eval_dataloader] max_encoder_len: {self.max_encoder_len}")
-        print(f"[DEBUG get_eval_dataloader] sampler_bucket_size: {self.sampler_bucket_size}")
-
         batch_sampler = LengthBucketedBatchSampler(
             lengths=lengths_for_sampler,
             max_tokens_per_batch=self.max_tokens_per_batch,
@@ -1478,48 +1466,51 @@ class TokenPackTrainer(Seq2SeqTrainer):
             max_length_in_batch=self.max_encoder_len,
         )
 
-        # DEBUG: Check what the sampler yields
-        sampler_batches = list(batch_sampler)
-        print(f"[DEBUG get_eval_dataloader] Number of batches from sampler: {len(sampler_batches)}")
-        if sampler_batches:
-            print(f"[DEBUG get_eval_dataloader] First batch indices: {sampler_batches[0]}")
-            print(f"[DEBUG get_eval_dataloader] First batch size: {len(sampler_batches[0])}")
+        # Use a simple, reliable collate function for token-aware eval
+        # The user's collator may be broken (outputting empty tensors)
+        pad_token_id = getattr(self.processing_class, "pad_token_id", 0) or 0
 
-        # Re-create the sampler (iteration consumes it)
-        batch_sampler = LengthBucketedBatchSampler(
-            lengths=lengths_for_sampler,
-            max_tokens_per_batch=self.max_tokens_per_batch,
-            bucket_size=self.sampler_bucket_size,
-            shuffle=False,
-            drop_last=False,
-            long_behavior="truncate",
-            max_length_in_batch=self.max_encoder_len,
-        )
+        def simple_eval_collate(features):
+            """Simple collate that pads input_ids, attention_mask, and labels."""
+            if not features:
+                return {"input_ids": torch.tensor([]), "attention_mask": torch.tensor([]), "labels": torch.tensor([])}
 
-        # Wrap collate_fn to debug what it receives
-        original_collate = self.eval_data_collator or self.data_collator
-        debug_calls = [0]  # mutable to track call count
-        def debug_collate(features):
-            debug_calls[0] += 1
-            if debug_calls[0] <= 3:
-                print(f"[DEBUG collate] Call {debug_calls[0]}: received {len(features)} features")
-                if features:
-                    print(f"[DEBUG collate] First feature keys: {list(features[0].keys()) if isinstance(features[0], dict) else type(features[0])}")
-                    if isinstance(features[0], dict) and 'input_ids' in features[0]:
-                        print(f"[DEBUG collate] First feature input_ids len: {len(features[0]['input_ids'])}")
-            result = original_collate(features)
-            if debug_calls[0] <= 3:
-                print(f"[DEBUG collate] Result keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
-                if isinstance(result, dict):
-                    for k, v in result.items():
-                        if hasattr(v, 'shape'):
-                            print(f"[DEBUG collate]   {k}: shape={v.shape}")
-            return result
+            # Extract and convert to tensors
+            input_ids_list = []
+            attention_mask_list = []
+            labels_list = []
+
+            for f in features:
+                ids = f.get("input_ids", [])
+                if not torch.is_tensor(ids):
+                    ids = torch.tensor(ids, dtype=torch.long)
+                input_ids_list.append(ids)
+
+                mask = f.get("attention_mask", [1] * len(ids))
+                if not torch.is_tensor(mask):
+                    mask = torch.tensor(mask, dtype=torch.long)
+                attention_mask_list.append(mask)
+
+                labs = f.get("labels", [])
+                if not torch.is_tensor(labs):
+                    labs = torch.tensor(labs, dtype=torch.long)
+                labels_list.append(labs)
+
+            # Pad sequences
+            input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_id)
+            attention_mask = pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
+            labels = pad_sequence(labels_list, batch_first=True, padding_value=-100)
+
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels,
+            }
 
         num_workers = self.args.dataloader_num_workers
         dl_kwargs = dict(
             batch_sampler=batch_sampler,
-            collate_fn=debug_collate,
+            collate_fn=simple_eval_collate,
             num_workers=num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
@@ -1766,15 +1757,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         for batch in tqdm(dataloader, desc=desc, leave=True, disable=bool(getattr(self.args, "disable_tqdm", False))):
             num_steps += 1
 
-            # Debug: print batch info for first few steps
-            if num_steps <= 3:
-                print(f"[DEBUG] Step {num_steps}: batch keys={list(batch.keys())}")
-                for k, v in batch.items():
-                    if torch.is_tensor(v):
-                        print(f"[DEBUG]   {k}: shape={v.shape}, dtype={v.dtype}")
-                    else:
-                        print(f"[DEBUG]   {k}: type={type(v)}")
-
             labels = batch.get("labels", None)
             if labels is None:
                 raise ValueError("Eval dataset must have labels for token-aware evaluation.")
@@ -1782,8 +1764,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
             # Skip truly empty batches (0 examples)
             batch_size = labels.size(0) if torch.is_tensor(labels) else 0
             if batch_size == 0:
-                if num_steps <= 3:
-                    print(f"[DEBUG] Step {num_steps}: Skipping empty batch (batch_size=0)")
                 continue
 
             # loss computation with OOM handling - try full batch first, fall back to microbatches
