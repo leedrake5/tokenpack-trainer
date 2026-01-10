@@ -1011,8 +1011,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         # update maxima
         enc_max = int(enc_len.max().item())
-        dec_max = int(dec_len.max().item())
-        tot_max = int(total_len.max().item())
+        dec_max = int(dec_len.max().item()) if dec_len.numel() else 0
+        tot_max = int(total_len.max().item()) if total_len.numel() else 0
+
         self._max_seen_enc_len = max(self._max_seen_enc_len, enc_max)
         self._max_seen_dec_len = max(self._max_seen_dec_len, dec_max)
         self._max_seen_total_len = max(self._max_seen_total_len, tot_max)
@@ -1318,6 +1319,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # If caller wants logits/labels, let HF handle it
         # Also use HF default when eval_mode is None/"hf" to avoid loss normalization mismatch
         # (HF aggregates losses by example count, not token count)
+        # skip empty batch defensively
+        am = inputs.get("attention_mask", None)
+        if am is not None and torch.is_tensor(am) and am.numel() == 0:
+            return (None, None, None)
         eval_mode = getattr(self, "eval_mode", None)
         use_hf_default = (
             not prediction_loss_only
@@ -1709,6 +1714,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
             labels = batch.get("labels", None)
             if labels is None:
                 raise ValueError("Eval dataset must have labels for token-aware evaluation.")
+
+            am = batch.get("attention_mask", None)
+            if am is not None and torch.is_tensor(am) and am.numel() == 0:
+                # skip empty batch
+                continue
 
             # loss computation with OOM handling - try full batch first, fall back to microbatches
             batch_loss = None
