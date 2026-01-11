@@ -47,7 +47,6 @@ import os
 import time
 from typing import Any, List, Optional
 
-import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
@@ -59,9 +58,6 @@ from .samplers import LengthBucketedBatchSampler
 logger = logging.get_logger(__name__)
 
 import inspect
-
-import inspect
-import torch
 import torch.nn.functional as F
 
 _ALWAYS_ALLOW = {
@@ -80,31 +76,6 @@ def _pad_to_len(x: torch.Tensor, pad: int, L: int) -> torch.Tensor:
 def _is_tensorish(x) -> bool:
     return torch.is_tensor(x)
 
-def _strip_for_generate(batch: dict, ignore_keys: set[str] | None = None) -> dict:
-    """
-    Return a dict safe to pass into model.generate():
-    - removes keys in ignore_keys
-    - removes any non-tensor values (strings/lists/etc.)
-    """
-    if ignore_keys is None:
-        ignore_keys = set()
-
-    out = {}
-    for k, v in batch.items():
-        if k in ignore_keys:
-            continue
-        # generate() only wants tensors (and a few scalar kwargs, which we pass separately)
-        # batch dict should be tensor-only anyway; this prevents 'task' / stray strings from crashing
-        try:
-            import torch
-            is_tensor = torch.is_tensor(v)
-        except Exception:
-            is_tensor = False
-
-        if is_tensor:
-            out[k] = v
-
-    return out
 
 class CUDAPrefetcher:
     """
@@ -459,42 +430,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 "Invalid TokenPackTrainer configuration:\n  - " + "\n  - ".join(errors)
             )
 
-    def _pad_to_len(x: torch.Tensor, pad: int, L: int) -> torch.Tensor:
-        if x.size(1) == L:
-            return x
-        return F.pad(x, (0, L - x.size(1)), value=pad)
-
-
-    def _forward_keys(self):
-        if self._cached_forward_keys is not None:
-            return self._cached_forward_keys
-        try:
-            sig = inspect.signature(self.model.forward)
-            if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
-                self._cached_forward_keys = None
-            else:
-                self._cached_forward_keys = set(sig.parameters.keys())
-        except Exception:
-            self._cached_forward_keys = None
-        return self._cached_forward_keys
-
-    def _filter_for_generate(self, batch: dict, ignore: set[str] | None = None) -> dict:
-        if ignore is None:
-            ignore = set()
-        fwd_keys = self._forward_keys()
-        out = {}
-        for k, v in batch.items():
-            if k in ignore:
-                continue
-            if not torch.is_tensor(v):
-                continue
-            if fwd_keys is None:
-                out[k] = v
-            else:
-                if (k in fwd_keys) or (k in _ALWAYS_ALLOW):
-                    out[k] = v
-        return out
-
     def _gather_pair_for_metrics(self, pred_ids: torch.Tensor, label_ids: torch.Tensor, pad_id: int):
         """
         Returns gathered (pred_ids, labels) across processes if needed.
@@ -709,15 +644,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "regime_bucket_size": getattr(self, "_regime_bucket_size", None),
         }
 
-    def _regime_key_from_batch(self, inputs_cpu) -> int:
-        enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_cpu)
-        alpha = 2.0
-        eff = enc_len + alpha * dec_len
-        mx = int(eff.max().item())
-        bucket_size = 128   # choose something coarse
-        return int((mx + bucket_size - 1) // bucket_size)
-
-
     def _autotune_regime_from_peak(self, key: int, eff_tokens_in_step: int, safety: float = 0.90):
         if not torch.cuda.is_available() or eff_tokens_in_step <= 0:
             return
@@ -798,30 +724,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     changed = True
 
         return changed
-
-    @staticmethod
-    def _pad_and_concat(arrays, pad_value: int):
-        """
-        Given a list of 2D arrays [N_i, T_i], pad each to max_T along dim 1
-        and stack into a single [sum_i N_i, max_T] array.
-        """
-        if not arrays:
-            return np.zeros((0, 0), dtype=np.int64)
-
-        # All arrays must be 2D
-        max_T = max(a.shape[1] for a in arrays)
-        total_N = sum(a.shape[0] for a in arrays)
-        dtype = arrays[0].dtype
-
-        out = np.full((total_N, max_T), pad_value, dtype=dtype)
-
-        offset = 0
-        for a in arrays:
-            n, t = a.shape
-            out[offset : offset + n, :t] = a
-            offset += n
-
-        return out
 
     def _compact_microbatch(self, mb: dict) -> dict:
         # Trim encoder side to max attention_mask sum in this microbatch
@@ -1154,53 +1056,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 cpu_inputs[k] = v
         return cpu_inputs
 
-
-    def _maybe_adapt_limits(self):
-        if not torch.cuda.is_available():
-            return
-        total = torch.cuda.get_device_properties(self.args.device.index).total_memory
-        peak = torch.cuda.max_memory_allocated(self.args.device)
-        util = peak / total
-
-        # tune these
-        high = 0.92
-        low  = 0.80
-
-        # initialize state
-        if not hasattr(self, "_adapt_cooldown"):
-            self._adapt_cooldown = 0
-            self._stable_low_steps = 0
-
-        if self._adapt_cooldown > 0:
-            self._adapt_cooldown -= 1
-            return
-
-        if util > high:
-            # back off fast
-            if self.max_examples_per_microbatch is None:
-                self.max_examples_per_microbatch = 16  # pick a sane start
-            self.max_examples_per_microbatch = max(1, int(self.max_examples_per_microbatch * 0.7))
-            self._stable_low_steps = 0
-            self._adapt_cooldown = 10  # wait N steps before changing again
-
-        elif util < low:
-            self._stable_low_steps += 1
-            if self._stable_low_steps >= 10:
-                if self.max_examples_per_microbatch is None:
-                    self.max_examples_per_microbatch = 16
-                self.max_examples_per_microbatch = int(self.max_examples_per_microbatch * 1.15) + 1
-                self._stable_low_steps = 0
-                self._adapt_cooldown = 10
-        else:
-            self._stable_low_steps = 0
-
-        if self.control.should_log:
-            self.log({
-                "adaptive_vram_util": float(util),
-                "adaptive_max_B": float(self.max_examples_per_microbatch or 0),
-            })
-
-
     def _make_microbatches(
         self,
         inputs,
@@ -1264,50 +1119,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if return_lengths:
             return result, enc_len, dec_len
         return result
-
-    def _plan_microbatches(self, inputs):
-        """
-        Given a batch on CPU, compute total lengths and return
-        a list of index lists for each microbatch.
-
-        No tensors are moved to GPU here; we only work with CPU tensors.
-        """
-        # compute_lengths_enc_dec works fine on CPU
-        _, _, total_len = self._compute_lengths_enc_dec(inputs)
-        lengths = [int(L) for L in total_len.tolist()]
-        N = len(lengths)
-
-        # Sort indices by length ascending (shortest first)
-        sorted_indices = sorted(range(N), key=lambda i: lengths[i])
-
-        microbatches = []
-        cur_indices = []
-        cur_tokens = 0
-
-        for i in sorted_indices:
-            L = lengths[i]
-            if self.max_tokens_per_microbatch is not None and L > self.max_tokens_per_microbatch:
-                # single example exceeds cap; we already logged this in _compute_lengths_enc_dec
-                # raise RuntimeError(f"Example {i} has {L} tokens > max_tokens_per_microbatch={self.max_tokens_per_microbatch}")
-                pass
-
-            if (
-                self.max_tokens_per_microbatch is not None
-                and cur_indices
-                and (cur_tokens + L) > self.max_tokens_per_microbatch
-            ):
-                microbatches.append(cur_indices)
-                cur_indices = [i]
-                cur_tokens = L
-            else:
-                cur_indices.append(i)
-                cur_tokens += L
-
-        if cur_indices:
-            microbatches.append(cur_indices)
-
-        return microbatches
-
 
     def prediction_step(
         self,
@@ -1615,33 +1426,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
           - Avoids "tqdm 100% then hang" by not doing giant end-of-epoch concat+decode.
           - METEOR is slow: only run if explicitly included in builtin_metrics.
         """
-        import time, random
-        import numpy as np
-        import torch
+        import time
         from tqdm import tqdm
-        
+
         gen_kwargs = self._build_gen_kwargs()
-
-        def _broadcast_tensor_from_main(t: torch.Tensor) -> torch.Tensor:
-            """
-            Broadcast a tensor from rank 0 to all ranks.
-
-            - Single process: returns unchanged
-            - Multi-process: uses torch.distributed.broadcast if initialized
-            - Does NOT rely on Accelerator.broadcast (not present in older Accelerate)
-            """
-            acc = getattr(self, "accelerator", None)
-            num_proc = getattr(acc, "num_processes", 1) if acc is not None else 1
-            if num_proc == 1:
-                return t
-
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                torch.distributed.broadcast(t, src=0)
-                return t
-
-            # If we get here, something is inconsistent (multi-proc but no dist init).
-            # Best effort: just return.
-            return t
 
         # ---- pick dataset
         if eval_dataset is None:
