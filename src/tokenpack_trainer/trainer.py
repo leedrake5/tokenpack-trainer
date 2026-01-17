@@ -48,7 +48,6 @@ import time
 from typing import Any, List, Optional
 
 import torch
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from transformers import Seq2SeqTrainer
 from transformers.utils import logging
@@ -1277,51 +1276,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
             max_length_in_batch=self.max_encoder_len,
         )
 
-        # Use a simple, reliable collate function for token-aware eval
-        # The user's collator may be broken (outputting empty tensors)
-        pad_token_id = getattr(self.processing_class, "pad_token_id", 0) or 0
-
-        def simple_eval_collate(features):
-            """Simple collate that pads input_ids, attention_mask, and labels."""
-            if not features:
-                return {"input_ids": torch.tensor([]), "attention_mask": torch.tensor([]), "labels": torch.tensor([])}
-
-            # Extract and convert to tensors
-            input_ids_list = []
-            attention_mask_list = []
-            labels_list = []
-
-            for f in features:
-                ids = f.get("input_ids", [])
-                if not torch.is_tensor(ids):
-                    ids = torch.tensor(ids, dtype=torch.long)
-                input_ids_list.append(ids)
-
-                mask = f.get("attention_mask", [1] * len(ids))
-                if not torch.is_tensor(mask):
-                    mask = torch.tensor(mask, dtype=torch.long)
-                attention_mask_list.append(mask)
-
-                labs = f.get("labels", [])
-                if not torch.is_tensor(labs):
-                    labs = torch.tensor(labs, dtype=torch.long)
-                labels_list.append(labs)
-
-            # Pad sequences
-            input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=pad_token_id)
-            attention_mask = pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
-            labels = pad_sequence(labels_list, batch_first=True, padding_value=-100)
-
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-            }
+        # Use the user's collator - important for pretraining with span corruption, etc.
+        collate_fn = self.eval_data_collator or self.data_collator
 
         num_workers = self.args.dataloader_num_workers
         dl_kwargs = dict(
             batch_sampler=batch_sampler,
-            collate_fn=simple_eval_collate,
+            collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
