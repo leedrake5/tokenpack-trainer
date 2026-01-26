@@ -1877,7 +1877,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if wants_generate:
                 # don't mutate args permanently; just call your loss-only helper
                 pass
-            return self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+            metrics = self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+            self.log(metrics)
+            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+            return metrics
 
         # ---- 3) token-aware metrics (responsive)
         if mode == "token_aware_metrics":
@@ -1898,6 +1901,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 desc="eval (token-aware)",
             )
             self.log(metrics)
+            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
             return metrics
 
         # ---- 4) auto
@@ -1909,8 +1913,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     desc="eval (token-aware)",
                 )
                 self.log(metrics)
+                self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
                 return metrics
-            return self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+            metrics = self._token_aware_loss_only(eval_dataset, desc="Eval (token-weighted loss)")
+            self.log(metrics)
+            self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+            return metrics
 
         # fallback: treat unknown as HF
         return super().evaluate(
