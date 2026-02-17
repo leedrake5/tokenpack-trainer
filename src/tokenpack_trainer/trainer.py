@@ -286,7 +286,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self._num_trunc_hits = 0  # Count of sequences that hit truncation limits
 
         # Upper bounds to prevent runaway growth during adaptation
-        self._regime_max_T = int(max_tokens_per_microbatch * 4) if max_tokens_per_microbatch is not None else (1 << 62)
+        # Allow autotuning to push T up to 16x the initial budget (the regime will
+        # OOM-shrink back down if it overshoots, so a generous ceiling is safe)
+        self._regime_max_T = int(max_tokens_per_microbatch * 16) if max_tokens_per_microbatch is not None else (1 << 62)
         if regime_max_B is not None:
             self._regime_max_B = int(regime_max_B)
         elif max_tokens_per_microbatch is not None:
@@ -308,6 +310,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         self._cached_forward_keys = None
 
+        # Baseline GPU memory (model + optimizer, before any batch).
+        # Captured lazily on the first training_step call.
+        self._gpu_baseline_mem: int | None = None
 
         if getattr(self, "processing_class", None) is None:
             # fallback, just in case
@@ -667,16 +672,33 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if peak <= 0:
             return
 
-        bytes_per_eff_token = peak / float(eff_tokens_in_step)
+        # Use baseline memory (model + optimizer) to compute MARGINAL per-token cost.
+        # Without this, model weights (~90% of VRAM) inflate per-token cost by 10x+,
+        # making the autotuned token budget far too conservative.
+        baseline = self._gpu_baseline_mem or 0
+        available = max(total - baseline, total * 0.05)  # headroom beyond model; floor at 5%
+        batch_mem = max(peak - baseline, available * 0.05)  # actual batch memory used
 
-        # target peak = safety * total
-        target_peak = safety * total
-        target_eff_tokens = int(target_peak / max(bytes_per_eff_token, 1e-9))
+        bytes_per_eff_token = batch_mem / float(eff_tokens_in_step)
+
+        # Target: use safety fraction of AVAILABLE memory (not total) for batch data.
+        # This correctly handles the common case where model+optimizer use 85-95% of VRAM.
+        target_batch_mem = safety * available
+        target_eff_tokens = int(target_batch_mem / max(bytes_per_eff_token, 1e-9))
 
         # clamp hard
         INT64_MAX = (1 << 63) - 1
         st = self._regime_state(key)
+        old_T = st["T"]
         st["T"] = max(self._regime_min_T, min(target_eff_tokens, INT64_MAX, getattr(self, "_regime_max_T", INT64_MAX)))
+
+        if self.debug:
+            print(
+                f"[autotune] regime {key}: baseline={baseline/(1<<30):.1f}G, "
+                f"peak={peak/(1<<30):.1f}G, batch_mem={batch_mem/(1<<30):.1f}G, "
+                f"bytes/tok={bytes_per_eff_token:.0f}, eff_tokens={eff_tokens_in_step}, "
+                f"target_tokens={target_eff_tokens}, T: {old_T} -> {st['T']}"
+            )
 
     def _is_cuda_oom(self, err: BaseException) -> bool:
         msg = str(err)
@@ -1994,6 +2016,21 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # turn off KV cache during training to reduce memory spikes
         if hasattr(model, "config") and getattr(model.config, "use_cache", None) is True:
             model.config.use_cache = False
+
+        # Track baseline GPU memory (model + optimizer, before any batch data).
+        # This lets _autotune_regime_from_peak compute marginal per-token cost
+        # instead of attributing fixed model memory to each token.
+        # We take the MAX across the first few steps because Adam optimizer states
+        # are allocated lazily after the first optimizer.step() (which runs after
+        # training_step returns), so step 0 baseline only has model weights.
+        if torch.cuda.is_available():
+            current_mem = torch.cuda.memory_allocated(self.args.device)
+            if self._gpu_baseline_mem is None or current_mem > self._gpu_baseline_mem:
+                if self.debug and self._gpu_baseline_mem is not None and current_mem > self._gpu_baseline_mem:
+                    print(f"[TokenPackTrainer] GPU baseline updated: {self._gpu_baseline_mem / (1<<30):.2f} -> {current_mem / (1<<30):.2f} GB")
+                self._gpu_baseline_mem = current_mem
+                if self.debug and self._gpu_baseline_mem == current_mem:
+                    print(f"[TokenPackTrainer] GPU baseline memory: {self._gpu_baseline_mem / (1<<30):.2f} GB")
 
         last_err = None
         regime_key = None  # <<< keep across retries for this same HF batch
