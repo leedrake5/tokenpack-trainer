@@ -269,7 +269,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Key = bucket of max effective length, Value = {"B": batch_size, "T": token_budget, "stable": success_count}
         self._regime_limits = {}
         self._regime_bucket_size = 128   # Bucket width in tokens (groups similar lengths)
-        self._regime_ramp_every = 10     # Ramp limits after N consecutive successes
+        self._regime_ramp_every = 4      # Ramp limits after N consecutive successes
         self._regime_ramp_B = 1.25       # Factor to increase B on ramp
         self._regime_ramp_T = 1.10       # Factor to increase T on ramp
         self._regime_min_B = getattr(self, "oom_min_B", 1)
@@ -1112,48 +1112,57 @@ class TokenPackTrainer(Seq2SeqTrainer):
         max_B = self.max_examples_per_microbatch  # may be None
         padding_aware = getattr(self, "padding_aware_budget", False)
 
-        microbatches = []
-        cur_indices: list[int] = []
+        # --- Sort once on GPU, then bulk-convert to Python lists (no per-element .item()) ---
+        order = torch.argsort(effective_len)
+        order_cpu = order.cpu()
+        sorted_eff_list = effective_len.cpu()[order_cpu].tolist()
+
+        # Reorder entire batch once (single index_select) so microbatches are contiguous slices
+        sorted_inputs = self._slice_inputs(inputs, order_cpu.tolist())
+
+        # Infer batch dim for contiguous slicing
+        _batch_dim = sorted_inputs["input_ids"].size(0) if "input_ids" in sorted_inputs else None
+
+        # --- Compute split sizes in pure Python (no tensor ops in loop) ---
+        split_sizes = []
         cur_tokens = 0
         cur_max_len = 0
+        cur_count = 0
 
-        # --- Fix 2: GPU-side sort, CPU-side indices only ---
-        order = torch.argsort(effective_len)
-        sorted_indices = order.to("cpu").tolist()
-
-        # Optional optimization: copy lengths once to CPU
-        eff_cpu = effective_len.to("cpu")
-
-        for i in sorted_indices:
-            L = int(eff_cpu[i].item())
-
+        for L in sorted_eff_list:
             if padding_aware:
                 new_max = max(cur_max_len, L)
-                new_count = len(cur_indices) + 1
-                padded_cost = new_max * new_count
-                too_many_tokens = cur_indices and padded_cost > budget
+                too_many_tokens = cur_count > 0 and new_max * (cur_count + 1) > budget
             else:
-                too_many_tokens = cur_indices and (cur_tokens + L) > budget
+                too_many_tokens = cur_count > 0 and cur_tokens + L > budget
 
-            too_many_examples = max_B is not None and len(cur_indices) >= max_B
+            too_many_examples = max_B is not None and cur_count >= max_B
 
             if too_many_tokens or too_many_examples:
-                microbatches.append(cur_indices)
-                cur_indices = [i]
+                split_sizes.append(cur_count)
                 cur_tokens = L
                 cur_max_len = L
+                cur_count = 1
             else:
-                cur_indices.append(i)
                 cur_tokens += L
                 cur_max_len = max(cur_max_len, L)
+                cur_count += 1
 
-        if cur_indices:
-            microbatches.append(cur_indices)
+        if cur_count > 0:
+            split_sizes.append(cur_count)
 
-        result = [
-            self._compact_microbatch(self._slice_inputs(inputs, mb_idx))
-            for mb_idx in microbatches
-        ]
+        # --- Split into microbatches using contiguous slicing (views, not copies) ---
+        result = []
+        offset = 0
+        for size in split_sizes:
+            mb = {}
+            for k, v in sorted_inputs.items():
+                if isinstance(v, torch.Tensor) and v.ndim >= 1 and _batch_dim is not None and v.size(0) == _batch_dim:
+                    mb[k] = v[offset:offset + size]
+                else:
+                    mb[k] = v
+            result.append(self._compact_microbatch(mb))
+            offset += size
 
         if return_lengths:
             return result, enc_len, dec_len
@@ -2026,11 +2035,21 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if torch.cuda.is_available():
             current_mem = torch.cuda.memory_allocated(self.args.device)
             if self._gpu_baseline_mem is None or current_mem > self._gpu_baseline_mem:
-                if self.debug and self._gpu_baseline_mem is not None and current_mem > self._gpu_baseline_mem:
-                    print(f"[TokenPackTrainer] GPU baseline updated: {self._gpu_baseline_mem / (1<<30):.2f} -> {current_mem / (1<<30):.2f} GB")
+                old_baseline = self._gpu_baseline_mem
                 self._gpu_baseline_mem = current_mem
-                if self.debug and self._gpu_baseline_mem == current_mem:
-                    print(f"[TokenPackTrainer] GPU baseline memory: {self._gpu_baseline_mem / (1<<30):.2f} GB")
+                if self.debug:
+                    if old_baseline is not None:
+                        print(f"[TokenPackTrainer] GPU baseline updated: {old_baseline / (1<<30):.2f} -> {current_mem / (1<<30):.2f} GB")
+                    else:
+                        print(f"[TokenPackTrainer] GPU baseline memory: {current_mem / (1<<30):.2f} GB")
+                # When baseline jumps (e.g. optimizer states allocated after step 0),
+                # clear autotuned keys so regimes re-autotune with accurate baseline.
+                if old_baseline is not None and current_mem > old_baseline * 1.05:
+                    autotuned = getattr(self, "_autotuned_keys", set())
+                    if autotuned:
+                        if self.debug:
+                            print(f"[TokenPackTrainer] Baseline jumped {(current_mem - old_baseline)/(1<<30):.2f}G — re-autotuning {len(autotuned)} regime(s)")
+                        self._autotuned_keys = set()
 
         last_err = None
         regime_key = None  # <<< keep across retries for this same HF batch
