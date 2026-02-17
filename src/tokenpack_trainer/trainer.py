@@ -221,6 +221,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         oom_skip_batch_on_fail: bool = True, # if retries exhausted, just skip batch
         eval_data_collator=None,
         sampler_bucket_size: int = 8,  # bucket size for length-bucketed sampling (smaller = tighter grouping)
+        sampler_shuffle_mode: str = "interleave",  # "bucket" = sequential buckets, "interleave" = global batch shuffle across buckets
         padding_aware_budget: bool = False,  # if True, budget by max_len * num_examples (actual memory) vs sum of lengths
         max_eval_generate_examples: int | None = None,  # max examples per generate call (None = no limit, uses token budget only)
         builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
@@ -256,6 +257,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.oom_min_tokens = int(oom_min_tokens)
         self.oom_skip_batch_on_fail = bool(oom_skip_batch_on_fail)
         self.sampler_bucket_size = int(sampler_bucket_size)
+        self.sampler_shuffle_mode = str(sampler_shuffle_mode)
 
         # --- OOM tracking ---
         self._oom_events = 0           # Total OOM events across all batches
@@ -810,6 +812,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             drop_last=False,
             long_behavior="truncate",
             max_length_in_batch=self.max_encoder_len,
+            shuffle_mode=self.sampler_shuffle_mode,
         )
 
         dl = DataLoader(
@@ -1997,19 +2000,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     microbatches, enc_len, dec_len = self._make_microbatches(inputs_work, return_lengths=True)
 
                 else:
-                    # We don't have CPU tensors by default; easiest is to still derive a key on CPU
-                    # from a detached copy. This is cheap because it's just masks/labels.
                     # GPU-native path
                     if regime_key is None:
-                        regime_key = self._regime_key_from_inputs_any_device(inputs)  # no copy
+                        regime_key = self._regime_key_from_inputs_any_device(inputs)
 
-                    self._apply_regime_limits(regime_key)
-
-                    inputs_work = self._prepare_inputs(inputs)
-                    inputs_work = self._truncate_batch(inputs_work)
-                    microbatches, enc_len, dec_len = self._make_microbatches(inputs_work, return_lengths=True)
-
-                    # >>> apply per-regime best limits BEFORE planning microbatches
                     self._apply_regime_limits(regime_key)
 
                     inputs_work = self._prepare_inputs(inputs)

@@ -79,8 +79,12 @@ class LengthBucketedBatchSampler(Sampler):
         drop_last: bool = False,
         long_behavior: str = "truncate",
         max_length_in_batch: int | None = None,
+        shuffle_mode: str = "bucket",
     ):
         assert long_behavior in {"truncate", "skip", "single"}
+        assert shuffle_mode in {"bucket", "interleave"}, (
+            f"shuffle_mode must be 'bucket' or 'interleave', got '{shuffle_mode}'"
+        )
 
         self.lengths = [int(L) for L in lengths]
         self.max_tokens_per_batch = int(max_tokens_per_batch)
@@ -89,6 +93,7 @@ class LengthBucketedBatchSampler(Sampler):
         self.drop_last = bool(drop_last)
         self.long_behavior = long_behavior
         self.max_length_in_batch = int(max_length_in_batch) if max_length_in_batch is not None else None
+        self.shuffle_mode = shuffle_mode
 
         buckets = defaultdict(list)
         for idx, L in enumerate(self.lengths):
@@ -164,72 +169,97 @@ class LengthBucketedBatchSampler(Sampler):
 
         return max(1, count)
 
+    def _pack_bucket(self, idxs):
+        """Pack a single bucket's indices into batches using greedy token budgeting."""
+        batches = []
+        current_batch = []
+        current_tokens = 0
+        current_max = 0
+
+        for i in idxs:
+            L = self.lengths[i]
+
+            # Handle examples that exceed max_length_in_batch
+            if self.max_length_in_batch is not None and L > self.max_length_in_batch:
+                if self.long_behavior == "skip":
+                    continue
+                elif self.long_behavior == "single":
+                    if current_batch and not self.drop_last:
+                        batches.append(current_batch)
+                    batches.append([i])
+                    current_batch, current_tokens, current_max = [], 0, 0
+                    continue
+                # "truncate": allow through (will be truncated later)
+
+            # Handle examples that exceed max_tokens_per_batch
+            if L > self.max_tokens_per_batch:
+                if self.long_behavior == "skip":
+                    continue
+                elif self.long_behavior == "single":
+                    if current_batch and not self.drop_last:
+                        batches.append(current_batch)
+                    batches.append([i])
+                    current_batch, current_tokens, current_max = [], 0, 0
+                    continue
+                # "truncate": allow through
+
+            if not current_batch:
+                current_batch = [i]
+                current_tokens = L
+                current_max = L
+                continue
+
+            would_exceed_sum = (current_tokens + L > self.max_tokens_per_batch)
+            would_exceed_max = (
+                self.max_length_in_batch is not None
+                and max(current_max, L) > self.max_length_in_batch
+            )
+
+            if would_exceed_sum or would_exceed_max:
+                if not self.drop_last:
+                    batches.append(current_batch)
+                current_batch = [i]
+                current_tokens = L
+                current_max = L
+            else:
+                current_batch.append(i)
+                current_tokens += L
+                current_max = max(current_max, L)
+
+        if current_batch and not self.drop_last:
+            batches.append(current_batch)
+
+        return batches
+
     def __iter__(self):
         bucket_ids = list(self.bucket_ids)
         if self.shuffle:
             random.shuffle(bucket_ids)
 
-        for b in bucket_ids:
-            idxs = list(self.buckets[b])
+        if self.shuffle_mode == "interleave":
+            # Collect ALL batches from ALL buckets, then shuffle globally.
+            # This ensures consecutive batches come from random length buckets,
+            # giving much more even GPU utilization with variable-length data.
+            all_batches = []
+            for b in bucket_ids:
+                idxs = list(self.buckets[b])
+                if self.shuffle:
+                    random.shuffle(idxs)
+                all_batches.extend(self._pack_bucket(idxs))
+
             if self.shuffle:
-                random.shuffle(idxs)
+                random.shuffle(all_batches)
 
-            current_batch = []
-            current_tokens = 0
-            current_max = 0
+            yield from all_batches
+        else:
+            # Original bucket-sequential mode
+            for b in bucket_ids:
+                idxs = list(self.buckets[b])
+                if self.shuffle:
+                    random.shuffle(idxs)
 
-            for i in idxs:
-                L = self.lengths[i]
-
-                # Handle examples that exceed max_length_in_batch
-                if self.max_length_in_batch is not None and L > self.max_length_in_batch:
-                    if self.long_behavior == "skip":
-                        continue
-                    elif self.long_behavior == "single":
-                        if current_batch and not self.drop_last:
-                            yield current_batch
-                        yield [i]
-                        current_batch, current_tokens, current_max = [], 0, 0
-                        continue
-                    # "truncate": allow through (will be truncated later)
-
-                # Handle examples that exceed max_tokens_per_batch
-                if L > self.max_tokens_per_batch:
-                    if self.long_behavior == "skip":
-                        continue
-                    elif self.long_behavior == "single":
-                        if current_batch and not self.drop_last:
-                            yield current_batch
-                        yield [i]
-                        current_batch, current_tokens, current_max = [], 0, 0
-                        continue
-                    # "truncate": allow through
-
-                if not current_batch:
-                    current_batch = [i]
-                    current_tokens = L
-                    current_max = L
-                    continue
-
-                would_exceed_sum = (current_tokens + L > self.max_tokens_per_batch)
-                would_exceed_max = (
-                    self.max_length_in_batch is not None
-                    and max(current_max, L) > self.max_length_in_batch
-                )
-
-                if would_exceed_sum or would_exceed_max:
-                    if not self.drop_last:
-                        yield current_batch
-                    current_batch = [i]
-                    current_tokens = L
-                    current_max = L
-                else:
-                    current_batch.append(i)
-                    current_tokens += L
-                    current_max = max(current_max, L)
-
-            if current_batch and not self.drop_last:
-                yield current_batch
+                for batch in self._pack_bucket(idxs):
+                    yield batch
 
     def __len__(self):
         return self._count_batches()

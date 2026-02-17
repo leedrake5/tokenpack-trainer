@@ -67,6 +67,9 @@ def is_english_target(prompt: str) -> bool:
     )
 
 
+import comet_ml
+from comet_ml import Experiment
+
 def make_seq2seq_compute_metrics(
     tokenizer,
     eval_dataset=None,
@@ -74,6 +77,7 @@ def make_seq2seq_compute_metrics(
     max_ref_tokens: int = 64,
     meteor_only_for_english: bool = True,
     is_english_fn: Optional[Callable[[str], bool]] = None,
+    comet_experiment: Optional[Experiment] = None,
 ) -> Callable:
     """
     Factory function that creates a compute_metrics function for seq2seq evaluation.
