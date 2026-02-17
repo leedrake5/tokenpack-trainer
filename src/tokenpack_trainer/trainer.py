@@ -223,6 +223,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         sampler_bucket_size: int = 8,  # bucket size for length-bucketed sampling (smaller = tighter grouping)
         sampler_shuffle_mode: str = "interleave",  # "bucket" = sequential buckets, "interleave" = global batch shuffle across buckets
         padding_aware_budget: bool = False,  # if True, budget by max_len * num_examples (actual memory) vs sum of lengths
+        regime_max_B: int | None = None,  # max examples per microbatch the regime can ramp to (None = auto from token budget)
         max_eval_generate_examples: int | None = None,  # max examples per generate call (None = no limit, uses token budget only)
         builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
         builtin_metrics_tokenize: str = "13a",
@@ -286,7 +287,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         # Upper bounds to prevent runaway growth during adaptation
         self._regime_max_T = int(max_tokens_per_microbatch * 4) if max_tokens_per_microbatch is not None else (1 << 62)
-        self._regime_max_B = 1024
+        if regime_max_B is not None:
+            self._regime_max_B = int(regime_max_B)
+        elif max_tokens_per_microbatch is not None:
+            # Auto: allow enough examples to fill the token budget even with very short sequences
+            self._regime_max_B = max(1024, int(max_tokens_per_microbatch))
+        else:
+            self._regime_max_B = 8192
 
         self.builtin_metrics = tuple(builtin_metrics) if builtin_metrics else tuple()
         self.builtin_metrics_tokenize = str(builtin_metrics_tokenize)
@@ -544,25 +551,27 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return "token_aware_metrics"
         return m
 
-    def _regime_key_from_inputs(self, inputs_cpu: dict) -> int:
-        """
-        Compute a coarse "regime key" from the maximum effective length
-        in this HF batch: eff = enc_len + alpha * dec_len.
-        """
-        enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_cpu)
+    def _regime_key_from_lengths(self, enc_len, dec_len) -> int:
+        """Compute regime key from precomputed lengths (avoids redundant recomputation)."""
         alpha = 2.0
         eff = enc_len + alpha * dec_len
         mx = int(eff.max().item()) if eff.numel() else 0
         bs = int(self._regime_bucket_size)
         return int((mx + bs - 1) // bs) if bs > 0 else mx
 
+    def _regime_key_from_inputs(self, inputs_cpu: dict) -> int:
+        """
+        Compute a coarse "regime key" from the maximum effective length
+        in this HF batch: eff = enc_len + alpha * dec_len.
+        """
+        enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_cpu)
+        return self._regime_key_from_lengths(enc_len, dec_len)
+
     def _regime_state(self, key: int) -> dict:
         st = self._regime_limits.get(key)
         if st is None:
             st = {"B": self._regime_default_B, "T": self._regime_default_T, "stable": 0}
-            # If defaults are None, pick something reasonable so we can adapt
-            if st["B"] is None:
-                st["B"] = 16
+            # B=None is valid and means "uncapped" — only default T if missing
             if st["T"] is None:
                 st["T"] = 400
             self._regime_limits[key] = st
@@ -594,10 +603,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
         st["stable"] += 1
 
         if st["stable"] % int(self._regime_ramp_every) == 0:
-            if st["B"] is None:
-                st["B"] = 16
-            st["B"] = max(self._regime_min_B, int(st["B"] * float(self._regime_ramp_B)) + 1)
-            st["B"] = self._clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
+            # B=None means uncapped — no ramping needed
+            if st["B"] is not None:
+                st["B"] = max(self._regime_min_B, int(st["B"] * float(self._regime_ramp_B)) + 1)
+                st["B"] = self._clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
 
             st["T"] = max(self._regime_min_T, int(st["T"] * float(self._regime_ramp_T)))
             # hard clamp to practical + int64 safety
@@ -607,9 +616,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
         st = self._regime_state(key)
         st["stable"] = 0
 
-        # Shrink B first
+        # Shrink B first — if uncapped, materialize from regime_max_B so we can shrink
         if st["B"] is None:
-            st["B"] = 16
+            st["B"] = self._regime_max_B
+            return
+
         new_B = max(self._regime_min_B, int(st["B"] * 0.7))
         if new_B < st["B"]:
             st["B"] = new_B
@@ -1063,9 +1074,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
         inputs,
         max_tokens_per_microbatch: int | None = None,
         return_lengths: bool = False,
+        precomputed_lengths: tuple | None = None,
     ):
-        # Compute lengths
-        enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
+        # Reuse precomputed lengths if available (avoids redundant tensor ops)
+        if precomputed_lengths is not None:
+            enc_len, dec_len = precomputed_lengths
+        else:
+            enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
 
         alpha = 2.0
         effective_len = enc_len + alpha * dec_len
@@ -1988,27 +2003,33 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 # ---------------- PLAN MICROBATCHE(S) ----------------
                 if self.use_cpu_microbatch:
                     inputs_work = self._move_to_cpu(inputs)
+                    inputs_work = self._truncate_batch(inputs_work)
 
-                    # >>> compute regime key once per batch (from CPU tensors)
+                    # >>> compute lengths ONCE (post-truncation), reuse for regime key + microbatch splitting
+                    enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_work)
                     if regime_key is None:
-                        regime_key = self._regime_key_from_inputs(inputs_work)
+                        regime_key = self._regime_key_from_lengths(enc_len, dec_len)
 
                     # >>> apply per-regime best limits BEFORE planning microbatches
                     self._apply_regime_limits(regime_key)
 
-                    inputs_work = self._truncate_batch(inputs_work)
-                    microbatches, enc_len, dec_len = self._make_microbatches(inputs_work, return_lengths=True)
+                    microbatches, enc_len, dec_len = self._make_microbatches(
+                        inputs_work, return_lengths=True, precomputed_lengths=(enc_len, dec_len))
 
                 else:
                     # GPU-native path
+                    inputs_work = self._prepare_inputs(inputs)
+                    inputs_work = self._truncate_batch(inputs_work)
+
+                    # >>> compute lengths once (post-truncation), reuse
+                    enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs_work)
                     if regime_key is None:
-                        regime_key = self._regime_key_from_inputs_any_device(inputs)
+                        regime_key = self._regime_key_from_lengths(enc_len, dec_len)
 
                     self._apply_regime_limits(regime_key)
 
-                    inputs_work = self._prepare_inputs(inputs)
-                    inputs_work = self._truncate_batch(inputs_work)
-                    microbatches, enc_len, dec_len = self._make_microbatches(inputs_work, return_lengths=True)
+                    microbatches, enc_len, dec_len = self._make_microbatches(
+                        inputs_work, return_lengths=True, precomputed_lengths=(enc_len, dec_len))
 
                 eff_tokens = int((enc_len + 2.0 * dec_len).sum().item())
 

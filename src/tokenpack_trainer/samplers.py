@@ -262,4 +262,6 @@ class LengthBucketedBatchSampler(Sampler):
                     yield batch
 
     def __len__(self):
-        return self._count_batches()
+        if self._num_batches is None:
+            self._num_batches = self._count_batches()
+        return self._num_batches
