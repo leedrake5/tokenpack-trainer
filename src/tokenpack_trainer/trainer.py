@@ -621,6 +621,18 @@ class TokenPackTrainer(Seq2SeqTrainer):
         st = self._regime_state(key)
         st["stable"] = 0
 
+        # Track OOM count per regime for safety factor adjustment on re-autotune
+        oom_history = getattr(self, "_regime_oom_count", {})
+        oom_history[key] = oom_history.get(key, 0) + 1
+        self._regime_oom_count = oom_history
+
+        # Allow re-autotuning after recovery stabilizes.
+        # Without this, a single OOM can condemn a regime to slow incremental
+        # ramp-up (~930 steps to recover from T=64 → T=16384).
+        autotuned = getattr(self, "_autotuned_keys", set())
+        if key in autotuned:
+            autotuned.discard(key)
+
         # Shrink B first — if uncapped, materialize from regime_max_B so we can shrink
         if st["B"] is None:
             st["B"] = self._regime_max_B
@@ -2141,9 +2153,19 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self._regime_on_success(regime_key)
 
                 if regime_key is not None and not getattr(self, "_autotuned_keys", set()).__contains__(regime_key):
-                    self._autotune_regime_from_peak(regime_key, eff_tokens, safety=0.90)
+                    # Use lower safety factor if this regime recently OOM'd
+                    # (previous autotune overshot, so be more conservative)
+                    st = self._regime_state(regime_key)
+                    oom_history = getattr(self, "_regime_oom_count", {})
+                    recent_oom = oom_history.get(regime_key, 0) > 0
+                    safety = 0.75 if recent_oom else 0.90
+                    self._autotune_regime_from_peak(regime_key, eff_tokens, safety=safety)
                     self._autotuned_keys = getattr(self, "_autotuned_keys", set())
                     self._autotuned_keys.add(regime_key)
+                    # Clear OOM history for this key now that we've re-autotuned
+                    if recent_oom:
+                        oom_history[regime_key] = 0
+                        self._regime_oom_count = oom_history
 
 
                 # optional logging
