@@ -1795,10 +1795,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     # fall through to microbatching
 
             # microbatch generation path (OOM-safe)
+            # When use_cpu_microbatch=True, plan on CPU and _prefetch_microbatches
+            # streams each microbatch to GPU.  When False, move the whole batch to
+            # GPU first (input tensors are tiny vs. model activations, so this
+            # won't OOM) so that _do_generate receives GPU tensors.
             if self.use_cpu_microbatch:
                 plan_inputs = self._truncate_batch(self._move_to_cpu(batch))
             else:
-                plan_inputs = self._truncate_batch(batch)
+                plan_inputs = self._truncate_batch(self._prepare_inputs(batch))
 
             last_err = None
             for attempt in range(int(self.oom_max_retries) + 1):
