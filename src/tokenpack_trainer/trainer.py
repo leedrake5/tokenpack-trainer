@@ -512,6 +512,119 @@ class TokenPackTrainer(Seq2SeqTrainer):
             gen_kwargs = tmp
         return gen_kwargs
 
+    def _estimate_max_gen_examples(
+        self,
+        gen_kwargs: dict,
+        enc_len: int | None = None,
+        safety: float = 0.70,
+    ) -> int | None:
+        """
+        Estimate the max generation batch size that fits in free VRAM.
+
+        Uses model config to compute KV-cache cost per example, then divides
+        available memory by that cost.  Returns None if estimation is not
+        possible (e.g. no CUDA, missing config attrs).
+
+        Args:
+            gen_kwargs: generation kwargs (needs 'max_length' or 'max_new_tokens')
+            enc_len:    encoder sequence length to assume.  Falls back to
+                        self.max_encoder_len, then model config max position.
+            safety:     fraction of free VRAM to budget (0.70 = 70%).
+        """
+        if not torch.cuda.is_available():
+            return None
+
+        # ---- generation length ------------------------------------------------
+        gen_max = (
+            gen_kwargs.get("max_length")
+            or gen_kwargs.get("max_new_tokens")
+            or getattr(self.args, "generation_max_length", None)
+        )
+        if gen_max is None:
+            return None
+        gen_max = int(gen_max)
+
+        # ---- encoder length ---------------------------------------------------
+        if enc_len is None:
+            enc_len = self.max_encoder_len
+        if enc_len is None:
+            enc_len = getattr(self.model.config, "max_position_embeddings", 512)
+        enc_len = int(enc_len)
+
+        # ---- model dimensions -------------------------------------------------
+        cfg = self.model.config
+        # decoder layers (enc-dec models often split these)
+        n_dec_layers = (
+            getattr(cfg, "num_decoder_layers", None)
+            or getattr(cfg, "num_hidden_layers", None)
+            or getattr(cfg, "num_layers", None)
+        )
+        if n_dec_layers is None:
+            return None
+
+        d_model = getattr(cfg, "d_model", None) or getattr(cfg, "hidden_size", None)
+        if d_model is None:
+            return None
+
+        n_heads = (
+            getattr(cfg, "num_attention_heads", None)
+            or getattr(cfg, "num_heads", None)
+        )
+        n_kv_heads = getattr(cfg, "num_key_value_heads", None) or n_heads
+        if n_kv_heads is None:
+            return None
+
+        d_kv = getattr(cfg, "d_kv", None) or (d_model // n_heads if n_heads else None)
+        if d_kv is None:
+            return None
+
+        # dtype bytes (match model dtype)
+        try:
+            dtype_bytes = next(self.model.parameters()).element_size()
+        except StopIteration:
+            dtype_bytes = 2  # assume fp16/bf16
+
+        # ---- KV cache cost per example ----------------------------------------
+        # Each layer stores K and V tensors; for encoder-decoder models there is
+        # both cross-attention KV (over enc_len) and self-attention KV (over
+        # gen_max tokens) in the decoder.
+        kv_per_tok_per_layer = 2 * n_kv_heads * d_kv * dtype_bytes
+
+        is_enc_dec = getattr(cfg, "is_encoder_decoder", False)
+        if is_enc_dec:
+            # cross-attn KV: decoder reads encoder output at every step
+            cross_attn_kv = int(n_dec_layers) * enc_len * kv_per_tok_per_layer
+            # self-attn KV: grows to gen_max
+            self_attn_kv = int(n_dec_layers) * gen_max * kv_per_tok_per_layer
+            kv_per_example = cross_attn_kv + self_attn_kv
+        else:
+            kv_per_example = int(n_dec_layers) * (enc_len + gen_max) * kv_per_tok_per_layer
+
+        # Activations + intermediates per decode step (rough: ~4× one layer's KV
+        # covers hidden states, attention scores, FFN intermediates)
+        act_per_example = int(n_dec_layers) * d_model * 4 * dtype_bytes
+
+        mem_per_example = kv_per_example + act_per_example
+        if mem_per_example <= 0:
+            return None
+
+        # ---- available memory -------------------------------------------------
+        free_mem, _total = torch.cuda.mem_get_info(self.args.device)
+        available = int(free_mem * safety)
+
+        max_batch = max(1, available // mem_per_example)
+
+        if self.debug:
+            logger.info(
+                f"[TokenPackTrainer] Gen batch auto-tune: "
+                f"free={free_mem / (1 << 30):.2f}GB, "
+                f"kv/ex={kv_per_example / (1 << 20):.1f}MB, "
+                f"act/ex={act_per_example / (1 << 20):.1f}MB, "
+                f"max_batch={max_batch} (safety={safety})"
+            )
+
+        return max_batch
+
     def _filter_for_generate(
         self,
         batch: dict,
@@ -1468,6 +1581,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
         wants_builtin = bool(getattr(self, "builtin_metrics", ()))
         do_generate = wants_generate or wants_builtin
 
+        # ---- auto-tune generation batch size from available VRAM
+        if do_generate and self.max_eval_generate_examples is None:
+            auto_B = self._estimate_max_gen_examples(gen_kwargs)
+            if auto_B is not None:
+                self.max_eval_generate_examples = auto_B
+                logger.info(
+                    f"[TokenPackTrainer] Auto-set max_eval_generate_examples={auto_B} "
+                    f"from VRAM estimate"
+                )
+
         acc = getattr(self, "accelerator", None)
         num_proc = getattr(acc, "num_processes", 1) if acc is not None else 1
         # On single process, always treat as main; otherwise check accelerator
@@ -1562,6 +1685,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
             metric_state["all_preds"].extend(preds)
             metric_state["all_refs"].extend(refs)
 
+        # Compute generation stride to evenly sample across the full eval set
+        # (ensures all tasks/domains are represented in metrics, not just the first block)
+        _gen_stride = 1
+        if self.max_metric_samples is not None and do_generate:
+            _n_eval = len(eval_dataset) if hasattr(eval_dataset, "__len__") else None
+            if _n_eval is not None and _n_eval > self.max_metric_samples:
+                _gen_stride = max(1, _n_eval // self.max_metric_samples)
+
         start_time = time.time()
 
         for batch in tqdm(dataloader, desc=desc, leave=True, disable=bool(getattr(self.args, "disable_tqdm", False))):
@@ -1639,9 +1770,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if not do_generate:
                 continue
 
-            # Gate generation on max_metric_samples to avoid needless decode
-            if (self.max_metric_samples is not None
-                    and metric_state["metric_examples"] >= self.max_metric_samples):
+            # Gate generation: skip batches via stride to sample evenly across full dataset
+            if _gen_stride > 1 and (num_steps % _gen_stride) != 1:
                 continue
 
             if self.use_cpu_microbatch:
