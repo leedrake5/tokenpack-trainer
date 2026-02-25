@@ -1639,21 +1639,30 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if not do_generate:
                 continue
 
+            # Gate generation on max_metric_samples to avoid needless decode
+            if (self.max_metric_samples is not None
+                    and metric_state["metric_examples"] >= self.max_metric_samples):
+                continue
+
             if self.use_cpu_microbatch:
                 batch_for_gen = self._to_device(self._truncate_batch(self._move_to_cpu(batch)))
             else:
                 batch_for_gen = self._truncate_batch(self._prepare_inputs(batch))
             # ---- fast path generate whole batch ----
-            try:
-                gen_ids = _do_generate(batch_for_gen)
-                _add_streaming_metrics(gen_ids, batch_for_gen["labels"])
-                self._eval_on_success()
-                continue
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                if not self._is_cuda_oom(e):
-                    raise
-                self._eval_oom_cleanup()
-                # fall through to microbatching
+            # Skip fast path if batch exceeds max_eval_generate_examples (avoids guaranteed OOM)
+            gen_limit = getattr(self, "max_eval_generate_examples", None)
+            fast_path_ok = (gen_limit is None or batch_for_gen["input_ids"].size(0) <= gen_limit)
+            if fast_path_ok:
+                try:
+                    gen_ids = _do_generate(batch_for_gen)
+                    _add_streaming_metrics(gen_ids, batch_for_gen["labels"])
+                    self._eval_on_success()
+                    continue
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                    if not self._is_cuda_oom(e):
+                        raise
+                    self._eval_oom_cleanup()
+                    # fall through to microbatching
 
             # microbatch generation path (OOM-safe)
             if self.use_cpu_microbatch:
