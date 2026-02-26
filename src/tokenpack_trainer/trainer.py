@@ -228,7 +228,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
         builtin_metrics_tokenize: str = "13a",
         builtin_metrics_lowercase: bool = False,
-        max_metric_samples: int | None = 2000,  # Max samples for metric computation (None = all, default 2000 for speed)
+        max_metric_samples: int | None = 100000,  # Max samples for metric computation (None = all, default 2000 for speed)
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
