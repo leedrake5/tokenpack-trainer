@@ -234,7 +234,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         super().__init__(*args, **kwargs)
         self.eval_data_collator = eval_data_collator
         self.padding_aware_budget = bool(padding_aware_budget)
-        self.max_eval_generate_examples = max_eval_generate_examples  # None = use full batch when possible
+        self.max_eval_generate_examples = max_eval_generate_examples  # None = auto-tune from VRAM
+        self._user_set_gen_B = max_eval_generate_examples  # track if user explicitly set a value
         self.max_metric_samples = max_metric_samples  # Limit samples for metrics to avoid slow decode
         self.max_tokens_per_microbatch = int(max_tokens_per_microbatch)
         self.max_encoder_len = int(max_encoder_len) if max_encoder_len is not None else None
@@ -1469,6 +1470,93 @@ class TokenPackTrainer(Seq2SeqTrainer):
         
         
     # --------------------------------------------------------------
+    # Eval VRAM optimisation: free training-only memory for generation
+    # --------------------------------------------------------------
+
+    def _prepare_eval_vram(self) -> dict:
+        """
+        Maximise free VRAM before generation by:
+          1. Disabling gradient checkpointing (pure overhead during inference —
+             recomputes activations at every decode step for no benefit).
+          2. Offloading optimizer states to CPU (AdamW momentum/variance can
+             consume 2-4× model size in fp32).
+          3. Clearing the CUDA cache so the freed blocks are visible to
+             mem_get_info / the auto-tuner.
+
+        Returns a state dict that _restore_eval_vram() uses to undo everything.
+        """
+        state: dict = {}
+
+        # ---- 1) gradient checkpointing ------------------------------------
+        model = self.model
+        gc_was_enabled = getattr(model, "is_gradient_checkpointing", False)
+        if not gc_was_enabled:
+            # some models use a private flag instead
+            gc_was_enabled = getattr(model.config, "gradient_checkpointing", False)
+        state["gc_was_enabled"] = gc_was_enabled
+
+        if gc_was_enabled:
+            try:
+                model.gradient_checkpointing_disable()
+            except Exception:
+                state["gc_was_enabled"] = False  # couldn't toggle, don't try to restore
+
+        # ---- 2) optimizer state → CPU -------------------------------------
+        moved_keys: list[tuple] = []
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            try:
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        pstate = optimizer.state.get(p)
+                        if not pstate:
+                            continue
+                        for k, v in pstate.items():
+                            if isinstance(v, torch.Tensor) and v.is_cuda:
+                                pstate[k] = v.to("cpu", non_blocking=True)
+                                moved_keys.append((id(p), k))
+            except Exception:
+                pass  # non-standard optimizer — skip silently
+        state["moved_keys"] = moved_keys
+
+        # ---- 3) flush cache -----------------------------------------------
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        return state
+
+    def _restore_eval_vram(self, state: dict):
+        """Undo _prepare_eval_vram: re-enable grad-ckpt, move optimizer back."""
+
+        # ---- gradient checkpointing ---------------------------------------
+        if state.get("gc_was_enabled", False):
+            try:
+                self.model.gradient_checkpointing_enable()
+            except Exception:
+                pass
+
+        # ---- optimizer state → GPU ----------------------------------------
+        moved_keys = set(state.get("moved_keys", []))
+        if moved_keys:
+            optimizer = getattr(self, "optimizer", None)
+            if optimizer is not None:
+                try:
+                    device = self.args.device
+                    for group in optimizer.param_groups:
+                        for p in group["params"]:
+                            pstate = optimizer.state.get(p)
+                            if not pstate:
+                                continue
+                            for k, v in pstate.items():
+                                if (id(p), k) in moved_keys and isinstance(v, torch.Tensor):
+                                    pstate[k] = v.to(device, non_blocking=True)
+                except Exception:
+                    pass
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+    # --------------------------------------------------------------
     # Token-aware evaluation with metrics
     # --------------------------------------------------------------
 
@@ -1581,15 +1669,24 @@ class TokenPackTrainer(Seq2SeqTrainer):
         wants_builtin = bool(getattr(self, "builtin_metrics", ()))
         do_generate = wants_generate or wants_builtin
 
+        # ---- free training-only VRAM (grad-ckpt, optimizer) for generation
+        _vram_state = self._prepare_eval_vram() if do_generate else None
+
         # ---- auto-tune generation batch size from available VRAM
-        if do_generate and self.max_eval_generate_examples is None:
+        # (runs AFTER _prepare_eval_vram so it sees the freed memory)
+        # Re-estimate every eval call: available VRAM varies as optimizer
+        # states are offloaded/restored between train and eval phases.
+        _user_set_gen_B = getattr(self, "_user_set_gen_B", None)
+        if do_generate:
             auto_B = self._estimate_max_gen_examples(gen_kwargs)
             if auto_B is not None:
-                self.max_eval_generate_examples = auto_B
-                logger.info(
-                    f"[TokenPackTrainer] Auto-set max_eval_generate_examples={auto_B} "
-                    f"from VRAM estimate"
-                )
+                # Only override if user didn't explicitly set a value at init
+                if _user_set_gen_B is None:
+                    self.max_eval_generate_examples = auto_B
+                    logger.info(
+                        f"[TokenPackTrainer] Auto-set max_eval_generate_examples={auto_B} "
+                        f"from VRAM estimate"
+                    )
 
         acc = getattr(self, "accelerator", None)
         num_proc = getattr(acc, "num_processes", 1) if acc is not None else 1
@@ -1944,8 +2041,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         f"do_generate={do_generate}, num_examples={num_examples}"
                     )
 
+        # ---- restore training VRAM state (grad-ckpt, optimizer) ------
+        if _vram_state is not None:
+            self._restore_eval_vram(_vram_state)
+
         return metrics
-        
+
     # --------------------------------------------------------------
     # OOM handling + emergency checkpoint
     # --------------------------------------------------------------
