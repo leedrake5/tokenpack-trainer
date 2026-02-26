@@ -517,7 +517,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self,
         gen_kwargs: dict,
         enc_len: int | None = None,
-        safety: float = 0.70,
+        safety: float = 0.85,
     ) -> int | None:
         """
         Estimate the max generation batch size that fits in free VRAM.
@@ -907,7 +907,23 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         mb[k] = mb[k][:, :dec_max]
 
         return mb
-        
+
+    @staticmethod
+    def _concat_eval_batches(batches: list) -> dict:
+        """Concatenate a list of batch dicts along the batch (first) dimension."""
+        if len(batches) == 1:
+            return batches[0]
+        merged = {}
+        for k in batches[0]:
+            vals = [b[k] for b in batches if k in b]
+            if not vals:
+                continue
+            if isinstance(vals[0], torch.Tensor) and vals[0].ndim >= 1:
+                merged[k] = torch.cat(vals, dim=0)
+            else:
+                merged[k] = vals[0]
+        return merged
+
     def get_train_dataloader(self):
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -1223,6 +1239,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         max_tokens_per_microbatch: int | None = None,
         return_lengths: bool = False,
         precomputed_lengths: tuple | None = None,
+        generation_max_length: int | None = None,
     ):
         # Reuse precomputed lengths if available (avoids redundant tensor ops)
         if precomputed_lengths is not None:
@@ -1231,7 +1248,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
             enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
 
         alpha = 2.0
-        effective_len = enc_len + alpha * dec_len
+        # When planning microbatches for generation, use generation_max_length
+        # instead of label length — KV cache grows to gen_max, not to dec_len.
+        if generation_max_length is not None:
+            effective_len = enc_len + alpha * generation_max_length
+        else:
+            effective_len = enc_len + alpha * dec_len
         N = int(effective_len.numel())
 
         budget = int(max_tokens_per_microbatch or self.max_tokens_per_microbatch)
@@ -1790,6 +1812,115 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if _n_eval is not None and _n_eval > self.max_metric_samples:
                 _gen_stride = max(1, _n_eval // self.max_metric_samples)
 
+        # ---- batch accumulation for generation ---------------------------------
+        # The dataloader yields small batches (per_device_eval_batch_size), but
+        # VRAM can fit many more examples.  Accumulate on CPU until we reach the
+        # auto-tuned target, then flush one large generate() call.
+        _gen_buffer: list = []
+        _gen_buffer_count = 0
+        _gen_target_B = self.max_eval_generate_examples or 0  # 0 = no accumulation
+
+        if _gen_target_B > 0 and do_generate:
+            logger.info(
+                f"[TokenPackTrainer] Gen batch accumulation: target={_gen_target_B} examples "
+                f"(dataloader yields ~{self.args.per_device_eval_batch_size})"
+            )
+
+        # Get generation_max_length for microbatch budget (KV cache cost)
+        _gen_max_len = (
+            gen_kwargs.get("max_length")
+            or gen_kwargs.get("max_new_tokens")
+            or getattr(self.args, "generation_max_length", None)
+        )
+
+        def _flush_gen_buffer():
+            """Concatenate accumulated batches and run generation."""
+            nonlocal _gen_buffer, _gen_buffer_count
+            if not _gen_buffer:
+                return
+
+            super_batch = self._concat_eval_batches(_gen_buffer)
+            _gen_buffer = []
+            _gen_buffer_count = 0
+
+            B = super_batch["input_ids"].size(0)
+            gen_limit = getattr(self, "max_eval_generate_examples", None)
+            fast_path_ok = (gen_limit is None or B <= gen_limit)
+
+            # ---- fast path: generate whole super-batch at once ----
+            if fast_path_ok:
+                try:
+                    gpu_batch = self._prepare_inputs(super_batch)
+                    gen_ids = _do_generate(gpu_batch)
+                    _add_streaming_metrics(gen_ids, gpu_batch["labels"])
+                    self._eval_on_success()
+                    return
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                    if not self._is_cuda_oom(e):
+                        raise
+                    self._eval_oom_cleanup()
+                    # fall through to microbatching
+
+            # ---- microbatch generation path (OOM-safe) ----
+            last_err = None
+            for attempt in range(int(self.oom_max_retries) + 1):
+                try:
+                    orig_use_cache = getattr(self.model.config, "use_cache", True)
+                    self.model.config.use_cache = True
+
+                    orig_max_B = self.max_examples_per_microbatch
+                    if gen_limit is not None:
+                        self.max_examples_per_microbatch = int(gen_limit)
+
+                    microbatches = self._make_microbatches(
+                        super_batch,
+                        max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
+                        generation_max_length=_gen_max_len,
+                    )
+                    self.max_examples_per_microbatch = orig_max_B
+
+                    for mb in microbatches:
+                        mb_gpu = self._prepare_inputs(mb)
+                        gen_ids = _do_generate(mb_gpu)
+                        _add_streaming_metrics(gen_ids, mb_gpu["labels"])
+
+                    last_err = None
+                    self._eval_on_success()
+                    break
+
+                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                    if not self._is_cuda_oom(e):
+                        raise
+                    last_err = e
+                    self._eval_on_oom()
+                    self._eval_oom_cleanup()
+                    changed = self._shrink_eval_limits()
+
+                    if self.control.should_log:
+                        self.log({
+                            "eval_oom_event": 1.0,
+                            "eval_oom_attempt": float(attempt),
+                            "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
+                            "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
+                            "eval_changed_limits": float(changed),
+                        })
+
+                    if not changed:
+                        break
+
+                finally:
+                    try:
+                        self.model.config.use_cache = orig_use_cache
+                    except Exception:
+                        pass
+
+            if last_err is not None:
+                if getattr(self, "oom_skip_batch_on_fail", True):
+                    if self.control.should_log:
+                        self.log({"eval_oom_skipped_batch": 1.0})
+                else:
+                    raise last_err
+
         start_time = time.time()
 
         for batch in tqdm(dataloader, desc=desc, leave=True, disable=bool(getattr(self.args, "disable_tqdm", False))):
@@ -1871,97 +2002,25 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if _gen_stride > 1 and (num_steps % _gen_stride) != 1:
                 continue
 
-            if self.use_cpu_microbatch:
-                batch_for_gen = self._to_device(self._truncate_batch(self._move_to_cpu(batch)))
-            else:
-                batch_for_gen = self._truncate_batch(self._prepare_inputs(batch))
-            # ---- fast path generate whole batch ----
-            # Skip fast path if batch exceeds max_eval_generate_examples (avoids guaranteed OOM)
-            gen_limit = getattr(self, "max_eval_generate_examples", None)
-            fast_path_ok = (gen_limit is None or batch_for_gen["input_ids"].size(0) <= gen_limit)
-            if fast_path_ok:
-                try:
-                    gen_ids = _do_generate(batch_for_gen)
-                    _add_streaming_metrics(gen_ids, batch_for_gen["labels"])
-                    self._eval_on_success()
-                    continue
-                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                    if not self._is_cuda_oom(e):
-                        raise
-                    self._eval_oom_cleanup()
-                    # fall through to microbatching
+            # Accumulate batches on CPU until we fill the VRAM budget, then flush
+            acc_batch = self._truncate_batch(batch)
+            # Ensure tensors are on CPU for accumulation (avoids wasting VRAM on buffered inputs)
+            acc_batch = {
+                k: v.cpu() if isinstance(v, torch.Tensor) and v.is_cuda else v
+                for k, v in acc_batch.items()
+            }
+            _gen_buffer.append(acc_batch)
+            _gen_buffer_count += acc_batch["input_ids"].size(0)
 
-            # microbatch generation path (OOM-safe)
-            # When use_cpu_microbatch=True, plan on CPU and _prefetch_microbatches
-            # streams each microbatch to GPU.  When False, move the whole batch to
-            # GPU first (input tensors are tiny vs. model activations, so this
-            # won't OOM) so that _do_generate receives GPU tensors.
-            if self.use_cpu_microbatch:
-                plan_inputs = self._truncate_batch(self._move_to_cpu(batch))
-            else:
-                plan_inputs = self._truncate_batch(self._prepare_inputs(batch))
+            # Only flush when we've accumulated enough examples to fill VRAM
+            if _gen_target_B > 0 and _gen_buffer_count < _gen_target_B:
+                continue  # keep accumulating
 
-            last_err = None
-            for attempt in range(int(self.oom_max_retries) + 1):
-                try:
-                    orig_use_cache = getattr(self.model.config, "use_cache", True)
-                    self.model.config.use_cache = True
+            _flush_gen_buffer()
 
-                    orig_max_B = self.max_examples_per_microbatch
-                    gen_limit = getattr(self, "max_eval_generate_examples", None)
-                    if gen_limit is not None:
-                        self.max_examples_per_microbatch = int(gen_limit)
-
-                    microbatches = self._make_microbatches(
-                        plan_inputs,
-                        max_tokens_per_microbatch=self.max_eval_tokens_per_microbatch,
-                    )
-                    self.max_examples_per_microbatch = orig_max_B
-
-                    mb_iter = self._prefetch_microbatches(microbatches) if self.use_cpu_microbatch else iter(microbatches)
-
-                    for mb in mb_iter:
-                        gen_ids = _do_generate(mb)
-                        _add_streaming_metrics(gen_ids, mb["labels"])
-                        
-
-                    last_err = None
-                    self._eval_on_success()
-                    break
-
-                except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                    if not self._is_cuda_oom(e):
-                        raise
-                    last_err = e
-                    self._eval_on_oom()
-                    self._eval_oom_cleanup()
-                    changed = self._shrink_eval_limits()
-
-                    if self.control.should_log:
-                        self.log({
-                            "eval_oom_event": 1.0,
-                            "eval_oom_attempt": float(attempt),
-                            "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
-                            "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
-                            "eval_changed_limits": float(changed),
-                        })
-
-                    if not changed:
-                        break
-
-                finally:
-                    try:
-                        self.model.config.use_cache = orig_use_cache
-                    except Exception:
-                        pass
-
-            if last_err is not None:
-                if getattr(self, "oom_skip_batch_on_fail", True):
-                    if self.control.should_log:
-                        self.log({"eval_oom_skipped_batch": 1.0})
-                    continue
-                raise last_err
-
+        # Flush any remaining accumulated batches after the loop ends
+        if _gen_buffer:
+            _flush_gen_buffer()
 
         # Note: metrics are computed in the finalize section below using metric_state
 
