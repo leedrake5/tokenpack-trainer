@@ -910,7 +910,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
     @staticmethod
     def _concat_eval_batches(batches: list) -> dict:
-        """Concatenate a list of batch dicts along the batch (first) dimension."""
+        """Concatenate a list of batch dicts along the batch (first) dimension.
+
+        Handles variable sequence lengths across batches (from dynamic padding)
+        by right-padding shorter batches to the maximum length before concat.
+        """
         if len(batches) == 1:
             return batches[0]
         merged = {}
@@ -919,7 +923,29 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if not vals:
                 continue
             if isinstance(vals[0], torch.Tensor) and vals[0].ndim >= 1:
-                merged[k] = torch.cat(vals, dim=0)
+                # Check if non-batch dimensions match across all batches
+                shapes = [v.shape[1:] for v in vals]
+                if all(s == shapes[0] for s in shapes):
+                    merged[k] = torch.cat(vals, dim=0)
+                else:
+                    # Dynamic padding: right-pad shorter batches to max length
+                    max_shape = list(shapes[0])
+                    for s in shapes[1:]:
+                        for i, d in enumerate(s):
+                            max_shape[i] = max(max_shape[i], d)
+                    # labels pad with -100 (ignore index), everything else with 0
+                    pad_val = -100 if k == "labels" else 0
+                    padded = []
+                    for v in vals:
+                        if list(v.shape[1:]) == max_shape:
+                            padded.append(v)
+                        else:
+                            new_shape = [v.shape[0]] + max_shape
+                            p = torch.full(new_shape, pad_val, dtype=v.dtype, device=v.device)
+                            slices = [slice(None)] + [slice(0, s) for s in v.shape[1:]]
+                            p[slices] = v
+                            padded.append(p)
+                    merged[k] = torch.cat(padded, dim=0)
             else:
                 merged[k] = vals[0]
         return merged
