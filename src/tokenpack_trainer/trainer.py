@@ -1850,7 +1850,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             # ---- fast path: generate whole super-batch at once ----
             if fast_path_ok:
                 try:
-                    gpu_batch = self._prepare_inputs(super_batch)
+                    gpu_batch = self._to_device(super_batch)
                     gen_ids = _do_generate(gpu_batch)
                     _add_streaming_metrics(gen_ids, gpu_batch["labels"])
                     self._eval_on_success()
@@ -1880,7 +1880,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self.max_examples_per_microbatch = orig_max_B
 
                     for mb in microbatches:
-                        mb_gpu = self._prepare_inputs(mb)
+                        mb_gpu = self._to_device(mb)
                         gen_ids = _do_generate(mb_gpu)
                         _add_streaming_metrics(gen_ids, mb_gpu["labels"])
 
