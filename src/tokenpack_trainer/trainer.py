@@ -114,10 +114,26 @@ class CUDAPrefetcher:
                     out[k] = v
             return out
 
+        def _safe_to_device(batch):
+            """Move batch to GPU with OOM recovery.
+
+            On OOM: empty the CUDA cache to defragment reserved-but-unused
+            memory and retry once.  If that also fails, return the batch on
+            CPU — training_step will handle device placement itself.
+            """
+            try:
+                return _to_device(batch)
+            except (torch.cuda.OutOfMemoryError, RuntimeError):
+                try:
+                    torch.cuda.empty_cache()
+                    return _to_device(batch)
+                except (torch.cuda.OutOfMemoryError, RuntimeError):
+                    return batch  # stay on CPU; training_step handles it
+
         with torch.cuda.stream(self.stream):
             next_batch = next(it, None)
             if next_batch is not None:
-                next_batch = _to_device(next_batch)
+                next_batch = _safe_to_device(next_batch)
 
         while True:
             torch.cuda.current_stream().wait_stream(self.stream)
@@ -128,7 +144,7 @@ class CUDAPrefetcher:
             with torch.cuda.stream(self.stream):
                 next_batch = next(it, None)
                 if next_batch is not None:
-                    next_batch = _to_device(next_batch)
+                    next_batch = _safe_to_device(next_batch)
 
             yield batch
 
