@@ -2225,11 +2225,18 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "cudaErrorLaunchTimeout" in msg
             or "the launch timed out and was terminated" in msg
         )
-        is_accelerator_cuda_error = "CUDA error" in msg
+        _accel_err = getattr(torch, "AcceleratorError", None)
+        is_accelerator_cuda_error = (
+            "CUDA error" in msg
+            or (_accel_err is not None and isinstance(err, _accel_err))
+        )
 
         should_save = is_cuda_oom or is_launch_timeout or is_accelerator_cuda_error
         if not should_save:
             raise err
+
+        ckpt_dir = os.path.join(self.args.output_dir, "last_error_checkpoint")
+        os.makedirs(ckpt_dir, exist_ok=True)
 
         try:
             if torch.cuda.is_available():
@@ -2237,18 +2244,43 @@ class TokenPackTrainer(Seq2SeqTrainer):
         except Exception:
             pass
 
-        ckpt_dir = os.path.join(self.args.output_dir, "last_error_checkpoint")
-        os.makedirs(ckpt_dir, exist_ok=True)
-        self.save_model(ckpt_dir)
+        # After a fatal CUDA error (launch timeout, ECC error, etc.), the GPU
+        # is in an unrecoverable state — all CUDA ops will fail, including the
+        # .to("cpu") inside save_pretrained.  Move weights to CPU first so
+        # safetensors can serialize them without touching the dead GPU.
+        saved = False
+        try:
+            try:
+                self.model.to("cpu")
+            except Exception:
+                pass  # GPU might already be dead; weights may already be on CPU
+            self.save_model(ckpt_dir)
+            saved = True
+        except Exception as save_err:
+            print(f"\n[TokenPackTrainer] WARNING: emergency save failed: {save_err}")
+            # Last resort: try saving just the state_dict with torch.save
+            try:
+                state_dict = {k: v.cpu() if hasattr(v, 'cpu') else v
+                              for k, v in self.model.state_dict().items()}
+                torch.save(state_dict, os.path.join(ckpt_dir, "pytorch_model_emergency.bin"))
+                print(f"[TokenPackTrainer] Saved raw state_dict to {ckpt_dir}/pytorch_model_emergency.bin")
+                saved = True
+            except Exception as e2:
+                print(f"[TokenPackTrainer] WARNING: raw state_dict save also failed: {e2}")
 
-        if self.args.should_save:
-            self.state.save_to_json(os.path.join(ckpt_dir, "trainer_state.json"))
-            # <-- only if optimizer/scheduler actually exist
-            if self.optimizer is not None:
-                self._save_optimizer_and_scheduler(ckpt_dir)
+        if saved and self.args.should_save:
+            try:
+                self.state.save_to_json(os.path.join(ckpt_dir, "trainer_state.json"))
+                if self.optimizer is not None:
+                    self._save_optimizer_and_scheduler(ckpt_dir)
+            except Exception as state_err:
+                print(f"[TokenPackTrainer] WARNING: could not save trainer state: {state_err}")
 
-        print(f"\n[TokenPackTrainer] Saved emergency checkpoint to {ckpt_dir} "
-              f"after CUDA error: {msg}\n")
+        if saved:
+            print(f"\n[TokenPackTrainer] Saved emergency checkpoint to {ckpt_dir} "
+                  f"after CUDA error: {msg}\n")
+        else:
+            print(f"\n[TokenPackTrainer] CUDA error occurred but emergency save failed: {msg}\n")
 
         raise err
         
@@ -2256,9 +2288,18 @@ class TokenPackTrainer(Seq2SeqTrainer):
     # OOM-aware wrappers around train/evaluate
     # --------------------------------------------------------------
     def train(self, *args, **kwargs):
+        # Catch CUDA errors (OOM, launch timeout, ECC) for emergency checkpoint.
+        # torch.AcceleratorError (PyTorch ≥2.3) wraps fatal CUDA errors and may
+        # not be a RuntimeError subclass, so catch it explicitly if available.
+        _catch = [torch.cuda.OutOfMemoryError, RuntimeError]
+        _accel_err = getattr(torch, "AcceleratorError", None)
+        if _accel_err is not None:
+            _catch.append(_accel_err)
+        _catch = tuple(_catch)
+
         try:
             return super().train(*args, **kwargs)
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as err:
+        except _catch as err:
             # Let _handle_oom_and_save decide whether to checkpoint
             return self._handle_oom_and_save(err, reason="train")
 
