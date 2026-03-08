@@ -168,6 +168,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
     Adaptive OOM Parameters:
     ------------------------
+    decoder_cost_multiplier : float
+        Multiplier for decoder tokens in the effective length formula
+        (eff = enc_len + alpha * dec_len). Higher values allocate more memory
+        budget per decoder token. Default: "auto" (auto-detected from model
+        vocab_size: 2.0 for vocab ≤ 64K, scales up for larger vocabs like
+        Gemma2's 256K).
+
     oom_max_retries : int
         Max retry attempts on OOM before skipping batch. Default: 3.
 
@@ -213,6 +220,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         use_cpu_microbatch: bool = True,
         eval_mode: str | None = None,  #use classic hf or switch to "token_aware_metrics" to use token packing
         debug: bool = False,
+        decoder_cost_multiplier: float | str = "auto",  # "auto" = detect from vocab_size; or set manually (e.g. 8.0 for 256K vocab)
         oom_max_retries: int = 3,
         oom_shrink_B: float = 0.5,           # halve B on OOM
         oom_shrink_tokens: float = 0.85,     # then shrink token budget
@@ -252,6 +260,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
         )
         self.eval_mode = self._normalize_eval_mode(eval_mode)
         self.debug = debug
+        # --- Decoder cost multiplier (alpha) ---
+        # Auto-detect from model vocab_size: large vocabs (e.g. Gemma2 256K)
+        # make the lm_head output tensor dominant, so decoder tokens cost much
+        # more than encoder tokens. alpha=2.0 is fine for ≤64K vocab.
+        self.decoder_cost_multiplier = self._resolve_decoder_cost_multiplier(decoder_cost_multiplier)
+
         self.oom_max_retries = int(oom_max_retries)
         self.oom_shrink_B = float(oom_shrink_B)
         self.oom_shrink_tokens = float(oom_shrink_tokens)
@@ -334,6 +348,38 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         # Validate parameter combinations
         self._validate_params()
+
+    def _resolve_decoder_cost_multiplier(self, value) -> float:
+        """Resolve decoder_cost_multiplier: auto-detect from vocab_size or use explicit value."""
+        if value != "auto":
+            return float(value)
+
+        # Auto-detect from model's vocab_size
+        vocab_size = 0
+        model = getattr(self, "model", None)
+        if model is not None:
+            config = getattr(model, "config", None)
+            if config is not None:
+                vocab_size = getattr(config, "vocab_size", 0)
+
+        if vocab_size <= 0:
+            alpha = 2.0
+        elif vocab_size <= 64_000:
+            alpha = 2.0      # Standard T5/mT5 (~32K vocab)
+        elif vocab_size <= 128_000:
+            alpha = 4.0      # Large vocab
+        else:
+            # Very large vocab (e.g. Gemma2 256K): lm_head output dominates
+            # Scale roughly as sqrt(vocab / 32K) to avoid being too aggressive
+            alpha = min(16.0, 2.0 * (vocab_size / 32_000) ** 0.5)
+
+        if vocab_size > 64_000:
+            print(
+                f"[TokenPackTrainer] Auto-detected vocab_size={vocab_size:,}, "
+                f"setting decoder_cost_multiplier={alpha:.1f} "
+                f"(override with decoder_cost_multiplier=<float>)"
+            )
+        return alpha
 
     def _load_builtin_metrics(self):
         """Load metric objects once at init with logging suppressed."""
@@ -672,7 +718,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
     def _regime_key_from_lengths(self, enc_len, dec_len) -> int:
         """Compute regime key from precomputed lengths (avoids redundant recomputation)."""
-        alpha = 2.0
+        alpha = self.decoder_cost_multiplier
         eff = enc_len + alpha * dec_len
         mx = int(eff.max().item()) if eff.numel() else 0
         bs = int(self._regime_bucket_size)
@@ -847,17 +893,19 @@ class TokenPackTrainer(Seq2SeqTrainer):
             except Exception:
                 pass
 
-        # Clear CUDA allocator state
-        try:
-            import gc
-            gc.collect()
-        except Exception:
-            pass
+        # Free CUDA memory quickly: empty cache first (fast), then do a
+        # lightweight gc pass. Full gc.collect() can take 10+ seconds after
+        # a massive failed allocation and is interruptible by Ctrl+C.
         if torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
+        try:
+            import gc
+            gc.collect(0)  # generation-0 only — fast, catches recent allocations
+        except Exception:
+            pass
 
     def _oom_shrink_limits(self):
         """
@@ -884,6 +932,35 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     changed = True
 
         return changed
+
+    def _estimate_lm_head_bytes(self, mb: dict) -> int:
+        """Estimate the lm_head output tensor size in bytes for a microbatch.
+
+        Returns 0 if vocab_size is unavailable (pre-flight check disabled).
+        The lm_head output is [B, dec_len, vocab_size] which can dominate GPU
+        memory for large-vocabulary models (e.g. Gemma2 256K vocab).
+        """
+        config = getattr(self.model, "config", None)
+        if config is None:
+            return 0
+        vocab_size = getattr(config, "vocab_size", 0)
+        if vocab_size <= 0:
+            return 0
+
+        B = mb["input_ids"].size(0) if "input_ids" in mb else 0
+        if B == 0:
+            return 0
+
+        labels = mb.get("labels", None)
+        if labels is None or not isinstance(labels, torch.Tensor) or labels.ndim != 2:
+            return 0
+
+        # dec_len after compact = max non-padding label count across batch
+        dec_max = int((labels != -100).sum(dim=-1).max().item())
+
+        # bf16/fp16 = 2 bytes, fp32 = 4 bytes
+        dtype_bytes = 2 if (self.args.bf16 or self.args.fp16) else 4
+        return B * dec_max * vocab_size * dtype_bytes
 
     def _compact_microbatch(self, mb: dict) -> dict:
         # Trim encoder side to max attention_mask sum in this microbatch
@@ -1273,7 +1350,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         else:
             enc_len, dec_len, _ = self._compute_lengths_enc_dec(inputs)
 
-        alpha = 2.0
+        alpha = self.decoder_cost_multiplier
         # When planning microbatches for generation, use generation_max_length
         # instead of label length — KV cache grows to gen_max, not to dec_len.
         if generation_max_length is not None:
@@ -2355,7 +2432,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         else:
             dec_len = (labels != -100).sum(dim=-1)
 
-        eff = enc_len + 2.0 * dec_len
+        eff = enc_len + self.decoder_cost_multiplier * dec_len
         mx = int(eff.max().item())  # <-- scalar sync only
         bs = int(self._regime_bucket_size)
         return int((mx + bs - 1) // bs) if bs > 0 else mx
@@ -2428,7 +2505,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     microbatches, enc_len, dec_len = self._make_microbatches(
                         inputs_work, return_lengths=True, precomputed_lengths=(enc_len, dec_len))
 
-                eff_tokens = int((enc_len + 2.0 * dec_len).sum().item())
+                eff_tokens = int((enc_len + self.decoder_cost_multiplier * dec_len).sum().item())
 
                 num_micro = max(len(microbatches), 1)
                 total_loss = 0.0
@@ -2459,6 +2536,21 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                     if self.length_column_name in mb:
                         mb = {k: v for k, v in mb.items() if k != self.length_column_name}
+
+                    # Pre-flight check: estimate lm_head output size and raise
+                    # OOM preemptively if it would exceed available GPU memory.
+                    # This avoids slow CUDA OOM recovery for massive allocations
+                    # (e.g. 76 GiB for a 256K-vocab model).
+                    lm_bytes = self._estimate_lm_head_bytes(mb)
+                    if lm_bytes > 0 and torch.cuda.is_available():
+                        dev = self.args.device
+                        free = torch.cuda.get_device_properties(dev).total_memory - torch.cuda.memory_allocated(dev)
+                        if lm_bytes > free * 0.85:
+                            raise torch.cuda.OutOfMemoryError(
+                                f"[TokenPackTrainer] Pre-flight: lm_head output would need "
+                                f"{lm_bytes / (1 << 30):.1f} GiB but only "
+                                f"{free / (1 << 30):.1f} GiB free (skipping to OOM recovery)"
+                            )
 
                     with self.compute_loss_context_manager():
                         loss_mb = self.compute_loss(model, mb)   # mean over tokens in this mb
