@@ -274,6 +274,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if max_eval_tokens_per_microbatch is not None
             else self.max_tokens_per_microbatch
         )
+        # Preserve the user's initial eval budget so evaluate() can restore it
+        # (training regime management may ratchet it down via _apply_regime_limits)
+        self._initial_eval_tokens_per_microbatch = self.max_eval_tokens_per_microbatch
         self.eval_mode = self._normalize_eval_mode(eval_mode)
         self.debug = debug
         # --- Decoder cost multiplier (alpha) ---
@@ -779,9 +782,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         self.max_examples_per_microbatch = st["B"]
         self.max_tokens_per_microbatch = T
-        # keep eval budget <= train budget
-        if getattr(self, "max_eval_tokens_per_microbatch", None) is not None:
-            self.max_eval_tokens_per_microbatch = min(self.max_eval_tokens_per_microbatch, self.max_tokens_per_microbatch)
+        # NOTE: do NOT clamp max_eval_tokens_per_microbatch here.
+        # Training regimes vary per sequence-length bucket; clamping eval to
+        # the current regime's T ratchets the eval budget down to the minimum
+        # T across all regimes (a one-way trip). Eval budgets are managed
+        # independently — restored at the start of each evaluate() call.
 
     INT64_MAX = (1 << 63) - 1
 
@@ -953,8 +958,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 new_T = max(self.oom_min_tokens, int(self.max_tokens_per_microbatch * self.oom_shrink_tokens))
                 if new_T < self.max_tokens_per_microbatch:
                     self.max_tokens_per_microbatch = new_T
-                    # keep eval consistent-ish
-                    self.max_eval_tokens_per_microbatch = min(self.max_eval_tokens_per_microbatch, self.max_tokens_per_microbatch)
                     changed = True
 
         return changed
@@ -2375,6 +2378,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
         eval_dataset = eval_dataset or self.eval_dataset
         if eval_dataset is None:
             raise ValueError("Evaluation requires an eval_dataset.")
+
+        # Restore eval budget to the user's initial value.  Training regime
+        # management used to clamp this down as a side-effect; even with that
+        # removed, eval OOM handling within a single pass may have shrunk it.
+        # Each eval pass should start fresh — eval has more VRAM headroom than
+        # training (no gradients, optimizer states offloaded).
+        if hasattr(self, "_initial_eval_tokens_per_microbatch"):
+            self.max_eval_tokens_per_microbatch = self._initial_eval_tokens_per_microbatch
 
         requested = eval_mode if eval_mode is not None else getattr(self, "eval_mode", None)
         mode = self._normalize_eval_mode(requested)
