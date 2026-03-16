@@ -2467,6 +2467,26 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 out[k] = v
         return out
 
+    def _get_num_items_in_batch(self, batch_samples, device=None):
+        """
+        Override HF's _get_num_items_in_batch to compute on CPU.
+
+        HF's default runs batch["labels"].ne(-100) on whatever device the
+        labels live on.  With use_cpu_microbatch=False the CUDAPrefetcher has
+        already moved labels to GPU, so this tiny allocation can OOM when
+        VRAM is fragmented.  Moving to CPU first is essentially free and
+        makes it impossible to OOM here.
+        """
+        total = 0
+        for batch in batch_samples:
+            labels = batch.get("labels")
+            if labels is None:
+                continue
+            if labels.is_cuda:
+                labels = labels.cpu()
+            total += int(labels.ne(-100).sum().item())
+        return total
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         """
         Compute loss, filtering out length column and ensuring contiguous tensors.
