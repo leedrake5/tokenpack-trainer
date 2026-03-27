@@ -1223,37 +1223,30 @@ class TokenPackTrainer(Seq2SeqTrainer):
         dec_cap = self.max_decoder_len
         alpha = self.decoder_cost_multiplier
 
-        # Try to get decoder lengths from labels column
+        # Try to get decoder lengths from labels column (vectorized for speed)
         dec_lengths = None
         if alpha > 1.0:
             try:
+                import numpy as np
                 if hasattr(ds, "column_names") and "labels" in ds.column_names:
-                    # Fast path: read all labels at once, count non-padding tokens
                     all_labels = ds["labels"]
-                    dec_lengths = []
-                    for lab in all_labels:
-                        if isinstance(lab, (list, tuple)):
-                            dlen = sum(1 for t in lab if t != -100)
-                        else:
-                            # tensor
-                            dlen = int(sum(1 for t in lab if t != -100))
+                    # HF datasets return list-of-lists; try numpy for speed
+                    try:
+                        # Fixed-length labels (all same shape) — fast path
+                        lab_arr = np.array(all_labels)
+                        dec_lengths = (lab_arr != -100).sum(axis=-1)
                         if dec_cap is not None:
-                            dlen = min(dlen, dec_cap)
-                        dec_lengths.append(dlen)
-                elif hasattr(ds, "__getitem__"):
-                    dec_lengths = []
-                    for i in range(len(ds)):
-                        lab = ds[i].get("labels")
-                        if lab is not None:
-                            if isinstance(lab, (list, tuple)):
-                                dlen = sum(1 for t in lab if t != -100)
-                            else:
-                                dlen = int(sum(1 for t in lab if t != -100))
+                            dec_lengths = np.minimum(dec_lengths, dec_cap)
+                        dec_lengths = dec_lengths.tolist()
+                    except (ValueError, TypeError):
+                        # Ragged labels — per-row numpy, still much faster than pure Python
+                        dec_lengths = []
+                        for lab in all_labels:
+                            arr = np.asarray(lab)
+                            dlen = int((arr != -100).sum())
                             if dec_cap is not None:
                                 dlen = min(dlen, dec_cap)
-                        else:
-                            dlen = 0
-                        dec_lengths.append(dlen)
+                            dec_lengths.append(dlen)
             except Exception as e:
                 logger.warning(f"[TokenPackTrainer] Could not compute decoder lengths for sampler: {e}")
                 dec_lengths = None
@@ -2801,6 +2794,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         model.train()
+        _t0 = time.time()  # step-level timing
 
         # turn off KV cache during training to reduce memory spikes
         if hasattr(model, "config") and getattr(model.config, "use_cache", None) is True:
@@ -2871,6 +2865,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         inputs_work, return_lengths=True, precomputed_lengths=(enc_len, dec_len))
 
                 eff_tokens = int((enc_len + self.decoder_cost_multiplier * dec_len).sum().item())
+                _t_plan = time.time()  # planning done
 
                 # --- Cap microbatches per step ---
                 # If a shrunken regime would produce too many tiny microbatches,
@@ -2947,6 +2942,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
                                     f"{free / (1 << 30):.1f} GiB free (skipping to OOM recovery)"
                                 )
 
+                _t_pre = time.time()  # pre-flight done
+
                 # Use prefetching iterator to overlap CPU→GPU transfer with computation
                 prefetched = self._prefetch_microbatches(microbatches) if self.use_cpu_microbatch else iter(microbatches)
 
@@ -3005,6 +3002,40 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         "max_B_now": float(self.max_examples_per_microbatch or 0),
                         "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
                     })
+
+                # --- Step timing (log every 100 steps) ---
+                _t_end = time.time()
+                _step_count = getattr(self, "_timing_step_count", 0) + 1
+                self._timing_step_count = _step_count
+                _plan_ms = (_t_plan - _t0) * 1000
+                _exec_ms = (_t_end - _t_pre) * 1000
+                _total_ms = (_t_end - _t0) * 1000
+
+                # Accumulate for averaging
+                if not hasattr(self, "_timing_accum"):
+                    self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
+                                          "examples": 0, "tokens": 0, "microbatches": 0}
+                ta = self._timing_accum
+                ta["plan"] += _plan_ms
+                ta["exec"] += _exec_ms
+                ta["total"] += _total_ms
+                ta["n"] += 1
+                ta["examples"] += total_examples
+                ta["tokens"] += total_tokens
+                ta["microbatches"] += num_micro
+
+                if ta["n"] >= 100:
+                    n = ta["n"]
+                    logger.info(
+                        f"[TokenPackTrainer] Step timing (avg of {n}): "
+                        f"plan={ta['plan']/n:.1f}ms, exec={ta['exec']/n:.1f}ms, "
+                        f"total={ta['total']/n:.1f}ms | "
+                        f"examples/step={ta['examples']/n:.0f}, "
+                        f"tokens/step={ta['tokens']/n:.0f}, "
+                        f"microbatches/step={ta['microbatches']/n:.1f}"
+                    )
+                    self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
+                                          "examples": 0, "tokens": 0, "microbatches": 0}
 
                 # Return a sane scalar for logging
                 return total_loss_weighted
