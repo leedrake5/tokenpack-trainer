@@ -248,6 +248,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
         sampler_shuffle_mode: str = "interleave",  # "bucket" = sequential buckets, "interleave" = global batch shuffle across buckets
         padding_aware_budget: bool = False,  # if True, budget by max_len * num_examples (actual memory) vs sum of lengths
         regime_max_B: int | None = None,  # max examples per microbatch the regime can ramp to (None = auto from token budget)
+        regime_ramp_every: int | str = "auto",       # ramp limits after N consecutive successes ("auto" = VRAM-scaled)
+        regime_ramp_B: float | str = "auto",         # factor to increase B on ramp ("auto" = VRAM-scaled)
+        regime_ramp_T: float | str = "auto",         # factor to increase T on ramp ("auto" = VRAM-scaled)
+        autotune_safety: float | str = "auto",       # safety factor for autotune (0-1, "auto" = VRAM-scaled)
+        autotune_oom_safety: float | str = "auto",   # safety factor after OOM ("auto" = VRAM-scaled)
+        eval_ramp_every: int | str = "auto",         # eval: ramp T after N successes ("auto" = VRAM-scaled)
+        eval_ramp_T: float | str = "auto",           # eval: factor to increase T on ramp ("auto" = VRAM-scaled)
         max_eval_generate_examples: int | None = None,  # max examples per generate call (None = no limit, uses token budget only)
         builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
         builtin_metrics_tokenize: str = "13a",
@@ -298,16 +305,32 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self._oom_events = 0           # Total OOM events across all batches
         self._oom_skipped_batches = 0  # Batches skipped after exhausting retries
 
+        # --- VRAM-aware adaptive defaults ---
+        vram_gb = self._detect_vram_gb()
+        self._vram_gb = vram_gb
+
         # --- Adaptive Regime Management ---
         # Regimes group sequences by length to learn stable microbatch limits.
         # Key = bucket of max effective length, Value = {"B": batch_size, "T": token_budget, "stable": success_count}
         self._regime_limits = {}
         self._regime_bucket_size = 128   # Bucket width in tokens (groups similar lengths)
-        self._regime_ramp_every = 4      # Ramp limits after N consecutive successes
-        self._regime_ramp_B = 1.25       # Factor to increase B on ramp
-        self._regime_ramp_T = 1.10       # Factor to increase T on ramp
+        self._regime_ramp_every = self._vram_default(regime_ramp_every, self._vram_ramp_every, int)
+        self._regime_ramp_B = self._vram_default(regime_ramp_B, self._vram_ramp_B, float)
+        self._regime_ramp_T = self._vram_default(regime_ramp_T, self._vram_ramp_T, float)
+        self._autotune_safety = self._vram_default(autotune_safety, self._vram_autotune_safety, float)
+        self._autotune_oom_safety = self._vram_default(autotune_oom_safety, self._vram_autotune_oom_safety, float)
+        self._eval_ramp_every = self._vram_default(eval_ramp_every, self._vram_eval_ramp_every, int)
+        self._eval_ramp_T = self._vram_default(eval_ramp_T, self._vram_eval_ramp_T, float)
         self._regime_min_B = getattr(self, "oom_min_B", 1)
         self._regime_min_T = getattr(self, "oom_min_tokens", 64)
+
+        if self.debug or vram_gb > 0:
+            logger.info(
+                f"[TokenPackTrainer] VRAM={vram_gb:.0f}GB — regime_ramp_every={self._regime_ramp_every}, "
+                f"ramp_B={self._regime_ramp_B:.2f}, ramp_T={self._regime_ramp_T:.2f}, "
+                f"autotune_safety={self._autotune_safety:.2f}, oom_safety={self._autotune_oom_safety:.2f}, "
+                f"eval_ramp_every={self._eval_ramp_every}, eval_ramp_T={self._eval_ramp_T:.2f}"
+            )
 
         # Initial values for new regimes (from user config)
         self._regime_default_B = self.max_examples_per_microbatch
@@ -745,6 +768,94 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return "token_aware_metrics"
         return m
 
+    # ------------------------------------------------------------------
+    # VRAM-aware adaptive defaults
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_vram_gb() -> float:
+        """Return total VRAM in GB for the first CUDA device, or 0 if unavailable."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(0)
+                return props.total_memory / (1 << 30)
+        except Exception:
+            pass
+        return 0.0
+
+    @staticmethod
+    def _vram_default(user_value, auto_fn, cast):
+        """Resolve 'auto' to a VRAM-scaled default, or use the user's explicit value."""
+        if isinstance(user_value, str) and user_value.lower() == "auto":
+            return cast(auto_fn())
+        return cast(user_value)
+
+    def _vram_ramp_every(self) -> int:
+        """Ramp every N successes. Larger VRAM → more aggressive (fewer successes needed).
+        >=80GB: 2,  48-80GB: 3,  24-48GB: 4,  <24GB: 6"""
+        v = self._vram_gb
+        if v >= 80:   return 2
+        if v >= 48:   return 3
+        if v >= 24:   return 4
+        return 6
+
+    def _vram_ramp_B(self) -> float:
+        """B ramp factor. Larger VRAM → more aggressive ramp.
+        >=80GB: 1.4,  48-80GB: 1.30,  24-48GB: 1.25,  <24GB: 1.15"""
+        v = self._vram_gb
+        if v >= 80:   return 1.40
+        if v >= 48:   return 1.30
+        if v >= 24:   return 1.25
+        return 1.15
+
+    def _vram_ramp_T(self) -> float:
+        """T ramp factor. Larger VRAM → more aggressive ramp.
+        >=80GB: 1.20,  48-80GB: 1.15,  24-48GB: 1.10,  <24GB: 1.05"""
+        v = self._vram_gb
+        if v >= 80:   return 1.20
+        if v >= 48:   return 1.15
+        if v >= 24:   return 1.10
+        return 1.05
+
+    def _vram_autotune_safety(self) -> float:
+        """Normal autotune safety factor. Larger VRAM → tighter fill.
+        >=80GB: 0.92,  48-80GB: 0.90,  24-48GB: 0.88,  <24GB: 0.85"""
+        v = self._vram_gb
+        if v >= 80:   return 0.92
+        if v >= 48:   return 0.90
+        if v >= 24:   return 0.88
+        return 0.85
+
+    def _vram_autotune_oom_safety(self) -> float:
+        """Post-OOM autotune safety factor. Larger VRAM → less conservative.
+        >=80GB: 0.85,  48-80GB: 0.80,  24-48GB: 0.75,  <24GB: 0.70"""
+        v = self._vram_gb
+        if v >= 80:   return 0.85
+        if v >= 48:   return 0.80
+        if v >= 24:   return 0.75
+        return 0.70
+
+    def _vram_eval_ramp_every(self) -> int:
+        """Eval ramp every N successes. Larger VRAM → faster recovery.
+        >=80GB: 10,  48-80GB: 20,  24-48GB: 30,  <24GB: 50"""
+        v = self._vram_gb
+        if v >= 80:   return 10
+        if v >= 48:   return 20
+        if v >= 24:   return 30
+        return 50
+
+    def _vram_eval_ramp_T(self) -> float:
+        """Eval T ramp factor. Larger VRAM → more aggressive.
+        >=80GB: 1.10,  48-80GB: 1.08,  24-48GB: 1.05,  <24GB: 1.03"""
+        v = self._vram_gb
+        if v >= 80:   return 1.10
+        if v >= 48:   return 1.08
+        if v >= 24:   return 1.05
+        return 1.03
+
+    # ------------------------------------------------------------------
+
     def _regime_key_from_lengths(self, enc_len, dec_len) -> int:
         """Compute regime key from precomputed lengths (avoids redundant recomputation)."""
         alpha = self.decoder_cost_multiplier
@@ -862,6 +973,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "oom_events": getattr(self, "_oom_events", 0),
             "oom_skipped_batches": getattr(self, "_oom_skipped_batches", 0),
             "regime_bucket_size": getattr(self, "_regime_bucket_size", None),
+            "vram_gb": getattr(self, "_vram_gb", 0),
+            "regime_ramp_every": self._regime_ramp_every,
+            "regime_ramp_B": self._regime_ramp_B,
+            "regime_ramp_T": self._regime_ramp_T,
+            "autotune_safety": self._autotune_safety,
+            "autotune_oom_safety": self._autotune_oom_safety,
+            "eval_ramp_every": self._eval_ramp_every,
+            "eval_ramp_T": self._eval_ramp_T,
         }
 
     def _autotune_regime_from_peak(self, key: int, eff_tokens_in_step: int, safety: float = 0.90):
@@ -1752,8 +1871,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if self.max_eval_tokens_per_microbatch is None:
             return
 
-        ramp_every = 50
-        ramp_T = 1.05  # +5%
+        ramp_every = self._eval_ramp_every
+        ramp_T = self._eval_ramp_T
         max_T_cap = getattr(self, "max_tokens_per_microbatch", None)  # never exceed train budget if set
 
         if (self._eval_stable % ramp_every) == 0:
@@ -2677,7 +2796,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     st = self._regime_state(regime_key)
                     oom_history = getattr(self, "_regime_oom_count", {})
                     recent_oom = oom_history.get(regime_key, 0) > 0
-                    safety = 0.75 if recent_oom else 0.90
+                    safety = self._autotune_oom_safety if recent_oom else self._autotune_safety
                     self._autotune_regime_from_peak(regime_key, eff_tokens, safety=safety)
                     self._autotuned_keys = getattr(self, "_autotuned_keys", set())
                     self._autotuned_keys.add(regime_key)
