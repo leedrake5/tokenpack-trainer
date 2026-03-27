@@ -256,6 +256,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         autotune_oom_safety: float | str = "auto",   # safety factor after OOM ("auto" = VRAM-scaled)
         eval_ramp_every: int | str = "auto",         # eval: ramp T after N successes ("auto" = VRAM-scaled)
         eval_ramp_T: float | str = "auto",           # eval: factor to increase T on ramp ("auto" = VRAM-scaled)
+        max_microbatches_per_step: int = 8,              # cap microbatches per step; if exceeded, budget is bumped for the step
         max_eval_generate_examples: int | None = None,  # max examples per generate call (None = no limit, uses token budget only)
         builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
         builtin_metrics_tokenize: str = "13a",
@@ -301,6 +302,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.oom_skip_batch_on_fail = bool(oom_skip_batch_on_fail)
         self.sampler_bucket_size = int(sampler_bucket_size)
         self.sampler_shuffle_mode = str(sampler_shuffle_mode)
+        self.max_microbatches_per_step = int(max_microbatches_per_step)
 
         # --- OOM tracking ---
         self._oom_events = 0           # Total OOM events across all batches
@@ -982,6 +984,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "autotune_oom_safety": self._autotune_oom_safety,
             "eval_ramp_every": self._eval_ramp_every,
             "eval_ramp_T": self._eval_ramp_T,
+            "max_microbatches_per_step": self.max_microbatches_per_step,
         }
 
     def _autotune_regime_from_peak(self, key: int, eff_tokens_in_step: int, safety: float = 0.90):
@@ -1201,7 +1204,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if to_remove:
                 ds = ds.remove_columns(to_remove)
 
-        # lengths used by sampler
+        # lengths used by sampler — compute EFFECTIVE lengths (enc + α × dec)
+        # so the sampler's token budget matches the microbatch planner's cost model.
+        # Without this, the sampler packs by encoder-only lengths, creating batches
+        # that are much larger than the microbatch budget when decoder cost is high
+        # (e.g. α=5.66 for 256K vocab), resulting in 20-30 microbatches per step.
         if hasattr(ds, "column_names"):
             if self.length_column_name not in ds.column_names:
                 raise ValueError(
@@ -1212,10 +1219,69 @@ class TokenPackTrainer(Seq2SeqTrainer):
         else:
             raw_lengths = [ds[i][self.length_column_name] for i in range(len(ds))]
 
-        if self.max_encoder_len is not None:
-            lengths_for_sampler = [min(int(L), self.max_encoder_len) for L in raw_lengths]
+        enc_cap = self.max_encoder_len
+        dec_cap = self.max_decoder_len
+        alpha = self.decoder_cost_multiplier
+
+        # Try to get decoder lengths from labels column
+        dec_lengths = None
+        if alpha > 1.0:
+            try:
+                if hasattr(ds, "column_names") and "labels" in ds.column_names:
+                    # Fast path: read all labels at once, count non-padding tokens
+                    all_labels = ds["labels"]
+                    dec_lengths = []
+                    for lab in all_labels:
+                        if isinstance(lab, (list, tuple)):
+                            dlen = sum(1 for t in lab if t != -100)
+                        else:
+                            # tensor
+                            dlen = int(sum(1 for t in lab if t != -100))
+                        if dec_cap is not None:
+                            dlen = min(dlen, dec_cap)
+                        dec_lengths.append(dlen)
+                elif hasattr(ds, "__getitem__"):
+                    dec_lengths = []
+                    for i in range(len(ds)):
+                        lab = ds[i].get("labels")
+                        if lab is not None:
+                            if isinstance(lab, (list, tuple)):
+                                dlen = sum(1 for t in lab if t != -100)
+                            else:
+                                dlen = int(sum(1 for t in lab if t != -100))
+                            if dec_cap is not None:
+                                dlen = min(dlen, dec_cap)
+                        else:
+                            dlen = 0
+                        dec_lengths.append(dlen)
+            except Exception as e:
+                logger.warning(f"[TokenPackTrainer] Could not compute decoder lengths for sampler: {e}")
+                dec_lengths = None
+
+        if dec_lengths is not None:
+            lengths_for_sampler = []
+            for enc_L, dec_L in zip(raw_lengths, dec_lengths):
+                enc = min(int(enc_L), enc_cap) if enc_cap is not None else int(enc_L)
+                eff = int(enc + alpha * dec_L)
+                lengths_for_sampler.append(eff)
+            logger.info(
+                f"[TokenPackTrainer] Sampler using effective lengths (enc + {alpha:.1f}×dec), "
+                f"mean_eff={sum(lengths_for_sampler)/max(len(lengths_for_sampler),1):.0f}"
+            )
         else:
-            lengths_for_sampler = [int(L) for L in raw_lengths]
+            if enc_cap is not None:
+                lengths_for_sampler = [min(int(L), enc_cap) for L in raw_lengths]
+            else:
+                lengths_for_sampler = [int(L) for L in raw_lengths]
+
+        # max_length_in_batch: scale by alpha if using effective lengths,
+        # so the sampler's length cap matches the microbatch planner's cap.
+        sampler_max_len = None
+        if enc_cap is not None:
+            if dec_lengths is not None and dec_cap is not None:
+                sampler_max_len = int(enc_cap + alpha * dec_cap)
+            else:
+                sampler_max_len = enc_cap
 
         batch_sampler = LengthBucketedBatchSampler(
             lengths=lengths_for_sampler,
@@ -1224,7 +1290,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             shuffle=True,
             drop_last=False,
             long_behavior="truncate",
-            max_length_in_batch=self.max_encoder_len,
+            max_length_in_batch=sampler_max_len,
             shuffle_mode=self.sampler_shuffle_mode,
         )
 
@@ -2746,7 +2812,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # We take the MAX across the first few steps because Adam optimizer states
         # are allocated lazily after the first optimizer.step() (which runs after
         # training_step returns), so step 0 baseline only has model weights.
-        if torch.cuda.is_available():
+        # After step 5, baseline is stable — skip the memory_allocated() sync.
+        _step = getattr(self, "state", None)
+        _global_step = getattr(_step, "global_step", 0) if _step else 0
+        if torch.cuda.is_available() and _global_step <= 5:
             current_mem = torch.cuda.memory_allocated(self.args.device)
             if self._gpu_baseline_mem is None or current_mem > self._gpu_baseline_mem:
                 old_baseline = self._gpu_baseline_mem
@@ -2803,6 +2872,31 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 eff_tokens = int((enc_len + self.decoder_cost_multiplier * dec_len).sum().item())
 
+                # --- Cap microbatches per step ---
+                # If a shrunken regime would produce too many tiny microbatches,
+                # bump the budget for THIS step and re-plan.  The OOM retry loop
+                # provides safety: if the larger budget OOMs, the regime shrinks
+                # and the next attempt retries with the smaller budget.
+                _max_mb = self.max_microbatches_per_step
+                if _max_mb > 0 and len(microbatches) > _max_mb:
+                    # Compute the budget that would yield ~max_mb microbatches
+                    step_T = max(
+                        int(eff_tokens / _max_mb) + 1,
+                        self.max_tokens_per_microbatch,
+                    )
+                    microbatches, enc_len, dec_len = self._make_microbatches(
+                        inputs_work,
+                        max_tokens_per_microbatch=step_T,
+                        return_lengths=True,
+                        precomputed_lengths=(enc_len, dec_len),
+                    )
+                    if self.debug:
+                        logger.info(
+                            f"[TokenPackTrainer] Microbatch cap: regime T={self.max_tokens_per_microbatch} "
+                            f"would produce {_max_mb}+ microbatches, bumped to T={step_T} "
+                            f"→ {len(microbatches)} microbatches for this step"
+                        )
+
                 num_micro = max(len(microbatches), 1)
                 total_loss = 0.0
                 total_examples = sum(mb["input_ids"].size(0) for mb in microbatches)
@@ -2835,6 +2929,24 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 total_loss_weighted = 0.0
 
+                # Pre-flight check: run ONCE per step using the worst-case
+                # microbatch (max lm_tok) to avoid GPU sync stalls in the hot
+                # loop.  memory_allocated() forces a GPU sync, so calling it
+                # per-microbatch tanks throughput on fast models.
+                if _need_lm_check and mb_lm_head_tokens and torch.cuda.is_available():
+                    max_lm_tok = max(mb_lm_head_tokens)
+                    if max_lm_tok > 0:
+                        lm_bytes = self._estimate_lm_head_bytes(max_lm_tok)
+                        if lm_bytes > 0:
+                            dev = self.args.device
+                            free = torch.cuda.get_device_properties(dev).total_memory - torch.cuda.memory_allocated(dev)
+                            if lm_bytes > free * 0.85:
+                                raise torch.cuda.OutOfMemoryError(
+                                    f"[TokenPackTrainer] Pre-flight: lm_head output would need "
+                                    f"{lm_bytes / (1 << 30):.1f} GiB but only "
+                                    f"{free / (1 << 30):.1f} GiB free (skipping to OOM recovery)"
+                                )
+
                 # Use prefetching iterator to overlap CPU→GPU transfer with computation
                 prefetched = self._prefetch_microbatches(microbatches) if self.use_cpu_microbatch else iter(microbatches)
 
@@ -2846,21 +2958,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                     if self.length_column_name in mb:
                         mb = {k: v for k, v in mb.items() if k != self.length_column_name}
-
-                    # Pre-flight check (large-vocab models only, e.g. Gemma2 256K):
-                    # estimate lm_head output size using CPU-side counts (no GPU sync).
-                    # Skipped entirely for ≤64K vocab models (_lm_head_vocab_size == 0).
-                    if self._lm_head_vocab_size > 0 and lm_tok > 0 and torch.cuda.is_available():
-                        lm_bytes = self._estimate_lm_head_bytes(lm_tok)
-                        if lm_bytes > 0:
-                            dev = self.args.device
-                            free = torch.cuda.get_device_properties(dev).total_memory - torch.cuda.memory_allocated(dev)
-                            if lm_bytes > free * 0.85:
-                                raise torch.cuda.OutOfMemoryError(
-                                    f"[TokenPackTrainer] Pre-flight: lm_head output would need "
-                                    f"{lm_bytes / (1 << 30):.1f} GiB but only "
-                                    f"{free / (1 << 30):.1f} GiB free (skipping to OOM recovery)"
-                                )
 
                     with self.compute_loss_context_manager():
                         loss_mb = self.compute_loss(model, mb)   # mean over tokens in this mb
