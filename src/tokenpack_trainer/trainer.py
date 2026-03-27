@@ -43,6 +43,7 @@ Example:
     ... )
 """
 
+import json
 import os
 import time
 from typing import Any, List, Optional
@@ -2409,6 +2410,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self._save_optimizer_and_scheduler(ckpt_dir)
             except Exception as state_err:
                 print(f"[TokenPackTrainer] WARNING: could not save trainer state: {state_err}")
+            try:
+                self._save_regime_state(ckpt_dir)
+            except Exception:
+                pass
 
         if saved:
             print(f"\n[TokenPackTrainer] Saved emergency checkpoint to {ckpt_dir} "
@@ -2421,6 +2426,83 @@ class TokenPackTrainer(Seq2SeqTrainer):
     # --------------------------------------------------------------
     # OOM-aware wrappers around train/evaluate
     # --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Regime state persistence
+    # ------------------------------------------------------------------
+    REGIME_STATE_FILENAME = "regime_state.json"
+
+    def _save_regime_state(self, output_dir: str):
+        """Persist regime limits and OOM history to a checkpoint directory."""
+        state = {
+            "regime_limits": {
+                str(k): v for k, v in self._regime_limits.items()
+            },
+            "autotuned_keys": list(getattr(self, "_autotuned_keys", set())),
+            "regime_oom_count": getattr(self, "_regime_oom_count", {}),
+            "oom_events": getattr(self, "_oom_events", 0),
+            "oom_skipped_batches": getattr(self, "_oom_skipped_batches", 0),
+            "gpu_baseline_mem": getattr(self, "_gpu_baseline_mem", None),
+        }
+        path = os.path.join(output_dir, self.REGIME_STATE_FILENAME)
+        try:
+            with open(path, "w") as f:
+                json.dump(state, f, indent=2)
+            if self.debug:
+                logger.info(f"[TokenPackTrainer] Saved regime state ({len(self._regime_limits)} regimes) to {path}")
+        except Exception as e:
+            logger.warning(f"[TokenPackTrainer] Could not save regime state: {e}")
+
+    def _load_regime_state(self, checkpoint_dir: str) -> bool:
+        """Restore regime limits from a checkpoint. Returns True if loaded successfully."""
+        path = os.path.join(checkpoint_dir, self.REGIME_STATE_FILENAME)
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+
+            # Restore regime limits (keys are ints, JSON saves them as strings)
+            loaded_limits = {}
+            for k, v in state.get("regime_limits", {}).items():
+                loaded_limits[int(k)] = {
+                    "B": v.get("B"),
+                    "T": int(v["T"]),
+                    "stable": int(v.get("stable", 0)),
+                }
+            self._regime_limits = loaded_limits
+            self._autotuned_keys = set(state.get("autotuned_keys", []))
+            self._regime_oom_count = {
+                int(k): int(v) for k, v in state.get("regime_oom_count", {}).items()
+            }
+            self._oom_events = int(state.get("oom_events", 0))
+            self._oom_skipped_batches = int(state.get("oom_skipped_batches", 0))
+
+            # Restore baseline memory if available (avoids conservative first-batch autotuning)
+            baseline = state.get("gpu_baseline_mem")
+            if baseline is not None:
+                self._gpu_baseline_mem = int(baseline)
+
+            logger.info(
+                f"[TokenPackTrainer] Restored regime state from {path}: "
+                f"{len(loaded_limits)} regimes, {self._oom_events} prior OOM events"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[TokenPackTrainer] Could not load regime state from {path}: {e}")
+            return False
+
+    def _save_checkpoint(self, model, trial):
+        """Override HF Trainer to also persist regime state alongside each checkpoint."""
+        super()._save_checkpoint(model, trial)
+
+        # Determine the checkpoint dir that was just created (mirrors HF logic)
+        checkpoint_folder = f"checkpoint-{self.state.global_step}"
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+
+        if os.path.isdir(output_dir) and self.args.should_save:
+            self._save_regime_state(output_dir)
+
     def train(self, *args, **kwargs):
         # Catch CUDA errors (OOM, launch timeout, ECC) for emergency checkpoint.
         # torch.AcceleratorError (PyTorch ≥2.3) wraps fatal CUDA errors and may
@@ -2430,6 +2512,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if _accel_err is not None:
             _catch.append(_accel_err)
         _catch = tuple(_catch)
+
+        # Restore regime state from checkpoint if resuming
+        resume = kwargs.get("resume_from_checkpoint") or (args[0] if args else None)
+        if resume:
+            ckpt_dir = str(resume)
+            if isinstance(resume, bool) and resume:
+                # HF resolves True → latest checkpoint in output_dir
+                from transformers.trainer_utils import get_last_checkpoint
+                ckpt_dir = get_last_checkpoint(self.args.output_dir)
+            if ckpt_dir and os.path.isdir(ckpt_dir):
+                self._load_regime_state(ckpt_dir)
 
         try:
             return super().train(*args, **kwargs)
