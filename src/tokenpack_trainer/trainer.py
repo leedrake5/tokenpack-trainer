@@ -383,6 +383,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Baseline GPU memory (model + optimizer, before any batch).
         # Captured lazily on the first training_step call.
         self._gpu_baseline_mem: int | None = None
+        self._gpu_baseline_mem_per_device: dict[int, int] = {}  # per-device baselines for multi-GPU
 
         if getattr(self, "processing_class", None) is None:
             # fallback, just in case
@@ -777,12 +778,23 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
     @staticmethod
     def _detect_vram_gb() -> float:
-        """Return total VRAM in GB for the first CUDA device, or 0 if unavailable."""
+        """Return VRAM in GB for tuning adaptive parameters.
+
+        For multi-GPU setups (model parallel / device_map), returns the
+        *minimum* VRAM across all devices, since the bottleneck GPU
+        determines the safe token budget.
+        """
         try:
             import torch
             if torch.cuda.is_available():
-                props = torch.cuda.get_device_properties(0)
-                return props.total_memory / (1 << 30)
+                n = torch.cuda.device_count()
+                if n == 0:
+                    return 0.0
+                vrams = [
+                    torch.cuda.get_device_properties(i).total_memory / (1 << 30)
+                    for i in range(n)
+                ]
+                return min(vrams)
         except Exception:
             pass
         return 0.0
@@ -1030,12 +1042,48 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "max_microbatches_per_step": self.max_microbatches_per_step,
         }
 
+    def _bottleneck_gpu_stats(self) -> tuple[int, int, int] | None:
+        """Return (total, peak, baseline) for the GPU with least headroom.
+
+        For model-parallel setups the OOM bottleneck is whichever GPU has
+        the smallest (total - peak) gap.  Querying only self.args.device
+        misses layers on other GPUs and leads to over-aggressive autotuning.
+        """
+        if not torch.cuda.is_available():
+            return None
+
+        n = torch.cuda.device_count()
+        baselines = getattr(self, "_gpu_baseline_mem_per_device", {})
+
+        best = None       # (headroom, total, peak, baseline)
+        for i in range(n):
+            total_i = torch.cuda.get_device_properties(i).total_memory
+            peak_i  = torch.cuda.max_memory_allocated(i)
+            base_i  = baselines.get(i, 0)
+            if peak_i <= 0:
+                continue  # device not used
+            headroom = total_i - peak_i
+            if best is None or headroom < best[0]:
+                best = (headroom, total_i, peak_i, base_i)
+
+        if best is None:
+            # Fall back to self.args.device
+            dev = self.args.device
+            total = torch.cuda.get_device_properties(dev.index if hasattr(dev, 'index') else 0).total_memory
+            peak  = torch.cuda.max_memory_allocated(dev)
+            baseline = self._gpu_baseline_mem or 0
+            return (total, peak, baseline)
+
+        return (best[1], best[2], best[3])
+
     def _autotune_regime_from_peak(self, key: int, eff_tokens_in_step: int, safety: float = 0.90):
         if not torch.cuda.is_available() or eff_tokens_in_step <= 0:
             return
 
-        total = torch.cuda.get_device_properties(self.args.device.index).total_memory
-        peak  = torch.cuda.max_memory_allocated(self.args.device)
+        stats = self._bottleneck_gpu_stats()
+        if stats is None:
+            return
+        total, peak, baseline = stats
 
         # avoid divide-by-zero / nonsense
         if peak <= 0:
@@ -1044,7 +1092,6 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Use baseline memory (model + optimizer) to compute MARGINAL per-token cost.
         # Without this, model weights (~90% of VRAM) inflate per-token cost by 10x+,
         # making the autotuned token budget far too conservative.
-        baseline = self._gpu_baseline_mem or 0
         available = max(total - baseline, total * 0.05)  # headroom beyond model; floor at 5%
         batch_mem = max(peak - baseline, available * 0.05)  # actual batch memory used
 
@@ -2544,6 +2591,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "oom_events": getattr(self, "_oom_events", 0),
             "oom_skipped_batches": getattr(self, "_oom_skipped_batches", 0),
             "gpu_baseline_mem": getattr(self, "_gpu_baseline_mem", None),
+            "gpu_baseline_mem_per_device": {
+                str(k): v for k, v in getattr(self, "_gpu_baseline_mem_per_device", {}).items()
+            },
         }
         path = os.path.join(output_dir, self.REGIME_STATE_FILENAME)
         try:
@@ -2584,6 +2634,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
             baseline = state.get("gpu_baseline_mem")
             if baseline is not None:
                 self._gpu_baseline_mem = int(baseline)
+            per_dev = state.get("gpu_baseline_mem_per_device", {})
+            if per_dev:
+                self._gpu_baseline_mem_per_device = {
+                    int(k): int(v) for k, v in per_dev.items()
+                }
 
             logger.info(
                 f"[TokenPackTrainer] Restored regime state from {path}: "
@@ -2854,23 +2909,38 @@ class TokenPackTrainer(Seq2SeqTrainer):
         _step = getattr(self, "state", None)
         _global_step = getattr(_step, "global_step", 0) if _step else 0
         if torch.cuda.is_available() and _global_step <= 5:
+            # Track baseline on ALL devices so _bottleneck_gpu_stats can use
+            # the correct per-device baseline for autotune calculations.
+            any_jumped = False
+            for dev_i in range(torch.cuda.device_count()):
+                mem_i = torch.cuda.memory_allocated(dev_i)
+                if mem_i <= 0:
+                    continue  # device not used by this model
+                old_i = self._gpu_baseline_mem_per_device.get(dev_i)
+                if old_i is None or mem_i > old_i:
+                    self._gpu_baseline_mem_per_device[dev_i] = mem_i
+                    if old_i is not None and mem_i > old_i * 1.05:
+                        any_jumped = True
+                    if self.debug:
+                        tag = f"device {dev_i}"
+                        if old_i is not None:
+                            print(f"[TokenPackTrainer] GPU baseline ({tag}) updated: {old_i / (1<<30):.2f} -> {mem_i / (1<<30):.2f} GB")
+                        else:
+                            print(f"[TokenPackTrainer] GPU baseline ({tag}): {mem_i / (1<<30):.2f} GB")
+
+            # Keep legacy single-device baseline for backward compat
             current_mem = torch.cuda.memory_allocated(self.args.device)
             if self._gpu_baseline_mem is None or current_mem > self._gpu_baseline_mem:
-                old_baseline = self._gpu_baseline_mem
                 self._gpu_baseline_mem = current_mem
-                if self.debug:
-                    if old_baseline is not None:
-                        print(f"[TokenPackTrainer] GPU baseline updated: {old_baseline / (1<<30):.2f} -> {current_mem / (1<<30):.2f} GB")
-                    else:
-                        print(f"[TokenPackTrainer] GPU baseline memory: {current_mem / (1<<30):.2f} GB")
-                # When baseline jumps (e.g. optimizer states allocated after step 0),
-                # clear autotuned keys so regimes re-autotune with accurate baseline.
-                if old_baseline is not None and current_mem > old_baseline * 1.05:
-                    autotuned = getattr(self, "_autotuned_keys", set())
-                    if autotuned:
-                        if self.debug:
-                            print(f"[TokenPackTrainer] Baseline jumped {(current_mem - old_baseline)/(1<<30):.2f}G — re-autotuning {len(autotuned)} regime(s)")
-                        self._autotuned_keys = set()
+
+            # When baseline jumps (e.g. optimizer states allocated after step 0),
+            # clear autotuned keys so regimes re-autotune with accurate baseline.
+            if any_jumped:
+                autotuned = getattr(self, "_autotuned_keys", set())
+                if autotuned:
+                    if self.debug:
+                        print(f"[TokenPackTrainer] Baseline jumped on one or more devices — re-autotuning {len(autotuned)} regime(s)")
+                    self._autotuned_keys = set()
 
         last_err = None
         regime_key = None  # <<< keep across retries for this same HF batch
@@ -2913,11 +2983,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 # --- Cap microbatches per step ---
                 # If a shrunken regime would produce too many tiny microbatches,
-                # bump the budget for THIS step and re-plan.  The OOM retry loop
-                # provides safety: if the larger budget OOMs, the regime shrinks
-                # and the next attempt retries with the smaller budget.
+                # bump the budget for THIS step and re-plan.
+                #
+                # IMPORTANT: Only apply the cap on the first attempt (attempt == 0).
+                # On OOM retries, the regime has been shrunk specifically to avoid
+                # OOM — bumping T back up to fit the cap undoes the shrink and
+                # creates a death loop (shrink → cap overrides → OOM → repeat).
+                # On retries, accept the extra microbatches as the cost of safety.
                 _max_mb = self.max_microbatches_per_step
-                if _max_mb > 0 and len(microbatches) > _max_mb:
+                if attempt == 0 and _max_mb > 0 and len(microbatches) > _max_mb:
                     # Compute the budget that would yield ~max_mb microbatches
                     step_T = max(
                         int(eff_tokens / _max_mb) + 1,
@@ -2941,7 +3015,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 total_examples = sum(mb["input_ids"].size(0) for mb in microbatches)
 
                 if torch.cuda.is_available():
-                    torch.cuda.reset_peak_memory_stats()
+                    for _di in range(torch.cuda.device_count()):
+                        torch.cuda.reset_peak_memory_stats(_di)
 
                 # ---------------- EXECUTE MICROBATCHE(S) ----------------
                 total_tokens = 0
@@ -2977,19 +3052,32 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     if max_lm_tok > 0:
                         lm_bytes = self._estimate_lm_head_bytes(max_lm_tok)
                         if lm_bytes > 0:
-                            dev = self.args.device
-                            free = torch.cuda.get_device_properties(dev).total_memory - torch.cuda.memory_allocated(dev)
-                            if lm_bytes > free * 0.85:
+                            # Check free memory on the bottleneck GPU (least headroom)
+                            min_free = None
+                            for _di in range(torch.cuda.device_count()):
+                                _alloc = torch.cuda.memory_allocated(_di)
+                                if _alloc <= 0:
+                                    continue  # device not used
+                                _free_i = torch.cuda.get_device_properties(_di).total_memory - _alloc
+                                if min_free is None or _free_i < min_free:
+                                    min_free = _free_i
+                            if min_free is None:
+                                dev = self.args.device
+                                min_free = torch.cuda.get_device_properties(dev).total_memory - torch.cuda.memory_allocated(dev)
+                            if lm_bytes > min_free * 0.85:
                                 raise torch.cuda.OutOfMemoryError(
                                     f"[TokenPackTrainer] Pre-flight: lm_head output would need "
                                     f"{lm_bytes / (1 << 30):.1f} GiB but only "
-                                    f"{free / (1 << 30):.1f} GiB free (skipping to OOM recovery)"
+                                    f"{min_free / (1 << 30):.1f} GiB free (skipping to OOM recovery)"
                                 )
 
                 _t_pre = time.time()  # pre-flight done
 
                 # Use prefetching iterator to overlap CPU→GPU transfer with computation
                 prefetched = self._prefetch_microbatches(microbatches) if self.use_cpu_microbatch else iter(microbatches)
+
+                _completed_mb = 0
+                _oom_mid_batch = False
 
                 for mb, ntok, lm_tok in zip(prefetched, mb_token_counts, mb_lm_head_tokens):
                     if ntok == 0:
@@ -3000,28 +3088,69 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     if self.length_column_name in mb:
                         mb = {k: v for k, v in mb.items() if k != self.length_column_name}
 
-                    with self.compute_loss_context_manager():
-                        loss_mb = self.compute_loss(model, mb)   # mean over tokens in this mb
+                    try:
+                        with self.compute_loss_context_manager():
+                            loss_mb = self.compute_loss(model, mb)   # mean over tokens in this mb
 
-                    if isinstance(loss_mb, tuple):
-                        loss_mb = loss_mb[0]
+                        if isinstance(loss_mb, tuple):
+                            loss_mb = loss_mb[0]
 
-                    weight = ntok / max(total_tokens, 1)
-                    loss = loss_mb * weight
+                        weight = ntok / max(total_tokens, 1)
+                        loss = loss_mb * weight
 
-                    if self.args.gradient_accumulation_steps > 1:
-                        loss = loss / self.args.gradient_accumulation_steps
+                        if self.args.gradient_accumulation_steps > 1:
+                            loss = loss / self.args.gradient_accumulation_steps
 
-                    self.accelerator.backward(loss)
+                        self.accelerator.backward(loss)
 
-                    total_loss_weighted += (loss_mb.detach().float() * weight)
+                        total_loss_weighted += (loss_mb.detach().float() * weight)
+                        _completed_mb += 1
 
+                    except (RuntimeError, torch.cuda.OutOfMemoryError) as mb_err:
+                        if not self._is_cuda_oom(mb_err):
+                            raise
+                        # --- Mid-batch OOM recovery ---
+                        # Some microbatches already completed and their gradients
+                        # are accumulated.  Rather than discarding everything and
+                        # retrying (which likely OOMs again at the same T due to
+                        # CUDA fragmentation), keep the partial gradients and
+                        # finish the step.  The optimizer gets a smaller-than-usual
+                        # gradient (like a reduced batch size for one step) which
+                        # is far better than zero gradient from a skipped batch.
+                        if _completed_mb > 0:
+                            _oom_mid_batch = True
+                            self._oom_events += 1
+                            # Free cache WITHOUT zeroing gradients
+                            if torch.cuda.is_available():
+                                try:
+                                    torch.cuda.empty_cache()
+                                except Exception:
+                                    pass
+                            # Shrink regime for future steps
+                            if regime_key is not None:
+                                self._regime_on_oom(regime_key)
+                                self._apply_regime_limits(regime_key)
+                            if self.control.should_log:
+                                self.log({
+                                    "oom_mid_batch_recovery": 1.0,
+                                    "oom_mid_batch_completed": float(_completed_mb),
+                                    "oom_mid_batch_total": float(num_micro),
+                                    "regime_key": float(regime_key if regime_key is not None else -1),
+                                    "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
+                                })
+                            break
+                        else:
+                            # No microbatches completed — fall through to the
+                            # outer OOM handler for full retry logic.
+                            raise
 
-                # >>> on success, mark this regime as stable and possibly ramp up
-                if regime_key is not None:
+                # >>> on success (full or partial), mark regime and possibly ramp up
+                if regime_key is not None and not _oom_mid_batch:
                     self._regime_on_success(regime_key)
 
-                if regime_key is not None and not getattr(self, "_autotuned_keys", set()).__contains__(regime_key):
+                # Skip autotune after mid-batch recovery (peak stats are from
+                # a partial step and would produce a bad estimate).
+                if not _oom_mid_batch and regime_key is not None and not getattr(self, "_autotuned_keys", set()).__contains__(regime_key):
                     # Use lower safety factor if this regime recently OOM'd
                     # (previous autotune overshot, so be more conservative)
                     st = self._regime_state(regime_key)
