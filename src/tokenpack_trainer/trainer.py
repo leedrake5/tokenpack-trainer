@@ -890,14 +890,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
     def _regime_state(self, key: int) -> dict:
         st = self._regime_limits.get(key)
         if st is None:
-            st = {"B": self._regime_default_B, "T": self._regime_default_T, "stable": 0, "hwm_T": None}
+            st = {"B": self._regime_default_B, "T": self._regime_default_T, "stable": 0,
+                  "hwm_T": None, "bytes_per_token": None}
             # B=None is valid and means "uncapped" — only default T if missing
             if st["T"] is None:
                 st["T"] = 400
             self._regime_limits[key] = st
-        # Backfill hwm_T for regimes created before this field existed
+        # Backfill fields for regimes created before these fields existed
         if "hwm_T" not in st:
             st["hwm_T"] = None
+        if "bytes_per_token" not in st:
+            st["bytes_per_token"] = None
         return st
 
     def _apply_regime_limits(self, key: int):
@@ -968,6 +971,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         st["stable"] = 0
 
+        # Invalidate bytes_per_token — the calibration that said "this T is safe"
+        # was wrong, so don't let the predictive check trust it until re-autotune.
+        st["bytes_per_token"] = None
+
         # Track OOM count per regime for safety factor adjustment on re-autotune
         oom_history = getattr(self, "_regime_oom_count", {})
         oom_history[key] = oom_history.get(key, 0) + 1
@@ -1011,7 +1018,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         Return current adaptive regime limits for debugging and monitoring.
 
         Returns a dict with:
-            - regimes: dict mapping regime_key → {"B": int, "T": int, "stable": int, "hwm_T": int|None}
+            - regimes: dict mapping regime_key → {"B": int, "T": int, "stable": int, "hwm_T": int|None, "bytes_per_token": float|None}
             - current_max_B: current max_examples_per_microbatch
             - current_max_T: current max_tokens_per_microbatch
             - oom_events: total OOM events encountered
@@ -1107,6 +1114,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
         st = self._regime_state(key)
         old_T = st["T"]
         st["T"] = max(self._regime_min_T, min(target_eff_tokens, INT64_MAX, getattr(self, "_regime_max_T", INT64_MAX)))
+
+        # Persist bytes_per_token for the predictive VRAM pre-flight check.
+        # This lets the next step predict memory before sending data to GPU.
+        st["bytes_per_token"] = bytes_per_eff_token
 
         if self.debug:
             print(
@@ -2621,6 +2632,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     "T": int(v["T"]),
                     "stable": int(v.get("stable", 0)),
                     "hwm_T": int(v["hwm_T"]) if v.get("hwm_T") is not None else None,
+                    "bytes_per_token": float(v["bytes_per_token"]) if v.get("bytes_per_token") is not None else None,
                 }
             self._regime_limits = loaded_limits
             self._autotuned_keys = set(state.get("autotuned_keys", []))
@@ -3021,8 +3033,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 # ---------------- EXECUTE MICROBATCHE(S) ----------------
                 total_tokens = 0
                 mb_token_counts = []
+                mb_eff_tokens = []   # per-microbatch effective tokens (enc + alpha*dec) for predictive VRAM check
                 _need_lm_check = self._lm_head_vocab_size > 0
                 mb_lm_head_tokens = []  # B * dec_max per microbatch (for pre-flight check)
+                _alpha = self.decoder_cost_multiplier
                 for mb in microbatches:
                     labels = mb.get("labels", None)
                     if isinstance(labels, torch.Tensor) and labels.ndim == 2:
@@ -3037,6 +3051,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     else:
                         ntok = 0
                         lm_tok = 0
+                    # Compute effective tokens: enc_tokens + alpha * dec_tokens
+                    _am = mb.get("attention_mask", None)
+                    if _am is not None and isinstance(_am, torch.Tensor) and _am.ndim == 2:
+                        _mb_enc = int(_am.sum().item())
+                    else:
+                        _mb_enc = 0
+                    mb_eff_tokens.append(int(_mb_enc + _alpha * ntok))
                     mb_token_counts.append(ntok)
                     mb_lm_head_tokens.append(lm_tok)
                     total_tokens += ntok
@@ -3070,6 +3091,43 @@ class TokenPackTrainer(Seq2SeqTrainer):
                                     f"{lm_bytes / (1 << 30):.1f} GiB but only "
                                     f"{min_free / (1 << 30):.1f} GiB free (skipping to OOM recovery)"
                                 )
+
+                # Predictive VRAM check: estimate peak memory for the worst-case
+                # microbatch using the learned bytes_per_eff_token from the last
+                # successful autotune.  This is entirely sync-free — all values
+                # are cached from prior steps.  If the predicted peak exceeds
+                # total VRAM * safety, raise synthetic OOM to trigger the regime
+                # shrink BEFORE burning GPU time on a doomed forward pass.
+                # Falls back gracefully: skipped when bytes_per_token is None
+                # (first few steps or after OOM invalidation).
+                if regime_key is not None and mb_eff_tokens and torch.cuda.is_available():
+                    _regime_st = self._regime_state(regime_key)
+                    _bpt = _regime_st.get("bytes_per_token")
+                    if _bpt is not None and _bpt > 0:
+                        _max_mb_eff = max(mb_eff_tokens)
+                        # Find bottleneck device using cached values (no GPU sync)
+                        _baselines = self._gpu_baseline_mem_per_device
+                        _pv_total = None
+                        _pv_baseline = None
+                        for _di, _base_i in _baselines.items():
+                            _tot_i = torch.cuda.get_device_properties(_di).total_memory
+                            _head_i = _tot_i - _base_i
+                            if _pv_total is None or _head_i < (_pv_total - _pv_baseline):
+                                _pv_total = _tot_i
+                                _pv_baseline = _base_i
+                        if _pv_total is None:
+                            _pv_total = int(self._vram_gb * (1 << 30))
+                            _pv_baseline = self._gpu_baseline_mem or 0
+                        _predicted_peak = _pv_baseline + _bpt * _max_mb_eff
+                        _safe_limit = _pv_total * self._autotune_safety
+                        if _predicted_peak > _safe_limit:
+                            raise torch.cuda.OutOfMemoryError(
+                                f"[TokenPackTrainer] Predictive VRAM check: worst microbatch "
+                                f"({_max_mb_eff} eff tokens, {_bpt:.0f} bytes/tok) would need "
+                                f"~{_predicted_peak / (1 << 30):.1f} GiB but safety limit is "
+                                f"{_safe_limit / (1 << 30):.1f} GiB — shrinking regime before "
+                                f"attempting forward pass"
+                            )
 
                 _t_pre = time.time()  # pre-flight done
 
