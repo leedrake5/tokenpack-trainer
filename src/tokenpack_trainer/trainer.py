@@ -878,11 +878,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
     def _regime_state(self, key: int) -> dict:
         st = self._regime_limits.get(key)
         if st is None:
-            st = {"B": self._regime_default_B, "T": self._regime_default_T, "stable": 0}
+            st = {"B": self._regime_default_B, "T": self._regime_default_T, "stable": 0, "hwm_T": None}
             # B=None is valid and means "uncapped" — only default T if missing
             if st["T"] is None:
                 st["T"] = 400
             self._regime_limits[key] = st
+        # Backfill hwm_T for regimes created before this field existed
+        if "hwm_T" not in st:
+            st["hwm_T"] = None
         return st
 
     def _apply_regime_limits(self, key: int):
@@ -912,6 +915,28 @@ class TokenPackTrainer(Seq2SeqTrainer):
         st = self._regime_state(key)
         st["stable"] += 1
 
+        # Update high-water mark after several consecutive successes confirm stability
+        if st["stable"] >= 5:
+            hwm = st.get("hwm_T") or 0
+            if st["T"] > hwm:
+                st["hwm_T"] = st["T"]
+
+        hwm = st.get("hwm_T")
+
+        # Fast recovery ramp: when T is well below HWM (post-OOM), ramp aggressively
+        # toward the last known-good level instead of the slow normal ramp.
+        if hwm and st["T"] < int(hwm * 0.9):
+            if st["stable"] % 5 == 0:  # every 5 successes (vs normal 20)
+                new_T = int(st["T"] * 1.20)  # 20% jump (vs normal 8%)
+                st["T"] = min(new_T, hwm)    # don't exceed HWM during recovery
+                st["T"] = self._clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, self.INT64_MAX))
+                # B recovery
+                if st["B"] is not None:
+                    st["B"] = max(self._regime_min_B, int(st["B"] * 1.20) + 1)
+                    st["B"] = self._clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
+            return
+
+        # Normal ramp
         if st["stable"] % int(self._regime_ramp_every) == 0:
             # B=None means uncapped — no ramping needed
             if st["B"] is not None:
@@ -924,6 +949,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
     def _regime_on_oom(self, key: int):
         st = self._regime_state(key)
+
+        # Before resetting stable, capture current T as HWM if it was working
+        if st["stable"] >= 3 and st["T"] > (st.get("hwm_T") or 0):
+            st["hwm_T"] = st["T"]
+
         st["stable"] = 0
 
         # Track OOM count per regime for safety factor adjustment on re-autotune
@@ -948,15 +978,28 @@ class TokenPackTrainer(Seq2SeqTrainer):
             st["B"] = new_B
             return
 
-        # If B can't shrink further, shrink token budget
-        st["T"] = max(self._regime_min_T, int(st["T"] * 0.85))
+        # If B can't shrink further, shrink token budget — but use HWM as a
+        # reference floor.  If the regime had a known-good T (hwm_T) and we're
+        # currently above it, fall back to hwm_T * 0.85 rather than cascading
+        # all the way to oom_min_tokens.  This is the "known safe setting" —
+        # the highest T that ran stably before this OOM spike.
+        hwm = st.get("hwm_T")
+        if hwm and st["T"] > hwm:
+            # Above HWM: drop to HWM (the last proven-stable level)
+            st["T"] = max(self._regime_min_T, hwm)
+        elif hwm and st["T"] > int(hwm * 0.85):
+            # Near HWM: drop to 85% of HWM
+            st["T"] = max(self._regime_min_T, int(hwm * 0.85))
+        else:
+            # Already below HWM or no HWM: normal proportional shrink
+            st["T"] = max(self._regime_min_T, int(st["T"] * 0.85))
 
     def get_regime_stats(self) -> dict:
         """
         Return current adaptive regime limits for debugging and monitoring.
 
         Returns a dict with:
-            - regimes: dict mapping regime_key → {"B": int, "T": int, "stable": int}
+            - regimes: dict mapping regime_key → {"B": int, "T": int, "stable": int, "hwm_T": int|None}
             - current_max_B: current max_examples_per_microbatch
             - current_max_T: current max_tokens_per_microbatch
             - oom_events: total OOM events encountered
@@ -2527,6 +2570,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     "B": v.get("B"),
                     "T": int(v["T"]),
                     "stable": int(v.get("stable", 0)),
+                    "hwm_T": int(v["hwm_T"]) if v.get("hwm_T") is not None else None,
                 }
             self._regime_limits = loaded_limits
             self._autotuned_keys = set(state.get("autotuned_keys", []))
@@ -2983,14 +3027,24 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     st = self._regime_state(regime_key)
                     oom_history = getattr(self, "_regime_oom_count", {})
                     recent_oom = oom_history.get(regime_key, 0) > 0
-                    safety = self._autotune_oom_safety if recent_oom else self._autotune_safety
-                    self._autotune_regime_from_peak(regime_key, eff_tokens, safety=safety)
-                    self._autotuned_keys = getattr(self, "_autotuned_keys", set())
-                    self._autotuned_keys.add(regime_key)
-                    # Clear OOM history for this key now that we've re-autotuned
-                    if recent_oom:
-                        oom_history[regime_key] = 0
-                        self._regime_oom_count = oom_history
+
+                    # Skip autotune on tiny post-OOM batches: when eff_tokens is
+                    # far below the regime's known capacity (HWM), the per-token
+                    # cost is inflated by fixed overhead, producing a conservative
+                    # estimate that prolongs recovery.  Let the fast ramp handle
+                    # recovery instead; autotune on a properly-sized batch later.
+                    hwm = st.get("hwm_T") or st["T"]
+                    if recent_oom and eff_tokens < hwm * 0.1:
+                        pass  # defer autotune to a larger batch
+                    else:
+                        safety = self._autotune_oom_safety if recent_oom else self._autotune_safety
+                        self._autotune_regime_from_peak(regime_key, eff_tokens, safety=safety)
+                        self._autotuned_keys = getattr(self, "_autotuned_keys", set())
+                        self._autotuned_keys.add(regime_key)
+                        # Clear OOM history for this key now that we've re-autotuned
+                        if recent_oom:
+                            oom_history[regime_key] = 0
+                            self._regime_oom_count = oom_history
 
 
                 # optional logging
