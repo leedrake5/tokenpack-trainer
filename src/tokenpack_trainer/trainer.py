@@ -3325,6 +3325,22 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
                                           "examples": 0, "tokens": 0, "microbatches": 0}
 
+                # --- Slow step diagnostic ---
+                # When a step is much slower than the baseline, log regime
+                # details so the cause is visible without needing debug=True.
+                _base_now = getattr(self, "_step_exec_baseline_ms", _exec_ms)
+                if _step_count > 20 and _exec_ms > max(_base_now * 10, 10_000):
+                    _regime_st = self._regime_state(regime_key) if regime_key is not None else {}
+                    logger.info(
+                        f"[TokenPackTrainer] Slow step: {_exec_ms/1000:.1f}s "
+                        f"(baseline={_base_now/1000:.1f}s) | "
+                        f"regime={regime_key}, B={_regime_st.get('B')}, "
+                        f"T={_regime_st.get('T')}, hwm_T={_regime_st.get('hwm_T')}, "
+                        f"stable={_regime_st.get('stable', 0)} | "
+                        f"microbatches={num_micro}, examples={total_examples}, "
+                        f"tokens={total_tokens}, eff_tokens={eff_tokens}"
+                    )
+
                 # --- Sustained slowdown watchdog ---
                 # Defragment CUDA cache when training has been slow for a
                 # sustained period.  A single slow step can happen for many
