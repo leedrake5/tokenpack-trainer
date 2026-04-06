@@ -834,22 +834,25 @@ class TokenPackTrainer(Seq2SeqTrainer):
         return 1.05
 
     def _vram_autotune_safety(self) -> float:
-        """Normal autotune safety factor. Larger VRAM → tighter fill.
-        >=80GB: 0.92,  48-80GB: 0.90,  24-48GB: 0.88,  <24GB: 0.85"""
+        """Normal autotune safety factor — targets this fraction of available
+        VRAM (total minus model/optimizer baseline) for batch data.
+        Previous values (0.85-0.92) pushed total utilization to 95-98%,
+        causing CUDA allocator pressure without triggering OOM.
+        >=80GB: 0.75,  48-80GB: 0.72,  24-48GB: 0.70,  <24GB: 0.66"""
         v = self._vram_gb
-        if v >= 80:   return 0.92
-        if v >= 48:   return 0.90
-        if v >= 24:   return 0.88
-        return 0.85
+        if v >= 80:   return 0.75
+        if v >= 48:   return 0.72
+        if v >= 24:   return 0.70
+        return 0.66
 
     def _vram_autotune_oom_safety(self) -> float:
-        """Post-OOM autotune safety factor. Larger VRAM → less conservative.
-        >=80GB: 0.85,  48-80GB: 0.80,  24-48GB: 0.75,  <24GB: 0.70"""
+        """Post-OOM autotune safety factor — more conservative than normal.
+        >=80GB: 0.66,  48-80GB: 0.60,  24-48GB: 0.55,  <24GB: 0.50"""
         v = self._vram_gb
-        if v >= 80:   return 0.85
-        if v >= 48:   return 0.80
-        if v >= 24:   return 0.75
-        return 0.70
+        if v >= 80:   return 0.66
+        if v >= 48:   return 0.60
+        if v >= 24:   return 0.55
+        return 0.50
 
     def _vram_eval_ramp_every(self) -> int:
         """Eval ramp every N successes. Larger VRAM → faster recovery.
@@ -962,6 +965,52 @@ class TokenPackTrainer(Seq2SeqTrainer):
             # hard clamp to practical + int64 safety
             st["T"] = self._clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, self.INT64_MAX))
 
+    def _safe_floor_T(self) -> int:
+        """Compute a dynamic minimum T that maintains useful GPU throughput.
+
+        Uses the learned bytes_per_token and VRAM headroom to compute the
+        token budget that fills ~66% of available VRAM.  This is the "known
+        steady-state" — large enough to keep the GPU busy, conservative
+        enough to never cause OOM or memory pressure.
+
+        Falls back to oom_min_tokens when bytes_per_token isn't known yet.
+        """
+        # Find best bytes_per_token across all regimes (any calibration is
+        # better than none — the per-token cost varies by regime but is
+        # the same order of magnitude)
+        bpt = None
+        for st in self._regime_limits.values():
+            b = st.get("bytes_per_token")
+            if b is not None and b > 0:
+                if bpt is None or b > bpt:
+                    bpt = b  # use the most conservative (highest) estimate
+
+        if bpt is None or not torch.cuda.is_available():
+            return self._regime_min_T
+
+        baselines = self._gpu_baseline_mem_per_device
+        if not baselines:
+            baseline = self._gpu_baseline_mem or 0
+            total = int(self._vram_gb * (1 << 30))
+        else:
+            # Use bottleneck device
+            baseline = 0
+            total = 0
+            best_headroom = None
+            for dev_i, base_i in baselines.items():
+                tot_i = torch.cuda.get_device_properties(dev_i).total_memory
+                head_i = tot_i - base_i
+                if best_headroom is None or head_i < best_headroom:
+                    best_headroom = head_i
+                    baseline = base_i
+                    total = tot_i
+
+        available = max(total - baseline, total * 0.05)
+        # Target 66% of available VRAM — a comfortable level that keeps the
+        # GPU busy without risking pressure or fragmentation
+        safe_T = int(0.66 * available / max(bpt, 1e-9))
+        return max(self._regime_min_T, safe_T)
+
     def _regime_on_oom(self, key: int):
         st = self._regime_state(key)
 
@@ -981,11 +1030,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self._regime_oom_count = oom_history
 
         # Allow re-autotuning after recovery stabilizes.
-        # Without this, a single OOM can condemn a regime to slow incremental
-        # ramp-up (~930 steps to recover from T=64 → T=16384).
         autotuned = getattr(self, "_autotuned_keys", set())
         if key in autotuned:
             autotuned.discard(key)
+
+        # Compute the safe floor — the minimum T that maintains useful GPU
+        # throughput (~66% of available VRAM).  Never shrink below this.
+        safe_floor = self._safe_floor_T()
 
         # Shrink B first — if uncapped, materialize from regime_max_B so we can shrink
         if st["B"] is None:
@@ -997,21 +1048,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
             st["B"] = new_B
             return
 
-        # If B can't shrink further, shrink token budget — but use HWM as a
-        # reference floor.  If the regime had a known-good T (hwm_T) and we're
-        # currently above it, fall back to hwm_T * 0.85 rather than cascading
-        # all the way to oom_min_tokens.  This is the "known safe setting" —
-        # the highest T that ran stably before this OOM spike.
+        # If B can't shrink further, shrink token budget — but never below
+        # the safe floor.  The HWM is the first reference (what worked before),
+        # the safe floor is the hard minimum (what maintains throughput).
+        floor = max(safe_floor, self._regime_min_T)
         hwm = st.get("hwm_T")
         if hwm and st["T"] > hwm:
-            # Above HWM: drop to HWM (the last proven-stable level)
-            st["T"] = max(self._regime_min_T, hwm)
+            st["T"] = max(floor, hwm)
         elif hwm and st["T"] > int(hwm * 0.85):
-            # Near HWM: drop to 85% of HWM
-            st["T"] = max(self._regime_min_T, int(hwm * 0.85))
+            st["T"] = max(floor, int(hwm * 0.85))
         else:
-            # Already below HWM or no HWM: normal proportional shrink
-            st["T"] = max(self._regime_min_T, int(st["T"] * 0.85))
+            st["T"] = max(floor, int(st["T"] * 0.85))
 
     def get_regime_stats(self) -> dict:
         """
@@ -3278,92 +3325,61 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
                                           "examples": 0, "tokens": 0, "microbatches": 0}
 
-                # --- Memory pressure watchdog ---
-                # CUDA can approach full VRAM without triggering OOM — the
-                # allocator finds fragmented blocks, but each allocation takes
-                # 100x+ longer.  Steps that normally take 2-4s take 200-400s.
-                # Since no OOM fires, the regime never shrinks, and training
-                # crawls for hours.  Detect this via step timing: if the step
-                # was extremely slow (compared to the running EMA AND an
-                # absolute floor), treat it as memory pressure — defragment
-                # CUDA cache and shrink the regime for the next step.
-                if not _oom_mid_batch and regime_key is not None and torch.cuda.is_available():
-                    # Maintain EMA of execution time (ms) and best-known baseline.
-                    # The EMA tracks recent trend; the baseline tracks the fastest
-                    # observed step (what "healthy" looks like for this workload).
-                    _ema = getattr(self, "_step_exec_ema_ms", None)
+                # --- Sustained slowdown watchdog ---
+                # Defragment CUDA cache when training has been slow for a
+                # sustained period.  A single slow step can happen for many
+                # reasons (long sequence, GC pause, data loading); only act
+                # when the slowdown is persistent, suggesting CUDA memory
+                # fragmentation.  empty_cache() costs ~1-10ms and consolidates
+                # free blocks without moving data.
+                if not _oom_mid_batch and torch.cuda.is_available():
+                    # Track best-known step time (healthy baseline)
                     _baseline_ms = getattr(self, "_step_exec_baseline_ms", None)
-                    _ema_alpha = 0.05  # slow-moving average
-
-                    if _ema is None:
-                        self._step_exec_ema_ms = _exec_ms
-                    else:
-                        self._step_exec_ema_ms = _ema * (1 - _ema_alpha) + _exec_ms * _ema_alpha
-
-                    # Update baseline with 10th-percentile-ish tracking:
-                    # only update if this step is faster (captures healthy speed)
                     if _baseline_ms is None or _exec_ms < _baseline_ms:
                         self._step_exec_baseline_ms = _exec_ms
 
-                    # --- Memory pressure detection ---
-                    # Two complementary triggers:
-                    #
-                    # Trigger A (spike): step > 10× EMA AND > 30s absolute.
-                    #   Catches sudden slowdowns when training was recently healthy.
-                    #
-                    # Trigger B (sustained): step > 20× baseline AND > 60s absolute.
-                    #   Catches persistent slowdowns where the EMA has drifted up
-                    #   (e.g., hours at 200-400s/step when baseline was 2-4s).
-                    #   The baseline never drifts — it's the best step ever seen.
-                    _pressure_triggered = False
-                    _pressure_reason = ""
-                    _ema_now = max(self._step_exec_ema_ms, 1.0)
-                    _base_now = max(self._step_exec_baseline_ms or _exec_ms, 1.0)
+                    # Accumulate slow-step duration: count consecutive seconds
+                    # spent in steps that are ≥10× the baseline.  Only trigger
+                    # defrag when this exceeds a sustained threshold (2 minutes).
+                    _base_now = self._step_exec_baseline_ms or _exec_ms
+                    _slow_accum = getattr(self, "_slow_step_accum_s", 0.0)
+                    _last_defrag_step = getattr(self, "_last_defrag_step", 0)
 
-                    if _step_count > 10 and _exec_ms > 30_000:
-                        _ratio_ema = _exec_ms / _ema_now
-                        if _ratio_ema > 10:
-                            _pressure_triggered = True
-                            _pressure_reason = f"spike: {_ratio_ema:.0f}x EMA ({_ema_now/1000:.1f}s)"
+                    if _step_count > 20 and _exec_ms > max(_base_now * 10, 10_000):
+                        # This step was slow — accumulate its duration
+                        _slow_accum += _exec_ms / 1000.0
+                    else:
+                        # Normal step — reset accumulator
+                        _slow_accum = 0.0
+                    self._slow_step_accum_s = _slow_accum
 
-                    if not _pressure_triggered and _step_count > 20 and _exec_ms > 60_000:
-                        _ratio_base = _exec_ms / _base_now
-                        if _ratio_base > 20:
-                            _pressure_triggered = True
-                            _pressure_reason = f"sustained: {_ratio_base:.0f}x baseline ({_base_now/1000:.1f}s)"
+                    # Fire when ≥120 seconds of sustained slow steps have
+                    # accumulated AND at least 100 steps since last defrag
+                    if _slow_accum >= 120 and (_step_count - _last_defrag_step) > 100:
+                        _alloc = torch.cuda.memory_allocated(self.args.device)
+                        _total_dev = torch.cuda.get_device_properties(self.args.device).total_memory
+                        _util = _alloc / max(_total_dev, 1)
 
-                    if _pressure_triggered:
-                        logger.warning(
-                            f"[TokenPackTrainer] Memory pressure detected ({_pressure_reason}): "
-                            f"step took {_exec_ms/1000:.1f}s. Defragmenting CUDA cache and "
-                            f"shrinking regime {regime_key}."
-                        )
-                        # Defragment: return cached but unused blocks to the allocator.
-                        # This is the key action — CUDA fragmentation is the likely
-                        # cause of the slowdown, and empty_cache() is the only way
-                        # to consolidate free blocks without restarting.
+                        if self.debug:
+                            logger.info(
+                                f"[TokenPackTrainer] Sustained slowdown: "
+                                f"{_slow_accum:.0f}s of slow steps accumulated "
+                                f"(baseline={_base_now/1000:.1f}s), VRAM {_util:.0%}. "
+                                f"Defragmenting CUDA cache."
+                            )
                         try:
                             torch.cuda.empty_cache()
                         except Exception:
                             pass
-                        # Shrink regime (same as OOM response) so next step uses
-                        # smaller microbatches that don't push VRAM to the edge.
-                        self._regime_on_oom(regime_key)
-                        self._apply_regime_limits(regime_key)
+
+                        self._last_defrag_step = _step_count
+                        self._slow_step_accum_s = 0.0
                         if self.control.should_log:
                             self.log({
-                                "memory_pressure_event": 1.0,
-                                "pressure_step_ms": _exec_ms,
-                                "pressure_ema_ms": self._step_exec_ema_ms,
-                                "pressure_baseline_ms": self._step_exec_baseline_ms,
-                                "pressure_reason": _pressure_reason,
-                                "regime_key": float(regime_key),
-                                "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
+                                "sustained_defrag": 1.0,
+                                "slow_accum_s": _slow_accum,
+                                "pressure_vram_util": _util,
                             })
-                        # Reset EMA to current (slow) value so the NEXT step
-                        # (with shrunken regime) can be compared against it —
-                        # if the shrink helped, EMA will drop quickly.
-                        self._step_exec_ema_ms = _exec_ms
 
                 # Return a sane scalar for logging
                 return total_loss_weighted
