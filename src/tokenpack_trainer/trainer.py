@@ -3278,6 +3278,93 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
                                           "examples": 0, "tokens": 0, "microbatches": 0}
 
+                # --- Memory pressure watchdog ---
+                # CUDA can approach full VRAM without triggering OOM — the
+                # allocator finds fragmented blocks, but each allocation takes
+                # 100x+ longer.  Steps that normally take 2-4s take 200-400s.
+                # Since no OOM fires, the regime never shrinks, and training
+                # crawls for hours.  Detect this via step timing: if the step
+                # was extremely slow (compared to the running EMA AND an
+                # absolute floor), treat it as memory pressure — defragment
+                # CUDA cache and shrink the regime for the next step.
+                if not _oom_mid_batch and regime_key is not None and torch.cuda.is_available():
+                    # Maintain EMA of execution time (ms) and best-known baseline.
+                    # The EMA tracks recent trend; the baseline tracks the fastest
+                    # observed step (what "healthy" looks like for this workload).
+                    _ema = getattr(self, "_step_exec_ema_ms", None)
+                    _baseline_ms = getattr(self, "_step_exec_baseline_ms", None)
+                    _ema_alpha = 0.05  # slow-moving average
+
+                    if _ema is None:
+                        self._step_exec_ema_ms = _exec_ms
+                    else:
+                        self._step_exec_ema_ms = _ema * (1 - _ema_alpha) + _exec_ms * _ema_alpha
+
+                    # Update baseline with 10th-percentile-ish tracking:
+                    # only update if this step is faster (captures healthy speed)
+                    if _baseline_ms is None or _exec_ms < _baseline_ms:
+                        self._step_exec_baseline_ms = _exec_ms
+
+                    # --- Memory pressure detection ---
+                    # Two complementary triggers:
+                    #
+                    # Trigger A (spike): step > 10× EMA AND > 30s absolute.
+                    #   Catches sudden slowdowns when training was recently healthy.
+                    #
+                    # Trigger B (sustained): step > 20× baseline AND > 60s absolute.
+                    #   Catches persistent slowdowns where the EMA has drifted up
+                    #   (e.g., hours at 200-400s/step when baseline was 2-4s).
+                    #   The baseline never drifts — it's the best step ever seen.
+                    _pressure_triggered = False
+                    _pressure_reason = ""
+                    _ema_now = max(self._step_exec_ema_ms, 1.0)
+                    _base_now = max(self._step_exec_baseline_ms or _exec_ms, 1.0)
+
+                    if _step_count > 10 and _exec_ms > 30_000:
+                        _ratio_ema = _exec_ms / _ema_now
+                        if _ratio_ema > 10:
+                            _pressure_triggered = True
+                            _pressure_reason = f"spike: {_ratio_ema:.0f}x EMA ({_ema_now/1000:.1f}s)"
+
+                    if not _pressure_triggered and _step_count > 20 and _exec_ms > 60_000:
+                        _ratio_base = _exec_ms / _base_now
+                        if _ratio_base > 20:
+                            _pressure_triggered = True
+                            _pressure_reason = f"sustained: {_ratio_base:.0f}x baseline ({_base_now/1000:.1f}s)"
+
+                    if _pressure_triggered:
+                        logger.warning(
+                            f"[TokenPackTrainer] Memory pressure detected ({_pressure_reason}): "
+                            f"step took {_exec_ms/1000:.1f}s. Defragmenting CUDA cache and "
+                            f"shrinking regime {regime_key}."
+                        )
+                        # Defragment: return cached but unused blocks to the allocator.
+                        # This is the key action — CUDA fragmentation is the likely
+                        # cause of the slowdown, and empty_cache() is the only way
+                        # to consolidate free blocks without restarting.
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        # Shrink regime (same as OOM response) so next step uses
+                        # smaller microbatches that don't push VRAM to the edge.
+                        self._regime_on_oom(regime_key)
+                        self._apply_regime_limits(regime_key)
+                        if self.control.should_log:
+                            self.log({
+                                "memory_pressure_event": 1.0,
+                                "pressure_step_ms": _exec_ms,
+                                "pressure_ema_ms": self._step_exec_ema_ms,
+                                "pressure_baseline_ms": self._step_exec_baseline_ms,
+                                "pressure_reason": _pressure_reason,
+                                "regime_key": float(regime_key),
+                                "max_tokens_now": float(self.max_tokens_per_microbatch or 0),
+                            })
+                        # Reset EMA to current (slow) value so the NEXT step
+                        # (with shrunken regime) can be compared against it —
+                        # if the shrink helped, EMA will drop quickly.
+                        self._step_exec_ema_ms = _exec_ms
+
                 # Return a sane scalar for logging
                 return total_loss_weighted
 
