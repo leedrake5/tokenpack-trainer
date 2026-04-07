@@ -3003,49 +3003,27 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Track baseline GPU memory (model + optimizer, before any batch data).
         # This lets _autotune_regime_from_peak compute marginal per-token cost
         # instead of attributing fixed model memory to each token.
-        # We take the MAX across the first few steps because Adam optimizer states
-        # are allocated lazily after the first optimizer.step() (which runs after
-        # training_step returns), so step 0 baseline only has model weights.
-        # After step 5, baseline is stable — skip the memory_allocated() sync.
-        _step = getattr(self, "state", None)
-        _global_step = getattr(_step, "global_step", 0) if _step else 0
+        #
+        # Use LATEST value (not max).  The max approach captured transient
+        # spikes from checkpoint loading (optimizer states briefly on GPU,
+        # then freed), locking in a baseline of 93GB when steady-state was
+        # 13GB — making the autotune think there was no headroom.
+        #
+        # The latest-value approach: each measurement overwrites the previous.
+        # By step 5, the steady-state (model + optimizer if on GPU) is captured.
         _local_step = getattr(self, "_timing_step_count", 0)
-        # Use local step count (resets each run) so baseline capture works
-        # on resume.  global_step would be e.g. 21537 after resume, skipping
-        # the capture entirely and leaving stale baselines from the checkpoint.
         if torch.cuda.is_available() and _local_step <= 5:
-            # Track baseline on ALL devices so _bottleneck_gpu_stats can use
-            # the correct per-device baseline for autotune calculations.
-            any_jumped = False
             for dev_i in range(torch.cuda.device_count()):
                 mem_i = torch.cuda.memory_allocated(dev_i)
                 if mem_i <= 0:
-                    continue  # device not used by this model
+                    continue
                 old_i = self._gpu_baseline_mem_per_device.get(dev_i)
-                if old_i is None or mem_i > old_i:
-                    self._gpu_baseline_mem_per_device[dev_i] = mem_i
-                    if old_i is not None and mem_i > old_i * 1.05:
-                        any_jumped = True
-                    if self.debug:
-                        tag = f"device {dev_i}"
-                        if old_i is not None:
-                            print(f"[TokenPackTrainer] GPU baseline ({tag}) updated: {old_i / (1<<30):.2f} -> {mem_i / (1<<30):.2f} GB")
-                        else:
-                            print(f"[TokenPackTrainer] GPU baseline ({tag}): {mem_i / (1<<30):.2f} GB")
+                self._gpu_baseline_mem_per_device[dev_i] = mem_i
+                if self.debug and (old_i is None or abs(mem_i - old_i) > old_i * 0.05 if old_i else True):
+                    print(f"[TokenPackTrainer] GPU baseline (device {dev_i}): {mem_i / (1<<30):.2f} GB")
 
-            # Keep legacy single-device baseline for backward compat
-            current_mem = torch.cuda.memory_allocated(self.args.device)
-            if self._gpu_baseline_mem is None or current_mem > self._gpu_baseline_mem:
-                self._gpu_baseline_mem = current_mem
-
-            # When baseline jumps (e.g. optimizer states allocated after step 0),
-            # clear autotuned keys so regimes re-autotune with accurate baseline.
-            if any_jumped:
-                autotuned = getattr(self, "_autotuned_keys", set())
-                if autotuned:
-                    if self.debug:
-                        print(f"[TokenPackTrainer] Baseline jumped on one or more devices — re-autotuning {len(autotuned)} regime(s)")
-                    self._autotuned_keys = set()
+            # Legacy single-device baseline
+            self._gpu_baseline_mem = torch.cuda.memory_allocated(self.args.device)
 
         last_err = None
         regime_key = None  # <<< keep across retries for this same HF batch
