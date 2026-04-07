@@ -2694,7 +2694,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     "bytes_per_token": float(v["bytes_per_token"]) if v.get("bytes_per_token") is not None else None,
                 }
             self._regime_limits = loaded_limits
-            self._autotuned_keys = set(state.get("autotuned_keys", []))
+            # Always clear autotuned_keys on resume.  This forces each regime
+            # to re-autotune on its first successful step, calibrating T to the
+            # current safety factor and actual GPU memory state.  Without this,
+            # stale T values from a previous run (computed with a different
+            # safety factor or on a different GPU) persist indefinitely.
+            self._autotuned_keys = set()
             self._regime_oom_count = {
                 int(k): int(v) for k, v in state.get("regime_oom_count", {}).items()
             }
@@ -3344,29 +3349,41 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
                                           "examples": 0, "tokens": 0, "microbatches": 0}
 
-                # --- Slow step diagnostic ---
-                # When a step is slow, log regime details so the cause is
-                # visible without needing debug=True.  Two triggers:
-                #   - 10× baseline (detects regression from known-good speed)
-                #   - >30s absolute (catches slow-from-start after resume)
-                # Throttled to once per 10 slow steps to avoid flooding logs.
+                # --- Step diagnostic ---
+                # Log regime details (gated by debug=True).
+                # Triggers:
+                #   - First 3 steps unconditionally (immediate visibility on resume)
+                #   - Every 200th step (periodic health check)
+                #   - >3× baseline or >5s absolute (regression detection)
+                # Throttled on slow steps: first 3, then every 50th.
                 _base_now = getattr(self, "_step_exec_baseline_ms", _exec_ms)
-                if _step_count > 5 and (_exec_ms > _base_now * 10 or _exec_ms > 30_000):
-                    _slow_diag_count = getattr(self, "_slow_diag_count", 0) + 1
-                    self._slow_diag_count = _slow_diag_count
-                    if self.debug and (_slow_diag_count <= 3 or _slow_diag_count % 10 == 0):
+                _is_slow = _step_count > 3 and (_exec_ms > _base_now * 3 or _exec_ms > 5_000)
+                _is_periodic = _step_count <= 3 or _step_count % 200 == 0
+                if self.debug and (_is_slow or _is_periodic):
+                    if _is_slow:
+                        _slow_diag_count = getattr(self, "_slow_diag_count", 0) + 1
+                        self._slow_diag_count = _slow_diag_count
+                        _should_print = _slow_diag_count <= 3 or _slow_diag_count % 50 == 0
+                        _label = f"Slow step #{_slow_diag_count}"
+                    else:
+                        _should_print = True
+                        _label = f"Step {_step_count}"
+                    if _should_print:
                         _regime_st = self._regime_state(regime_key) if regime_key is not None else {}
+                        _vram_mb = torch.cuda.memory_allocated(self.args.device) / (1 << 20) if torch.cuda.is_available() else 0
+                        _vram_total_mb = torch.cuda.get_device_properties(self.args.device).total_memory / (1 << 20) if torch.cuda.is_available() else 0
                         print(
-                            f"[TokenPackTrainer] Slow step #{_slow_diag_count}: "
+                            f"[TokenPackTrainer] {_label}: "
                             f"{_exec_ms/1000:.1f}s "
                             f"(baseline={_base_now/1000:.1f}s) | "
                             f"regime={regime_key}, B={_regime_st.get('B')}, "
                             f"T={_regime_st.get('T')}, hwm_T={_regime_st.get('hwm_T')}, "
                             f"stable={_regime_st.get('stable', 0)} | "
                             f"microbatches={num_micro}, examples={total_examples}, "
-                            f"tokens={total_tokens}, eff_tokens={eff_tokens}"
+                            f"tokens={total_tokens}, eff_tokens={eff_tokens} | "
+                            f"VRAM={_vram_mb:.0f}/{_vram_total_mb:.0f}MB"
                         )
-                else:
+                elif not _is_slow:
                     self._slow_diag_count = 0  # reset counter on normal steps
 
                 # --- Sustained slowdown watchdog ---
