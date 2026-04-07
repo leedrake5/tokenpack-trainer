@@ -951,7 +951,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         hwm_b = st.get("hwm_B")
 
         # Fast recovery ramp: when B or T is well below HWM (post-OOM),
-        # ramp aggressively toward the proven-stable level.
+        # ramp toward the proven-stable level.
         _recovering = False
         if hwm_t and st["T"] < int(hwm_t * 0.9):
             _recovering = True
@@ -959,7 +959,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             _recovering = True
 
         if _recovering:
-            if st["stable"] % 5 == 0:  # every 5 successes (vs normal 20)
+            if st["stable"] % 5 == 0:  # every 5 successes
                 if hwm_t and st["T"] < hwm_t:
                     new_T = int(st["T"] * 1.20)
                     st["T"] = min(new_T, hwm_t)
@@ -970,16 +970,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     st["B"] = self._clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
             return
 
-        # Normal ramp — only ABOVE the HWM (exploring new territory)
-        if st["stable"] % int(self._regime_ramp_every) == 0:
-            # B=None means uncapped — no ramping needed
-            if st["B"] is not None:
-                st["B"] = max(self._regime_min_B, int(st["B"] * float(self._regime_ramp_B)) + 1)
-                st["B"] = self._clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
-
-            st["T"] = max(self._regime_min_T, int(st["T"] * float(self._regime_ramp_T)))
-            # hard clamp to practical + int64 safety
-            st["T"] = self._clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, self.INT64_MAX))
+        # At or above HWM — regime is at its proven stable pace.
+        # DON'T ramp further.  The autotune already calibrated T; pushing
+        # B and T higher causes the "sugar high" → OOM → crash cycle.
+        # The HWM is updated naturally when the autotune sets a higher T
+        # (because conditions improved), which then becomes the new ceiling.
+        return
 
     def _safe_floor_T(self) -> int:
         """Compute a dynamic minimum T that maintains useful GPU throughput.
@@ -3079,14 +3075,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         int(eff_tokens / _max_mb) + 1,
                         self.max_tokens_per_microbatch,
                     )
-                    # Also bump B — but cap it at 4× the regime's current B
-                    # to avoid jumping from B=15 to B=682 (which OOMs and
-                    # triggers a cascade that shrinks the regime's actual B).
-                    # If 4× B still produces too many microbatches, accept it.
+                    # Also bump B — but cap at 2× the regime's current B to avoid
+                    # jumping far past what's proven stable.  If the HWM is known,
+                    # use it as the ceiling (don't exceed what worked before).
                     _total_ex = sum(mb["input_ids"].size(0) for mb in microbatches)
                     _ideal_B = int(_total_ex / _max_mb) + 1
                     _cur_B = self.max_examples_per_microbatch or _ideal_B
-                    step_B = min(_ideal_B, max(_cur_B * 4, _cur_B + 32))
+                    _regime_hwm_b = self._regime_state(regime_key).get("hwm_B") if regime_key is not None else None
+                    _cap_B = max(_cur_B * 2, _cur_B + 16)
+                    if _regime_hwm_b:
+                        _cap_B = min(_cap_B, int(_regime_hwm_b * 1.5))
+                    step_B = min(_ideal_B, max(_cap_B, _cur_B))
                     microbatches, enc_len, dec_len = self._make_microbatches(
                         inputs_work,
                         max_tokens_per_microbatch=step_T,
