@@ -894,7 +894,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         st = self._regime_limits.get(key)
         if st is None:
             st = {"B": self._regime_default_B, "T": self._regime_default_T, "stable": 0,
-                  "hwm_T": None, "bytes_per_token": None}
+                  "hwm_T": None, "hwm_B": None, "bytes_per_token": None}
             # B=None is valid and means "uncapped" — only default T if missing
             if st["T"] is None:
                 st["T"] = 400
@@ -902,6 +902,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Backfill fields for regimes created before these fields existed
         if "hwm_T" not in st:
             st["hwm_T"] = None
+        if "hwm_B" not in st:
+            st["hwm_B"] = None
         if "bytes_per_token" not in st:
             st["bytes_per_token"] = None
         return st
@@ -933,28 +935,42 @@ class TokenPackTrainer(Seq2SeqTrainer):
         st = self._regime_state(key)
         st["stable"] += 1
 
-        # Update high-water mark after several consecutive successes confirm stability
+        # Update high-water marks after consecutive successes confirm stability.
+        # These are the "proven safe operating point" — the (B, T) that ran
+        # reliably.  On OOM, the regime falls back HERE, not to minimums.
         if st["stable"] >= 5:
-            hwm = st.get("hwm_T") or 0
-            if st["T"] > hwm:
+            hwm_t = st.get("hwm_T") or 0
+            if st["T"] > hwm_t:
                 st["hwm_T"] = st["T"]
+            if st["B"] is not None:
+                hwm_b = st.get("hwm_B") or 0
+                if st["B"] > hwm_b:
+                    st["hwm_B"] = st["B"]
 
-        hwm = st.get("hwm_T")
+        hwm_t = st.get("hwm_T")
+        hwm_b = st.get("hwm_B")
 
-        # Fast recovery ramp: when T is well below HWM (post-OOM), ramp aggressively
-        # toward the last known-good level instead of the slow normal ramp.
-        if hwm and st["T"] < int(hwm * 0.9):
+        # Fast recovery ramp: when B or T is well below HWM (post-OOM),
+        # ramp aggressively toward the proven-stable level.
+        _recovering = False
+        if hwm_t and st["T"] < int(hwm_t * 0.9):
+            _recovering = True
+        if hwm_b and st["B"] is not None and st["B"] < int(hwm_b * 0.9):
+            _recovering = True
+
+        if _recovering:
             if st["stable"] % 5 == 0:  # every 5 successes (vs normal 20)
-                new_T = int(st["T"] * 1.20)  # 20% jump (vs normal 8%)
-                st["T"] = min(new_T, hwm)    # don't exceed HWM during recovery
-                st["T"] = self._clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, self.INT64_MAX))
-                # B recovery
-                if st["B"] is not None:
-                    st["B"] = max(self._regime_min_B, int(st["B"] * 1.20) + 1)
+                if hwm_t and st["T"] < hwm_t:
+                    new_T = int(st["T"] * 1.20)
+                    st["T"] = min(new_T, hwm_t)
+                    st["T"] = self._clamp_int(st["T"], self._regime_min_T, min(self._regime_max_T, self.INT64_MAX))
+                if st["B"] is not None and hwm_b and st["B"] < hwm_b:
+                    new_B = max(self._regime_min_B, int(st["B"] * 1.20) + 1)
+                    st["B"] = min(new_B, hwm_b)
                     st["B"] = self._clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
             return
 
-        # Normal ramp
+        # Normal ramp — only ABOVE the HWM (exploring new territory)
         if st["stable"] % int(self._regime_ramp_every) == 0:
             # B=None means uncapped — no ramping needed
             if st["B"] is not None:
@@ -1024,9 +1040,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
         """
         st = self._regime_state(key)
 
-        # Before resetting stable, capture current T as HWM if it was working
-        if st["stable"] >= 3 and st["T"] > (st.get("hwm_T") or 0):
-            st["hwm_T"] = st["T"]
+        # Before resetting stable, capture HWMs if this regime was working.
+        # These define the "proven stable operating point" to fall back to.
+        if st["stable"] >= 3:
+            if st["T"] > (st.get("hwm_T") or 0):
+                st["hwm_T"] = st["T"]
+            if st["B"] is not None and st["B"] > (st.get("hwm_B") or 0):
+                st["hwm_B"] = st["B"]
 
         st["stable"] = 0
 
@@ -1044,30 +1064,34 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if key in autotuned:
             autotuned.discard(key)
 
-        # Compute the safe floor — the minimum T that maintains useful GPU
-        # throughput (~66% of available VRAM).  Never shrink below this.
         safe_floor = self._safe_floor_T()
+        hwm_b = st.get("hwm_B")
+        hwm_t = st.get("hwm_T")
 
-        # Shrink B first (only on first retry per batch — shrink_b=True).
-        # On subsequent retries, skip B and shrink T instead.  This prevents
-        # cascading B from e.g. 457 → 7 across 12 retries.
+        # --- Shrink B (only on first retry per batch) ---
         if shrink_b:
             if st["B"] is None:
                 st["B"] = self._regime_max_B
                 return
 
-            new_B = max(self._regime_min_B, int(st["B"] * 0.7))
-            if new_B < st["B"]:
-                st["B"] = new_B
-                return
+            # Fall back toward hwm_B (proven stable), not toward minimums.
+            # If above hwm_B: drop to hwm_B.
+            # If at/near hwm_B: drop to 85% of hwm_B.
+            # If below hwm_B or no hwm: proportional 0.7x shrink.
+            if hwm_b and st["B"] > hwm_b:
+                st["B"] = hwm_b
+            elif hwm_b and st["B"] > int(hwm_b * 0.85):
+                st["B"] = max(self._regime_min_B, int(hwm_b * 0.85))
+            else:
+                st["B"] = max(self._regime_min_B, int(st["B"] * 0.7))
+            return
 
-        # Shrink token budget — but never below the safe floor.
+        # --- Shrink T (on subsequent retries, or when B can't shrink) ---
         floor = max(safe_floor, self._regime_min_T)
-        hwm = st.get("hwm_T")
-        if hwm and st["T"] > hwm:
-            st["T"] = max(floor, hwm)
-        elif hwm and st["T"] > int(hwm * 0.85):
-            st["T"] = max(floor, int(hwm * 0.85))
+        if hwm_t and st["T"] > hwm_t:
+            st["T"] = max(floor, hwm_t)
+        elif hwm_t and st["T"] > int(hwm_t * 0.85):
+            st["T"] = max(floor, int(hwm_t * 0.85))
         else:
             st["T"] = max(floor, int(st["T"] * 0.85))
 
@@ -2691,6 +2715,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     "T": int(v["T"]),
                     "stable": int(v.get("stable", 0)),
                     "hwm_T": int(v["hwm_T"]) if v.get("hwm_T") is not None else None,
+                    "hwm_B": int(v["hwm_B"]) if v.get("hwm_B") is not None else None,
                     "bytes_per_token": float(v["bytes_per_token"]) if v.get("bytes_per_token") is not None else None,
                 }
             self._regime_limits = loaded_limits
@@ -3076,12 +3101,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         int(eff_tokens / _max_mb) + 1,
                         self.max_tokens_per_microbatch,
                     )
-                    # Also bump B: ceil(total_examples / max_mb)
+                    # Also bump B — but cap it at 4× the regime's current B
+                    # to avoid jumping from B=15 to B=682 (which OOMs and
+                    # triggers a cascade that shrinks the regime's actual B).
+                    # If 4× B still produces too many microbatches, accept it.
                     _total_ex = sum(mb["input_ids"].size(0) for mb in microbatches)
-                    step_B = max(
-                        int(_total_ex / _max_mb) + 1,
-                        self.max_examples_per_microbatch or 1,
-                    )
+                    _ideal_B = int(_total_ex / _max_mb) + 1
+                    _cur_B = self.max_examples_per_microbatch or _ideal_B
+                    step_B = min(_ideal_B, max(_cur_B * 4, _cur_B + 32))
                     microbatches, enc_len, dec_len = self._make_microbatches(
                         inputs_work,
                         max_tokens_per_microbatch=step_T,
@@ -3281,9 +3308,13 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 if regime_key is not None and not _oom_mid_batch:
                     self._regime_on_success(regime_key)
 
-                # Skip autotune after mid-batch recovery (peak stats are from
-                # a partial step and would produce a bad estimate).
-                if not _oom_mid_batch and regime_key is not None and not getattr(self, "_autotuned_keys", set()).__contains__(regime_key):
+                # Skip autotune when peak memory stats are unrepresentative:
+                #   - mid-batch recovery (partial step)
+                #   - retry attempts (attempt > 0): tiny desperation-mode
+                #     microbatches produce artificially low bytes_per_token,
+                #     causing the autotune to think tokens are cheap → sets
+                #     T=max → next cap-bumped attempt OOMs → B shrinks → repeat
+                if attempt == 0 and not _oom_mid_batch and regime_key is not None and not getattr(self, "_autotuned_keys", set()).__contains__(regime_key):
                     # Use lower safety factor if this regime recently OOM'd
                     # (previous autotune overshot, so be more conservative)
                     st = self._regime_state(regime_key)
