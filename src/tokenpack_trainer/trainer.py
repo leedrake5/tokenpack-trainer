@@ -3362,33 +3362,23 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 # Throttled on slow steps: first 3, then every 50th.
                 _base_now = getattr(self, "_step_exec_baseline_ms", _exec_ms)
                 _is_slow = _step_count > 3 and (_exec_ms > _base_now * 3 or _exec_ms > 5_000)
-                _is_periodic = _step_count <= 3 or _step_count % 200 == 0
-                if self.debug and (_is_slow or _is_periodic):
-                    if _is_slow:
-                        _slow_diag_count = getattr(self, "_slow_diag_count", 0) + 1
-                        self._slow_diag_count = _slow_diag_count
-                        _should_print = _slow_diag_count <= 3 or _slow_diag_count % 50 == 0
-                        _label = f"Slow step #{_slow_diag_count}"
-                    else:
-                        _should_print = True
-                        _label = f"Step {_step_count}"
-                    if _should_print:
-                        _regime_st = self._regime_state(regime_key) if regime_key is not None else {}
-                        _vram_mb = torch.cuda.memory_allocated(self.args.device) / (1 << 20) if torch.cuda.is_available() else 0
-                        _vram_total_mb = torch.cuda.get_device_properties(self.args.device).total_memory / (1 << 20) if torch.cuda.is_available() else 0
-                        print(
-                            f"[TokenPackTrainer] {_label}: "
-                            f"{_exec_ms/1000:.1f}s "
-                            f"(baseline={_base_now/1000:.1f}s) | "
-                            f"regime={regime_key}, B={_regime_st.get('B')}, "
-                            f"T={_regime_st.get('T')}, hwm_T={_regime_st.get('hwm_T')}, "
-                            f"stable={_regime_st.get('stable', 0)} | "
-                            f"microbatches={num_micro}, examples={total_examples}, "
-                            f"tokens={total_tokens}, eff_tokens={eff_tokens} | "
-                            f"VRAM={_vram_mb:.0f}/{_vram_total_mb:.0f}MB"
-                        )
-                elif not _is_slow:
-                    self._slow_diag_count = 0  # reset counter on normal steps
+                if self.debug:
+                    _regime_st = self._regime_state(regime_key) if regime_key is not None else {}
+                    _vram_mb = torch.cuda.memory_allocated(self.args.device) / (1 << 20) if torch.cuda.is_available() else 0
+                    _vram_total_mb = torch.cuda.get_device_properties(self.args.device).total_memory / (1 << 20) if torch.cuda.is_available() else 0
+                    _slow_tag = " [SLOW]" if _is_slow else ""
+                    print(
+                        f"[TokenPackTrainer] Step {_step_count}{_slow_tag}: "
+                        f"{_exec_ms/1000:.1f}s "
+                        f"(baseline={_base_now/1000:.1f}s) | "
+                        f"regime={regime_key}, B={_regime_st.get('B')}, "
+                        f"T={_regime_st.get('T')}, hwm_T={_regime_st.get('hwm_T')}, "
+                        f"stable={_regime_st.get('stable', 0)}, "
+                        f"bpt={_regime_st.get('bytes_per_token', 'None')} | "
+                        f"microbatches={num_micro}, examples={total_examples}, "
+                        f"tokens={total_tokens}, eff_tokens={eff_tokens} | "
+                        f"VRAM={_vram_mb:.0f}/{_vram_total_mb:.0f}MB"
+                    )
 
                 # --- Sustained slowdown watchdog ---
                 # Defragment CUDA cache when training has been slow for a
