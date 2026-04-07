@@ -3326,20 +3326,29 @@ class TokenPackTrainer(Seq2SeqTrainer):
                                           "examples": 0, "tokens": 0, "microbatches": 0}
 
                 # --- Slow step diagnostic ---
-                # When a step is much slower than the baseline, log regime
-                # details so the cause is visible without needing debug=True.
+                # When a step is slow, log regime details so the cause is
+                # visible without needing debug=True.  Two triggers:
+                #   - 10× baseline (detects regression from known-good speed)
+                #   - >30s absolute (catches slow-from-start after resume)
+                # Throttled to once per 10 slow steps to avoid flooding logs.
                 _base_now = getattr(self, "_step_exec_baseline_ms", _exec_ms)
-                if _step_count > 20 and _exec_ms > max(_base_now * 10, 10_000):
-                    _regime_st = self._regime_state(regime_key) if regime_key is not None else {}
-                    logger.info(
-                        f"[TokenPackTrainer] Slow step: {_exec_ms/1000:.1f}s "
-                        f"(baseline={_base_now/1000:.1f}s) | "
-                        f"regime={regime_key}, B={_regime_st.get('B')}, "
-                        f"T={_regime_st.get('T')}, hwm_T={_regime_st.get('hwm_T')}, "
-                        f"stable={_regime_st.get('stable', 0)} | "
-                        f"microbatches={num_micro}, examples={total_examples}, "
-                        f"tokens={total_tokens}, eff_tokens={eff_tokens}"
-                    )
+                if _step_count > 5 and (_exec_ms > _base_now * 10 or _exec_ms > 30_000):
+                    _slow_diag_count = getattr(self, "_slow_diag_count", 0) + 1
+                    self._slow_diag_count = _slow_diag_count
+                    if _slow_diag_count <= 3 or _slow_diag_count % 10 == 0:
+                        _regime_st = self._regime_state(regime_key) if regime_key is not None else {}
+                        logger.info(
+                            f"[TokenPackTrainer] Slow step #{_slow_diag_count}: "
+                            f"{_exec_ms/1000:.1f}s "
+                            f"(baseline={_base_now/1000:.1f}s) | "
+                            f"regime={regime_key}, B={_regime_st.get('B')}, "
+                            f"T={_regime_st.get('T')}, hwm_T={_regime_st.get('hwm_T')}, "
+                            f"stable={_regime_st.get('stable', 0)} | "
+                            f"microbatches={num_micro}, examples={total_examples}, "
+                            f"tokens={total_tokens}, eff_tokens={eff_tokens}"
+                        )
+                else:
+                    self._slow_diag_count = 0  # reset counter on normal steps
 
                 # --- Sustained slowdown watchdog ---
                 # Defragment CUDA cache when training has been slow for a
