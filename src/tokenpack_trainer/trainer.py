@@ -1011,7 +1011,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
         safe_T = int(0.66 * available / max(bpt, 1e-9))
         return max(self._regime_min_T, safe_T)
 
-    def _regime_on_oom(self, key: int):
+    def _regime_on_oom(self, key: int, shrink_b: bool = True):
+        """Shrink regime limits after an OOM event.
+
+        Args:
+            key: regime key
+            shrink_b: if True, try shrinking B first (default). If False,
+                skip B and go straight to T.  The retry loop sets this to
+                False after the first retry so that B is only shrunk once
+                per failing batch — preventing cascades like B=457 → B=7
+                from 12 consecutive shrinks across 3 failing batches.
+        """
         st = self._regime_state(key)
 
         # Before resetting stable, capture current T as HWM if it was working
@@ -1038,19 +1048,20 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # throughput (~66% of available VRAM).  Never shrink below this.
         safe_floor = self._safe_floor_T()
 
-        # Shrink B first — if uncapped, materialize from regime_max_B so we can shrink
-        if st["B"] is None:
-            st["B"] = self._regime_max_B
-            return
+        # Shrink B first (only on first retry per batch — shrink_b=True).
+        # On subsequent retries, skip B and shrink T instead.  This prevents
+        # cascading B from e.g. 457 → 7 across 12 retries.
+        if shrink_b:
+            if st["B"] is None:
+                st["B"] = self._regime_max_B
+                return
 
-        new_B = max(self._regime_min_B, int(st["B"] * 0.7))
-        if new_B < st["B"]:
-            st["B"] = new_B
-            return
+            new_B = max(self._regime_min_B, int(st["B"] * 0.7))
+            if new_B < st["B"]:
+                st["B"] = new_B
+                return
 
-        # If B can't shrink further, shrink token budget — but never below
-        # the safe floor.  The HWM is the first reference (what worked before),
-        # the safe floor is the hard minimum (what maintains throughput).
+        # Shrink token budget — but never below the safe floor.
         floor = max(safe_floor, self._regime_min_T)
         hwm = st.get("hwm_T")
         if hwm and st["T"] > hwm:
@@ -1682,6 +1693,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self,
         inputs,
         max_tokens_per_microbatch: int | None = None,
+        max_examples_per_microbatch: int | None = None,
         return_lengths: bool = False,
         precomputed_lengths: tuple | None = None,
         generation_max_length: int | None = None,
@@ -1702,7 +1714,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         N = int(effective_len.numel())
 
         budget = int(max_tokens_per_microbatch or self.max_tokens_per_microbatch)
-        max_B = self.max_examples_per_microbatch  # may be None
+        max_B = max_examples_per_microbatch if max_examples_per_microbatch is not None else self.max_examples_per_microbatch
         padding_aware = getattr(self, "padding_aware_budget", False)
 
         # --- Sort once on GPU, then bulk-convert to Python lists (no per-element .item()) ---
@@ -3003,6 +3015,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         last_err = None
         regime_key = None  # <<< keep across retries for this same HF batch
+        _b_shrunk_this_batch = False  # only shrink B once per batch
 
         for attempt in range(self.oom_max_retries + 1):
             try:
@@ -3041,31 +3054,37 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 _t_plan = time.time()  # planning done
 
                 # --- Cap microbatches per step ---
-                # If a shrunken regime would produce too many tiny microbatches,
-                # bump the budget for THIS step and re-plan.
+                # If a regime would produce too many microbatches, bump BOTH
+                # the token budget (T) and examples-per-microbatch (B) for
+                # THIS step.  Previously only T was bumped, but for regimes
+                # with many short examples (regime 1), B is the bottleneck —
+                # 25,000 examples / B=171 = 151 microbatches regardless of T.
                 #
-                # IMPORTANT: Only apply the cap on the first attempt (attempt == 0).
-                # On OOM retries, the regime has been shrunk specifically to avoid
-                # OOM — bumping T back up to fit the cap undoes the shrink and
-                # creates a death loop (shrink → cap overrides → OOM → repeat).
-                # On retries, accept the extra microbatches as the cost of safety.
+                # IMPORTANT: Only apply on attempt 0 (not OOM retries).
                 _max_mb = self.max_microbatches_per_step
                 if attempt == 0 and _max_mb > 0 and len(microbatches) > _max_mb:
-                    # Compute the budget that would yield ~max_mb microbatches
                     step_T = max(
                         int(eff_tokens / _max_mb) + 1,
                         self.max_tokens_per_microbatch,
                     )
+                    # Also bump B: ceil(total_examples / max_mb)
+                    _total_ex = sum(mb["input_ids"].size(0) for mb in microbatches)
+                    step_B = max(
+                        int(_total_ex / _max_mb) + 1,
+                        self.max_examples_per_microbatch or 1,
+                    )
                     microbatches, enc_len, dec_len = self._make_microbatches(
                         inputs_work,
                         max_tokens_per_microbatch=step_T,
+                        max_examples_per_microbatch=step_B,
                         return_lengths=True,
                         precomputed_lengths=(enc_len, dec_len),
                     )
                     if self.debug:
-                        logger.info(
-                            f"[TokenPackTrainer] Microbatch cap: regime T={self.max_tokens_per_microbatch} "
-                            f"would produce {_max_mb}+ microbatches, bumped to T={step_T} "
+                        print(
+                            f"[TokenPackTrainer] Microbatch cap: {_total_ex} examples, "
+                            f"regime B={self.max_examples_per_microbatch}, T={self.max_tokens_per_microbatch} "
+                            f"→ bumped to B={step_B}, T={step_T} "
                             f"→ {len(microbatches)} microbatches for this step"
                         )
 
@@ -3335,7 +3354,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 if _step_count > 5 and (_exec_ms > _base_now * 10 or _exec_ms > 30_000):
                     _slow_diag_count = getattr(self, "_slow_diag_count", 0) + 1
                     self._slow_diag_count = _slow_diag_count
-                    if _slow_diag_count <= 3 or _slow_diag_count % 10 == 0:
+                    if self.debug and (_slow_diag_count <= 3 or _slow_diag_count % 10 == 0):
                         _regime_st = self._regime_state(regime_key) if regime_key is not None else {}
                         print(
                             f"[TokenPackTrainer] Slow step #{_slow_diag_count}: "
@@ -3423,7 +3442,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 # >>> shrink only THIS regime first
                 if regime_key is not None:
-                    self._regime_on_oom(regime_key)
+                    # Only shrink B on the first OOM per batch.  Subsequent
+                    # retries shrink T instead.  This prevents cascading B
+                    # from e.g. 457 → 7 across 4 retries in one batch.
+                    self._regime_on_oom(regime_key, shrink_b=not _b_shrunk_this_batch)
+                    _b_shrunk_this_batch = True
                     # re-apply immediately so the retry uses the new values
                     self._apply_regime_limits(regime_key)
                     changed = True
