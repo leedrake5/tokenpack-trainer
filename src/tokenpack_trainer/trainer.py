@@ -3337,7 +3337,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     self._slow_diag_count = _slow_diag_count
                     if _slow_diag_count <= 3 or _slow_diag_count % 10 == 0:
                         _regime_st = self._regime_state(regime_key) if regime_key is not None else {}
-                        logger.info(
+                        print(
                             f"[TokenPackTrainer] Slow step #{_slow_diag_count}: "
                             f"{_exec_ms/1000:.1f}s "
                             f"(baseline={_base_now/1000:.1f}s) | "
@@ -3386,7 +3386,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                         _util = _alloc / max(_total_dev, 1)
 
                         if self.debug:
-                            logger.info(
+                            print(
                                 f"[TokenPackTrainer] Sustained slowdown: "
                                 f"{_slow_accum:.0f}s of slow steps accumulated "
                                 f"(baseline={_base_now/1000:.1f}s), VRAM {_util:.0%}. "
