@@ -2984,7 +2984,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # After step 5, baseline is stable — skip the memory_allocated() sync.
         _step = getattr(self, "state", None)
         _global_step = getattr(_step, "global_step", 0) if _step else 0
-        if torch.cuda.is_available() and _global_step <= 5:
+        _local_step = getattr(self, "_timing_step_count", 0)
+        # Use local step count (resets each run) so baseline capture works
+        # on resume.  global_step would be e.g. 21537 after resume, skipping
+        # the capture entirely and leaving stale baselines from the checkpoint.
+        if torch.cuda.is_available() and _local_step <= 5:
             # Track baseline on ALL devices so _bottleneck_gpu_stats can use
             # the correct per-device baseline for autotune calculations.
             any_jumped = False
