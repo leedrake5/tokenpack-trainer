@@ -257,6 +257,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         eval_ramp_every: int | str = "auto",         # eval: ramp T after N successes ("auto" = VRAM-scaled)
         eval_ramp_T: float | str = "auto",           # eval: factor to increase T on ramp ("auto" = VRAM-scaled)
         max_microbatches_per_step: int = 8,              # cap microbatches per step; if exceeded, budget is bumped for the step
+        seed_regime_state: str | None = None,          # path to regime_state.json or checkpoint dir to seed B/T defaults from a previous run
         max_eval_generate_examples: int | None = None,  # max examples per generate call (None = no limit, uses token budget only)
         builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
         builtin_metrics_tokenize: str = "13a",
@@ -338,6 +339,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Initial values for new regimes (from user config)
         self._regime_default_B = self.max_examples_per_microbatch
         self._regime_default_T = self.max_tokens_per_microbatch
+
+        # --- Seed regime state from a previous run ---
+        # Loads calibrated B/T values as starting points, avoiding cold-start
+        # calibration (which can take thousands of OOM events for large-vocab models).
+        # Autotuned keys are cleared so each regime re-autotunes T with the current
+        # model's memory baseline — only the B/T starting points are reused.
+        self._seed_regime_state_path = seed_regime_state
+        if seed_regime_state is not None:
+            self._seed_regime_state(str(seed_regime_state))
 
         # --- Sequence length tracking for diagnostics ---
         self._max_seen_enc_len = 0
@@ -2684,6 +2694,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "gpu_baseline_mem_per_device": {
                 str(k): v for k, v in getattr(self, "_gpu_baseline_mem_per_device", {}).items()
             },
+            "seeded_from": getattr(self, "_seed_regime_state_path", None),
         }
         path = os.path.join(output_dir, self.REGIME_STATE_FILENAME)
         try:
@@ -2744,6 +2755,73 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return True
         except Exception as e:
             logger.warning(f"[TokenPackTrainer] Could not load regime state from {path}: {e}")
+            return False
+
+    def _seed_regime_state(self, source: str) -> bool:
+        """Seed regime B/T defaults from a previous run's regime_state.json.
+
+        Unlike _load_regime_state (which fully restores a checkpoint's state for
+        resuming), this method uses the previous run's calibrated B and T values
+        as *starting points* for a fresh training run.  This avoids the expensive
+        cold-start calibration that can take thousands of OOM events for
+        large-vocab models.
+
+        What is preserved:
+          - B (max examples per microbatch): reflects data distribution + vocab
+            size constraints that are unlikely to change between runs.
+          - T (token budget): a reasonable starting point, though the model's
+            memory footprint may have changed.
+
+        What is reset:
+          - autotuned_keys: cleared so every regime re-autotunes T with the
+            current model's actual memory baseline on first encounter.
+          - stable counts: reset to 0 so ramp-up behaviour starts fresh.
+          - OOM counts/history: cleared since the new model may have different
+            memory characteristics.
+          - gpu_baseline_mem: not loaded — re-measured from current model.
+
+        Args:
+            source: Path to a regime_state.json file or a checkpoint directory
+                    containing one.
+
+        Returns:
+            True if seeding succeeded, False otherwise.
+        """
+        path = source
+        if os.path.isdir(source):
+            path = os.path.join(source, self.REGIME_STATE_FILENAME)
+        if not os.path.isfile(path):
+            logger.warning(f"[TokenPackTrainer] seed_regime_state: file not found: {path}")
+            return False
+        try:
+            with open(path, "r") as f:
+                state = json.load(f)
+
+            seeded = {}
+            for k, v in state.get("regime_limits", {}).items():
+                seeded[int(k)] = {
+                    "B": v.get("B"),
+                    "T": int(v["T"]),
+                    "stable": 0,  # fresh start — don't inherit stability
+                    "hwm_T": int(v["hwm_T"]) if v.get("hwm_T") is not None else None,
+                    "hwm_B": int(v["hwm_B"]) if v.get("hwm_B") is not None else None,
+                    "bytes_per_token": None,  # reset — model memory footprint may differ
+                }
+            self._regime_limits = seeded
+
+            # Force re-autotune: the model's memory footprint may differ
+            # (e.g. untied embeddings, different model size, different optimizer).
+            self._autotuned_keys = set()
+            self._regime_oom_count = {}
+            # Don't load gpu_baseline_mem — let it re-measure with current model.
+
+            logger.info(
+                f"[TokenPackTrainer] Seeded regime state from {path}: "
+                f"{len(seeded)} regimes (B/T loaded, autotuned_keys cleared for re-calibration)"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[TokenPackTrainer] Could not seed regime state from {path}: {e}")
             return False
 
     def _save_checkpoint(self, model, trial):
