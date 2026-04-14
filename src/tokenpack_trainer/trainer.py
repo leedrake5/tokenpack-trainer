@@ -1889,10 +1889,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return (torch.tensor(avg_loss, device=self.args.device), None, None)
 
         # ------------- GPU-native microbatch path -------------
-        # Bypass our _prepare_inputs override (which no-ops when
-        # use_cpu_microbatch=True for training) — super() always
-        # transfers to the correct device.
-        inputs = super(TokenPackTrainer, self)._prepare_inputs(inputs)
+        # Use _to_device directly — our _prepare_input(s) overrides no-op
+        # when use_cpu_microbatch=True (training flag), so super() wouldn't
+        # transfer either since it calls self._prepare_input() per tensor.
+        inputs = self._to_device(inputs)
         inputs = self._truncate_batch(inputs)
 
         microbatches = self._make_microbatches(
@@ -2467,10 +2467,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 mb_tok_sum = 0
                 with torch.no_grad():
                     for mb in loss_microbatches:
-                        if self._use_cpu_microbatch_eval:
-                            mb = self._to_device(mb)
-                        else:
-                            mb = super(TokenPackTrainer, self)._prepare_inputs(mb)
+                        mb = self._to_device(mb)
                         try:
                             mb_labels = mb.get("labels", None)
                             loss_mb, _, _ = self.prediction_step(self.model, mb, prediction_loss_only=True)
