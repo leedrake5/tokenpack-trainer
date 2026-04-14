@@ -2246,6 +2246,22 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         self._eval_stable = 0
 
+    def _eval_bootstrap_hwm(self):
+        """Record current limits as HWMs immediately (no stability requirement).
+
+        Called after the first successful generation retry within an OOM loop,
+        so the rest of the eval pass has a proven floor.  Normal
+        _eval_on_success() still gates further HWM *increases* on 5 consec
+        successes — this only bootstraps when no HWM exists yet.
+        """
+        self._eval_regime_init()
+        cur_T = self.max_eval_tokens_per_microbatch
+        cur_gen_B = getattr(self, "max_eval_generate_examples", None)
+        if cur_T is not None and self._eval_hwm_T is None:
+            self._eval_hwm_T = cur_T
+        if cur_gen_B is not None and self._eval_hwm_gen_B is None:
+            self._eval_hwm_gen_B = cur_gen_B
+
     def _token_aware_evaluate(
         self,
         eval_dataset=None,
@@ -2296,11 +2312,22 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Re-estimate every eval call: available VRAM varies as optimizer
         # states are offloaded/restored between train and eval phases.
         _user_set_gen_B = getattr(self, "_user_set_gen_B", None)
+        self._eval_regime_init()
         if do_generate:
             auto_B = self._estimate_max_gen_examples(gen_kwargs)
             if auto_B is not None:
                 # Only override if user didn't explicitly set a value at init
                 if _user_set_gen_B is None:
+                    # Cap with HWM: the VRAM estimate is theoretical; the HWM
+                    # is what actually ran without OOM.  Don't re-discover the
+                    # OOM boundary every eval call.
+                    hwm_gen_B = self._eval_hwm_gen_B
+                    if hwm_gen_B is not None and auto_B > hwm_gen_B:
+                        logger.info(
+                            f"[TokenPackTrainer] Auto-tune gen_B={auto_B} exceeds "
+                            f"HWM={hwm_gen_B}; capping at HWM"
+                        )
+                        auto_B = hwm_gen_B
                     self.max_eval_generate_examples = auto_B
                     logger.info(
                         f"[TokenPackTrainer] Auto-set max_eval_generate_examples={auto_B} "
@@ -2463,6 +2490,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             fast_path_ok = (gen_limit is None or B <= gen_limit)
 
             # ---- fast path: generate whole super-batch at once ----
+            _fast_path_oom = False
             if fast_path_ok:
                 try:
                     gpu_batch = self._to_device(super_batch)
@@ -2473,6 +2501,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
                     if not self._is_cuda_oom(e):
                         raise
+                    _fast_path_oom = True
                     self._eval_oom_cleanup()
                     # fall through to microbatching
 
@@ -2501,6 +2530,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                     last_err = None
                     self._eval_on_success()
+                    # Bootstrap HWM immediately after any OOM recovery
+                    # (fast-path fallthrough or microbatch retry) so
+                    # subsequent flushes have a proven floor.
+                    if attempt > 0 or _fast_path_oom:
+                        self._eval_bootstrap_hwm()
                     break
 
                 except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
