@@ -2452,10 +2452,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if _n_eval is not None and _n_eval > self.max_metric_samples:
                 _gen_stride = max(1, _n_eval // self.max_metric_samples)
 
-        # ---- batch accumulation for generation ---------------------------------
-        # The dataloader yields small batches (per_device_eval_batch_size), but
-        # VRAM can fit many more examples.  Accumulate on CPU until we reach the
-        # auto-tuned target, then flush one large generate() call.
+        # ---- generation batching state (used by _flush_gen_buffer closure) ----
         _gen_buffer: list = []
         _gen_buffer_count = 0
         _gen_target_B = self.max_eval_generate_examples or 0  # 0 = no accumulation
@@ -2575,7 +2572,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         start_time = time.time()
 
-        for batch in tqdm(dataloader, desc=desc, leave=True, disable=bool(getattr(self.args, "disable_tqdm", False))):
+        # ================================================================
+        # PHASE 1: Loss computation (fast forward passes, high GPU util)
+        # ================================================================
+        # Accumulate gen-eligible batches on the side; generation runs in
+        # Phase 2 so the loss progress bar never stalls on generate().
+        _all_gen_batches: list = []
+
+        for batch in tqdm(dataloader, desc=f"{desc} [loss]", leave=True, disable=bool(getattr(self.args, "disable_tqdm", False))):
             num_steps += 1
 
             labels = batch.get("labels", None)
@@ -2651,28 +2655,52 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if _gen_stride > 1 and (num_steps % _gen_stride) != 1:
                 continue
 
-            # Accumulate batches until we fill the VRAM budget, then flush.
-            # When eval is GPU-native, keep tensors on GPU to avoid the
-            # GPU→CPU→GPU round-trip over PCIe; only offload when using
-            # CPU-microbatch eval mode (where data starts on CPU anyway).
+            # Stage batch for Phase 2 generation.  Store on CPU to free
+            # GPU memory for loss computation of remaining batches.
             acc_batch = self._truncate_batch(batch)
-            if self._use_cpu_microbatch_eval:
-                acc_batch = {
-                    k: v.cpu() if isinstance(v, torch.Tensor) and v.is_cuda else v
-                    for k, v in acc_batch.items()
-                }
-            _gen_buffer.append(acc_batch)
-            _gen_buffer_count += acc_batch["input_ids"].size(0)
+            acc_batch = {
+                k: v.cpu() if isinstance(v, torch.Tensor) and v.is_cuda else v
+                for k, v in acc_batch.items()
+            }
+            _all_gen_batches.append(acc_batch)
 
-            # Only flush when we've accumulated enough examples to fill VRAM
-            if _gen_target_B > 0 and _gen_buffer_count < _gen_target_B:
-                continue  # keep accumulating
+        # ================================================================
+        # PHASE 2: Generation (autoregressive decode, memory-bandwidth bound)
+        # ================================================================
+        if _all_gen_batches:
+            # Build super-batches up to _gen_target_B, then flush each.
+            _gen_buffer = []
+            _gen_buffer_count = 0
+            n_flushes = 0
 
-            _flush_gen_buffer()
+            # Count expected flushes for the progress bar
+            total_gen_examples = sum(b["input_ids"].size(0) for b in _all_gen_batches)
+            flush_target = _gen_target_B if _gen_target_B > 0 else total_gen_examples
+            expected_flushes = max(1, (total_gen_examples + flush_target - 1) // flush_target)
 
-        # Flush any remaining accumulated batches after the loop ends
-        if _gen_buffer:
-            _flush_gen_buffer()
+            gen_pbar = tqdm(
+                total=expected_flushes, desc=f"{desc} [generate]", leave=True,
+                disable=bool(getattr(self.args, "disable_tqdm", False)),
+            )
+
+            for acc_batch in _all_gen_batches:
+                _gen_buffer.append(acc_batch)
+                _gen_buffer_count += acc_batch["input_ids"].size(0)
+
+                if _gen_target_B > 0 and _gen_buffer_count < _gen_target_B:
+                    continue
+
+                _flush_gen_buffer()
+                n_flushes += 1
+                gen_pbar.update(1)
+
+            # Flush remainder
+            if _gen_buffer:
+                _flush_gen_buffer()
+                n_flushes += 1
+                gen_pbar.update(1)
+
+            gen_pbar.close()
 
         # Wait for any in-flight decode threads before reading metric_state
         _drain_decode_threads()
