@@ -179,6 +179,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
         Uses prefetching to overlap transfer with computation.
         If False, use standard HF device placement.
 
+    use_cpu_microbatch_eval : bool or None
+        Override use_cpu_microbatch for evaluation only. Set to False to keep
+        eval batches on GPU (avoids repeated CPU→GPU transfers over slow PCIe).
+        None (default) inherits from use_cpu_microbatch.
+
     eval_mode : str, optional
         "hf" or None: Use standard HF evaluation (faster, no generation).
         "token_aware_metrics": Use token-aware eval with generation for BLEU/chrF.
@@ -235,6 +240,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         length_column_name: str = "input_length",
         log_longest_every: int = 0,   # 0 = disable logging, >0 = log every N steps
         use_cpu_microbatch: bool = True,
+        use_cpu_microbatch_eval: bool | None = None,
         eval_mode: str | None = None,  #use classic hf or switch to "token_aware_metrics" to use token packing
         debug: bool = False,
         decoder_cost_multiplier: float | str = "auto",  # "auto" = detect from vocab_size; or set manually (e.g. 8.0 for 256K vocab)
@@ -278,6 +284,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self.length_column_name = length_column_name
         self.log_longest_every = int(log_longest_every)
         self.use_cpu_microbatch = bool(use_cpu_microbatch)
+        self._use_cpu_microbatch_eval = (
+            bool(use_cpu_microbatch_eval)
+            if use_cpu_microbatch_eval is not None
+            else self.use_cpu_microbatch
+        )
         self.max_examples_per_microbatch = max_examples_per_microbatch
         self.max_eval_tokens_per_microbatch = (
             int(max_eval_tokens_per_microbatch)
@@ -1834,7 +1845,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         model.eval()
 
         # ------------- CPU microbatch path -------------
-        if self.use_cpu_microbatch:
+        if self._use_cpu_microbatch_eval:
             inputs_cpu = self._move_to_cpu(inputs)
             inputs_cpu = self._truncate_batch(inputs_cpu)
 
@@ -1878,7 +1889,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return (torch.tensor(avg_loss, device=self.args.device), None, None)
 
         # ------------- GPU-native microbatch path -------------
-        inputs = self._prepare_inputs(inputs)
+        # Bypass our _prepare_inputs override (which no-ops when
+        # use_cpu_microbatch=True for training) — super() always
+        # transfers to the correct device.
+        inputs = super(TokenPackTrainer, self)._prepare_inputs(inputs)
         inputs = self._truncate_batch(inputs)
 
         microbatches = self._make_microbatches(
@@ -2439,7 +2453,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 self._eval_oom_cleanup()
 
                 # Compute loss in microbatches
-                if self.use_cpu_microbatch:
+                if self._use_cpu_microbatch_eval:
                     loss_inputs = self._truncate_batch(self._move_to_cpu(batch))
                 else:
                     loss_inputs = self._truncate_batch(batch)
@@ -2453,10 +2467,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 mb_tok_sum = 0
                 with torch.no_grad():
                     for mb in loss_microbatches:
-                        if self.use_cpu_microbatch:
+                        if self._use_cpu_microbatch_eval:
                             mb = self._to_device(mb)
                         else:
-                            mb = self._prepare_inputs(mb)
+                            mb = super(TokenPackTrainer, self)._prepare_inputs(mb)
                         try:
                             mb_labels = mb.get("labels", None)
                             loss_mb, _, _ = self.prediction_step(self.model, mb, prediction_loss_only=True)
