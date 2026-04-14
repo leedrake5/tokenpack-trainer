@@ -2099,56 +2099,151 @@ class TokenPackTrainer(Seq2SeqTrainer):
     def _shrink_eval_limits(self) -> bool:
         """
         Shrink eval limits on OOM. Returns True if we changed something.
-        Prefers shrinking eval token budget; optionally shrink B as secondary.
+
+        Uses high-water marks as intelligent floors: if we're above the HWM,
+        fall back to it first.  If at/near the HWM, nudge 15% below it.
+        Only applies the blind proportional shrink as a last resort.
+
+        Order: shrink generation batch size first (biggest VRAM consumer due
+        to KV cache), then token budget, then microbatch examples.
         """
+        self._eval_regime_init()
         changed = False
 
-        # shrink eval token budget first
-        if self.max_eval_tokens_per_microbatch is not None and self.max_eval_tokens_per_microbatch > self.oom_min_tokens:
-            new_T = max(self.oom_min_tokens, int(self.max_eval_tokens_per_microbatch * self.oom_shrink_tokens))
-            if new_T < self.max_eval_tokens_per_microbatch:
-                self.max_eval_tokens_per_microbatch = new_T
+        # --- 1. Shrink generation batch size (gen_B) first ---
+        cur_gen_B = getattr(self, "max_eval_generate_examples", None)
+        hwm_gen_B = self._eval_hwm_gen_B
+        if cur_gen_B is not None and cur_gen_B > 1:
+            if hwm_gen_B and cur_gen_B > hwm_gen_B:
+                # Above HWM → fall to proven-safe level
+                self.max_eval_generate_examples = hwm_gen_B
                 changed = True
-
-        # optional: also shrink microbatch examples if tokens can't shrink further
-        if not changed:
-            if self.max_examples_per_microbatch is not None and self.max_examples_per_microbatch > self.oom_min_B:
-                new_B = max(self.oom_min_B, int(self.max_examples_per_microbatch * self.oom_shrink_B))
-                if new_B < self.max_examples_per_microbatch:
-                    self.max_examples_per_microbatch = new_B
+            elif hwm_gen_B and cur_gen_B > int(hwm_gen_B * 0.85):
+                # At/near HWM → nudge below it
+                self.max_eval_generate_examples = max(1, int(hwm_gen_B * 0.85))
+                changed = True
+            else:
+                # Below HWM or no HWM → proportional shrink
+                new_gen_B = max(1, int(cur_gen_B * self.oom_shrink_B))
+                if new_gen_B < cur_gen_B:
+                    self.max_eval_generate_examples = new_gen_B
                     changed = True
+
+        if changed:
+            return True
+
+        # --- 2. Shrink eval token budget (T) ---
+        cur_T = self.max_eval_tokens_per_microbatch
+        hwm_T = self._eval_hwm_T
+        if cur_T is not None and cur_T > self.oom_min_tokens:
+            if hwm_T and cur_T > hwm_T:
+                # Above HWM → fall to proven-safe level
+                new_T = max(self.oom_min_tokens, hwm_T)
+                if new_T < cur_T:
+                    self.max_eval_tokens_per_microbatch = new_T
+                    changed = True
+            elif hwm_T and cur_T > int(hwm_T * 0.85):
+                # At/near HWM → nudge below it
+                new_T = max(self.oom_min_tokens, int(hwm_T * 0.85))
+                if new_T < cur_T:
+                    self.max_eval_tokens_per_microbatch = new_T
+                    changed = True
+            else:
+                # Below HWM or no HWM → proportional shrink
+                new_T = max(self.oom_min_tokens, int(cur_T * self.oom_shrink_tokens))
+                if new_T < cur_T:
+                    self.max_eval_tokens_per_microbatch = new_T
+                    changed = True
+
+        if changed:
+            return True
+
+        # --- 3. Shrink microbatch examples (B) as last resort ---
+        if self.max_examples_per_microbatch is not None and self.max_examples_per_microbatch > self.oom_min_B:
+            new_B = max(self.oom_min_B, int(self.max_examples_per_microbatch * self.oom_shrink_B))
+            if new_B < self.max_examples_per_microbatch:
+                self.max_examples_per_microbatch = new_B
+                changed = True
 
         return changed
 
     def _eval_regime_init(self):
         if not hasattr(self, "_eval_stable"):
             self._eval_stable = 0
+        if not hasattr(self, "_eval_hwm_T"):
+            self._eval_hwm_T = None   # proven-safe token budget
+        if not hasattr(self, "_eval_hwm_gen_B"):
+            self._eval_hwm_gen_B = None  # proven-safe generation batch size
 
     def _eval_on_success(self):
         """
         Called once per *successful eval batch* (i.e., the batch generated without OOM).
-        Ramps up token budget slowly after enough stable batches.
+        Updates high-water marks after consecutive successes and ramps toward
+        the proven-stable operating point when recovering from OOM.
         """
         self._eval_regime_init()
         self._eval_stable += 1
 
+        cur_T = self.max_eval_tokens_per_microbatch
+        cur_gen_B = getattr(self, "max_eval_generate_examples", None)
+
+        # Update HWMs after enough consecutive successes confirm stability.
+        if self._eval_stable >= 5:
+            if cur_T is not None and cur_T > (self._eval_hwm_T or 0):
+                self._eval_hwm_T = cur_T
+            if cur_gen_B is not None and cur_gen_B > (self._eval_hwm_gen_B or 0):
+                self._eval_hwm_gen_B = cur_gen_B
+
         # only ramp if we have a budget
-        if self.max_eval_tokens_per_microbatch is None:
+        if cur_T is None:
             return
 
+        hwm_T = self._eval_hwm_T
+        hwm_gen_B = self._eval_hwm_gen_B
+
+        # Fast recovery ramp: when T or gen_B is well below HWM (post-OOM),
+        # ramp toward the proven-stable level instead of creeping up slowly.
+        _recovering = False
+        if hwm_T and cur_T < int(hwm_T * 0.9):
+            _recovering = True
+        if hwm_gen_B and cur_gen_B is not None and cur_gen_B < int(hwm_gen_B * 0.9):
+            _recovering = True
+
+        if _recovering:
+            if self._eval_stable % 3 == 0:  # every 3 successes (faster than training)
+                if hwm_T and cur_T < hwm_T:
+                    new_T = min(int(cur_T * 1.20), hwm_T)
+                    self.max_eval_tokens_per_microbatch = max(new_T, self.oom_min_tokens)
+                if cur_gen_B is not None and hwm_gen_B and cur_gen_B < hwm_gen_B:
+                    new_gen_B = min(int(cur_gen_B * 1.20) + 1, hwm_gen_B)
+                    self.max_eval_generate_examples = max(1, new_gen_B)
+            return  # don't also apply the normal ramp
+
+        # Normal ramp (at or above HWM — regime is at its proven stable pace)
         ramp_every = self._eval_ramp_every
         ramp_T = self._eval_ramp_T
         max_T_cap = getattr(self, "max_tokens_per_microbatch", None)  # never exceed train budget if set
 
         if (self._eval_stable % ramp_every) == 0:
-            new_T = int(self.max_eval_tokens_per_microbatch * ramp_T)
+            new_T = int(cur_T * ramp_T)
             if max_T_cap is not None:
                 new_T = min(new_T, int(max_T_cap))
             self.max_eval_tokens_per_microbatch = max(new_T, self.oom_min_tokens)
 
     def _eval_on_oom(self):
-        """Reset stability counter on OOM so we don't ramp immediately after shrinking."""
+        """Capture HWMs (if stable enough) before resetting, so we have a
+        proven-safe fallback after shrinking."""
         self._eval_regime_init()
+
+        # Capture HWMs before resetting stable counter
+        if self._eval_stable >= 3:
+            cur_T = self.max_eval_tokens_per_microbatch
+            cur_gen_B = getattr(self, "max_eval_generate_examples", None)
+            if cur_T is not None and cur_T > (self._eval_hwm_T or 0):
+                self._eval_hwm_T = cur_T
+            if cur_gen_B is not None and cur_gen_B > (self._eval_hwm_gen_B or 0):
+                self._eval_hwm_gen_B = cur_gen_B
+
         self._eval_stable = 0
 
     def _token_aware_evaluate(
@@ -2422,6 +2517,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
                             "eval_oom_attempt": float(attempt),
                             "eval_max_T_now": float(self.max_eval_tokens_per_microbatch or 0),
                             "eval_max_B_now": float(self.max_examples_per_microbatch or 0),
+                            "eval_gen_B_now": float(getattr(self, "max_eval_generate_examples", 0) or 0),
+                            "eval_hwm_T": float(self._eval_hwm_T or 0),
+                            "eval_hwm_gen_B": float(self._eval_hwm_gen_B or 0),
                             "eval_changed_limits": float(changed),
                         })
 
@@ -2960,13 +3058,19 @@ class TokenPackTrainer(Seq2SeqTrainer):
         if eval_dataset is None:
             raise ValueError("Evaluation requires an eval_dataset.")
 
-        # Restore eval budget to the user's initial value.  Training regime
-        # management used to clamp this down as a side-effect; even with that
-        # removed, eval OOM handling within a single pass may have shrunk it.
-        # Each eval pass should start fresh — eval has more VRAM headroom than
-        # training (no gradients, optimizer states offloaded).
-        if hasattr(self, "_initial_eval_tokens_per_microbatch"):
-            self.max_eval_tokens_per_microbatch = self._initial_eval_tokens_per_microbatch
+        # Restore eval token budget for this pass.  If we have a HWM from a
+        # previous eval pass (proven-safe ceiling), start there instead of
+        # re-discovering the OOM boundary from the user's initial value.
+        # This prevents the first few batches from OOM-ing every eval call.
+        self._eval_regime_init()
+        initial_T = getattr(self, "_initial_eval_tokens_per_microbatch", None)
+        hwm_T = self._eval_hwm_T
+        if initial_T is not None:
+            if hwm_T is not None and hwm_T < initial_T:
+                # HWM is lower than initial — start from the proven ceiling
+                self.max_eval_tokens_per_microbatch = hwm_T
+            else:
+                self.max_eval_tokens_per_microbatch = initial_T
 
         requested = eval_mode if eval_mode is not None else getattr(self, "eval_mode", None)
         mode = self._normalize_eval_mode(requested)
