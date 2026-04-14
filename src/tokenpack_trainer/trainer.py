@@ -45,6 +45,7 @@ Example:
 
 import json
 import os
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -2270,6 +2271,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "all_refs": [],   # accumulate all references
         }
 
+        # Background decode: run batch_decode in a thread so the GPU can
+        # proceed with the next batch's loss computation in parallel.
+        _decode_threads: list[threading.Thread] = []
+
+        def _drain_decode_threads():
+            """Wait for all pending background decode threads to finish."""
+            for t in _decode_threads:
+                t.join()
+            _decode_threads.clear()
+
         def _add_streaming_metrics(gen_ids: torch.Tensor, labels: torch.Tensor):
             _bleu = metric_state["bleu_obj"]
             _chrf = metric_state["chrf_obj"]
@@ -2285,25 +2296,31 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if not is_main:
                 return
 
-            # Move to CPU before decoding for efficiency
-            if pred_g.device.type != 'cpu':
-                pred_g = pred_g.cpu()
-            if lab_g.device.type != 'cpu':
-                lab_g = lab_g.cpu()
+            # Transfer to CPU synchronously (fast, frees GPU memory)
+            pred_cpu = pred_g.cpu()
+            lab_cpu = lab_g.cpu()
 
-            preds_txt = self.processing_class.batch_decode(pred_g, skip_special_tokens=True)
-            refs_txt  = self.processing_class.batch_decode(lab_g,  skip_special_tokens=True)
+            # Decode + accumulate in a background thread so the GPU can
+            # start the next loss / generate step immediately.
+            def _decode_and_accumulate(pred_ids, lab_ids):
+                preds_txt = self.processing_class.batch_decode(pred_ids, skip_special_tokens=True)
+                refs_txt  = self.processing_class.batch_decode(lab_ids,  skip_special_tokens=True)
 
-            preds = [p.strip() for p in preds_txt]
-            refs  = [[r.strip()] for r in refs_txt]
+                preds = [p.strip() for p in preds_txt]
+                refs  = [[r.strip()] for r in refs_txt]
 
-            if len(preds) == 0:
-                return
+                if len(preds) == 0:
+                    return
 
-            # Accumulate instead of calling add_batch every time (MUCH faster)
-            metric_state["metric_examples"] += len(preds)
-            metric_state["all_preds"].extend(preds)
-            metric_state["all_refs"].extend(refs)
+                # metric_state is only touched by decode threads + main after
+                # _drain_decode_threads(), so no lock needed.
+                metric_state["metric_examples"] += len(preds)
+                metric_state["all_preds"].extend(preds)
+                metric_state["all_refs"].extend(refs)
+
+            t = threading.Thread(target=_decode_and_accumulate, args=(pred_cpu, lab_cpu))
+            t.start()
+            _decode_threads.append(t)
 
         # Compute generation stride to evenly sample across the full eval set
         # (ensures all tasks/domains are represented in metrics, not just the first block)
@@ -2337,6 +2354,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
         def _flush_gen_buffer():
             """Concatenate accumulated batches and run generation."""
             nonlocal _gen_buffer, _gen_buffer_count
+            # Ensure previous decode threads are done before starting new generation
+            _drain_decode_threads()
             if not _gen_buffer:
                 return
 
@@ -2500,13 +2519,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
             if _gen_stride > 1 and (num_steps % _gen_stride) != 1:
                 continue
 
-            # Accumulate batches on CPU until we fill the VRAM budget, then flush
+            # Accumulate batches until we fill the VRAM budget, then flush.
+            # When eval is GPU-native, keep tensors on GPU to avoid the
+            # GPU→CPU→GPU round-trip over PCIe; only offload when using
+            # CPU-microbatch eval mode (where data starts on CPU anyway).
             acc_batch = self._truncate_batch(batch)
-            # Ensure tensors are on CPU for accumulation (avoids wasting VRAM on buffered inputs)
-            acc_batch = {
-                k: v.cpu() if isinstance(v, torch.Tensor) and v.is_cuda else v
-                for k, v in acc_batch.items()
-            }
+            if self._use_cpu_microbatch_eval:
+                acc_batch = {
+                    k: v.cpu() if isinstance(v, torch.Tensor) and v.is_cuda else v
+                    for k, v in acc_batch.items()
+                }
             _gen_buffer.append(acc_batch)
             _gen_buffer_count += acc_batch["input_ids"].size(0)
 
@@ -2519,6 +2541,9 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Flush any remaining accumulated batches after the loop ends
         if _gen_buffer:
             _flush_gen_buffer()
+
+        # Wait for any in-flight decode threads before reading metric_state
+        _drain_decode_threads()
 
         # Note: metrics are computed in the finalize section below using metric_state
 
