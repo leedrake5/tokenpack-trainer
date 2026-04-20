@@ -265,6 +265,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         eval_ramp_T: float | str = "auto",           # eval: factor to increase T on ramp ("auto" = VRAM-scaled)
         max_microbatches_per_step: int = 8,              # cap microbatches per step; if exceeded, budget is bumped for the step
         seed_regime_state: str | None = None,          # path to regime_state.json or checkpoint dir to seed B/T defaults from a previous run
+        adaptive_regime_state: bool = False,              # when True with seed_regime_state, explore beyond seeded B/T limits for new data
         max_eval_generate_examples: int | None = None,  # max examples per generate call (None = no limit, uses token budget only)
         builtin_metrics: tuple[str, ...] | None = None,   # e.g. ("bleu","chrf") or ("bleu","chrf","meteor")
         builtin_metrics_tokenize: str = "13a",
@@ -358,8 +359,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Autotuned keys are cleared so each regime re-autotunes T with the current
         # model's memory baseline — only the B/T starting points are reused.
         self._seed_regime_state_path = seed_regime_state
+        self._adaptive_regime_state = bool(adaptive_regime_state)
         if seed_regime_state is not None:
             self._seed_regime_state(str(seed_regime_state))
+        elif self._adaptive_regime_state:
+            logger.warning("[TokenPackTrainer] adaptive_regime_state=True has no effect without seed_regime_state")
+            self._adaptive_regime_state = False
 
         # --- Sequence length tracking for diagnostics ---
         self._max_seen_enc_len = 0
@@ -928,6 +933,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
             st["hwm_B"] = None
         if "bytes_per_token" not in st:
             st["bytes_per_token"] = None
+        if "adaptive_ramps" not in st:
+            st["adaptive_ramps"] = 0
         return st
 
     def _apply_regime_limits(self, key: int):
@@ -990,6 +997,34 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     new_B = max(self._regime_min_B, int(st["B"] * 1.20) + 1)
                     st["B"] = min(new_B, hwm_b)
                     st["B"] = self._clamp_int(st["B"], self._regime_min_B, self._regime_max_B)
+            return
+
+        # Adaptive exploration: when seeded in adaptive mode, cautiously probe
+        # beyond the seed's operating point to discover better limits for the
+        # new data distribution.  Each regime gets a limited number of ramp
+        # attempts; OOM terminates exploration immediately.
+        adaptive_ramps = st.get("adaptive_ramps", 0)
+        if adaptive_ramps > 0 and st["stable"] >= self._regime_ramp_every:
+            old_T, old_B = st["T"], st["B"]
+            st["T"] = self._clamp_int(
+                int(st["T"] * self._regime_ramp_T),
+                self._regime_min_T,
+                min(self._regime_max_T, self.INT64_MAX),
+            )
+            if st["B"] is not None:
+                st["B"] = self._clamp_int(
+                    max(self._regime_min_B, int(st["B"] * self._regime_ramp_B) + 1),
+                    self._regime_min_B,
+                    self._regime_max_B,
+                )
+            st["adaptive_ramps"] = adaptive_ramps - 1
+            st["stable"] = 0
+            if self.debug:
+                logger.info(
+                    f"[TokenPackTrainer] Adaptive ramp regime {key}: "
+                    f"T={old_T}→{st['T']}, B={old_B}→{st['B']}, "
+                    f"ramps_left={st['adaptive_ramps']}"
+                )
             return
 
         # At or above HWM — regime is at its proven stable pace.
@@ -1067,6 +1102,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 st["hwm_B"] = st["B"]
 
         st["stable"] = 0
+        st["adaptive_ramps"] = 0  # OOM ends adaptive exploration for this regime
 
         # Invalidate bytes_per_token — the calibration that said "this T is safe"
         # was wrong, so don't let the predictive check trust it until re-autotune.
@@ -1147,6 +1183,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "eval_ramp_every": self._eval_ramp_every,
             "eval_ramp_T": self._eval_ramp_T,
             "max_microbatches_per_step": self.max_microbatches_per_step,
+            "adaptive_regime_state": getattr(self, "_adaptive_regime_state", False),
         }
 
     def _bottleneck_gpu_stats(self) -> tuple[int, int, int] | None:
@@ -2671,12 +2708,17 @@ class TokenPackTrainer(Seq2SeqTrainer):
             # Build super-batches up to _gen_target_B, then flush each.
             _gen_buffer = []
             _gen_buffer_count = 0
-            n_flushes = 0
 
-            # Count expected flushes for the progress bar
-            total_gen_examples = sum(b["input_ids"].size(0) for b in _all_gen_batches)
-            flush_target = _gen_target_B if _gen_target_B > 0 else total_gen_examples
-            expected_flushes = max(1, (total_gen_examples + flush_target - 1) // flush_target)
+            # Pre-count exact flushes by simulating the accumulation
+            _sim_count = 0
+            expected_flushes = 0
+            for b in _all_gen_batches:
+                _sim_count += b["input_ids"].size(0)
+                if _gen_target_B <= 0 or _sim_count >= _gen_target_B:
+                    expected_flushes += 1
+                    _sim_count = 0
+            if _sim_count > 0:
+                expected_flushes += 1  # remainder flush
 
             gen_pbar = tqdm(
                 total=expected_flushes, desc=f"{desc} [generate]", leave=True,
@@ -2691,13 +2733,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     continue
 
                 _flush_gen_buffer()
-                n_flushes += 1
                 gen_pbar.update(1)
 
             # Flush remainder
             if _gen_buffer:
                 _flush_gen_buffer()
-                n_flushes += 1
                 gen_pbar.update(1)
 
             gen_pbar.close()
@@ -2993,15 +3033,20 @@ class TokenPackTrainer(Seq2SeqTrainer):
             with open(path, "r") as f:
                 state = json.load(f)
 
+            adaptive = self._adaptive_regime_state
             seeded = {}
             for k, v in state.get("regime_limits", {}).items():
                 seeded[int(k)] = {
                     "B": v.get("B"),
                     "T": int(v["T"]),
                     "stable": 0,  # fresh start — don't inherit stability
-                    "hwm_T": int(v["hwm_T"]) if v.get("hwm_T") is not None else None,
-                    "hwm_B": int(v["hwm_B"]) if v.get("hwm_B") is not None else None,
+                    # In adaptive mode, clear HWMs so regimes can explore beyond
+                    # the previous run's proven limits (which may be suboptimal
+                    # for the new data distribution).
+                    "hwm_T": None if adaptive else (int(v["hwm_T"]) if v.get("hwm_T") is not None else None),
+                    "hwm_B": None if adaptive else (int(v["hwm_B"]) if v.get("hwm_B") is not None else None),
                     "bytes_per_token": None,  # reset — model memory footprint may differ
+                    "adaptive_ramps": 3 if adaptive else 0,
                 }
             self._regime_limits = seeded
 
@@ -3011,9 +3056,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
             self._regime_oom_count = {}
             # Don't load gpu_baseline_mem — let it re-measure with current model.
 
+            mode = "adaptive" if adaptive else "seeded"
             logger.info(
                 f"[TokenPackTrainer] Seeded regime state from {path}: "
-                f"{len(seeded)} regimes (B/T loaded, autotuned_keys cleared for re-calibration)"
+                f"{len(seeded)} regimes ({mode}, B/T loaded, autotuned_keys cleared for re-calibration)"
             )
             return True
         except Exception as e:
