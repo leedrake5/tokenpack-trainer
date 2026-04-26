@@ -1250,7 +1250,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
     #   - pynvml handle cached once, not re-initialized per call
 
     _DIAG_MAX_RECORDS = 5000  # keep last 5000 records (~4 MB)
-    _DIAG_FLUSH_EVERY = 50    # flush ring buffer to disk every 50 writes
+    _DIAG_FLUSH_EVERY = 10    # flush ring buffer to disk every 10 writes (= every 100 steps)
 
     def _diag_get_nvml_handle(self):
         """Get (or lazily create) a cached pynvml device handle."""
