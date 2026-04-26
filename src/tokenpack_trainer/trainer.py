@@ -414,11 +414,10 @@ class TokenPackTrainer(Seq2SeqTrainer):
         self._gpu_baseline_mem_per_device: dict[int, int] = {}  # per-device baselines for multi-GPU
 
         # --- Diagnostics file ---
-        # Writes a JSONL file every N steps with GPU/CPU metrics, timing
-        # breakdown, regime state, and batch stats.  No stdout clutter.
-        # Clearly distinguishes "small T" from "dataloader starvation".
+        # Ring-buffer JSONL: keeps last 5000 records (~4 MB), flushed to
+        # disk asynchronously every 50 writes.  No stdout clutter.
+        # Distinguishes "small T" from "dataloader starvation" via gap_ms.
         self._diag_interval = int(diagnostic_interval)
-        self._diag_file = None  # opened lazily on first write
         self._last_step_end_time = None  # for inter-step gap measurement
 
         if getattr(self, "processing_class", None) is None:
@@ -1242,6 +1241,41 @@ class TokenPackTrainer(Seq2SeqTrainer):
     # ------------------------------------------------------------------
     # Diagnostics file writer
     # ------------------------------------------------------------------
+    #
+    # Design constraints:
+    #   - Must not slow training (async writes via a background thread)
+    #   - Must not grow unbounded (ring-buffer: keeps last N records,
+    #     rewrites file periodically)
+    #   - Must not crash training (all errors swallowed)
+    #   - pynvml handle cached once, not re-initialized per call
+
+    _DIAG_MAX_RECORDS = 5000  # keep last 5000 records (~4 MB)
+    _DIAG_FLUSH_EVERY = 50    # flush ring buffer to disk every 50 writes
+
+    def _diag_get_nvml_handle(self):
+        """Get (or lazily create) a cached pynvml device handle."""
+        if not hasattr(self, "_nvml_handle"):
+            self._nvml_handle = None
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                dev = self.args.device
+                dev_idx = dev.index if hasattr(dev, "index") and dev.index is not None else 0
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(dev_idx)
+                self._pynvml = pynvml
+            except Exception:
+                self._pynvml = None
+        return self._nvml_handle
+
+    def _diag_get_psutil(self):
+        """Lazily import psutil (returns module or None)."""
+        if not hasattr(self, "_psutil"):
+            try:
+                import psutil
+                self._psutil = psutil
+            except ImportError:
+                self._psutil = None
+        return self._psutil
 
     def _write_step_diagnostics(
         self,
@@ -1257,111 +1291,126 @@ class TokenPackTrainer(Seq2SeqTrainer):
         num_microbatches: int,
         mb_eff_tokens: list | None = None,
     ):
-        """Write one diagnostic record to {output_dir}/tokenpack_diagnostics.jsonl.
+        """Append one diagnostic record to an in-memory ring buffer.
 
-        Called every diagnostic_interval steps.  Captures GPU/CPU state,
-        timing breakdown, and regime state in a single JSON line.
-        No stdout output — file only.
+        Every _DIAG_FLUSH_EVERY writes, the buffer is flushed to disk
+        asynchronously via a daemon thread.  The file is rewritten (not
+        appended) so it never exceeds _DIAG_MAX_RECORDS lines (~4 MB).
+
+        Called every diagnostic_interval steps.  No stdout output.
         """
-        import json
-
         if self._diag_interval <= 0:
             return
 
-        # Lazy open
-        if self._diag_file is None:
-            diag_path = os.path.join(self.args.output_dir, "tokenpack_diagnostics.jsonl")
-            os.makedirs(self.args.output_dir, exist_ok=True)
-            self._diag_file = open(diag_path, "a", buffering=1)  # line-buffered
-
-        record = {
-            "step": step,
-            "timestamp": time.time(),
-        }
+        record = {"step": step, "ts": round(time.time(), 2)}
 
         # --- GPU metrics ---
         if torch.cuda.is_available():
             dev = self.args.device
-            dev_idx = dev.index if hasattr(dev, "index") and dev.index is not None else 0
             try:
-                record["gpu_utilization_pct"] = torch.cuda.utilization(dev)
-            except Exception:
-                record["gpu_utilization_pct"] = None
-            record["gpu_memory_allocated_gb"] = torch.cuda.memory_allocated(dev) / (1 << 30)
-            record["gpu_memory_reserved_gb"] = torch.cuda.memory_reserved(dev) / (1 << 30)
-            record["gpu_memory_peak_gb"] = torch.cuda.max_memory_allocated(dev) / (1 << 30)
-            try:
-                props = torch.cuda.get_device_properties(dev)
-                record["gpu_memory_total_gb"] = props.total_memory / (1 << 30)
+                record["gpu_util"] = torch.cuda.utilization(dev)
             except Exception:
                 pass
-            # Power and temperature via pynvml (optional)
-            try:
-                import pynvml
-                pynvml.nvmlInit()
-                handle = pynvml.nvmlDeviceGetHandleByIndex(dev_idx)
-                record["gpu_power_w"] = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
-                record["gpu_temp_c"] = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-            except Exception:
-                pass
+            record["gpu_mem_alloc_gb"] = round(torch.cuda.memory_allocated(dev) / (1 << 30), 2)
+            record["gpu_mem_peak_gb"] = round(torch.cuda.max_memory_allocated(dev) / (1 << 30), 2)
+            # Power + temp from cached pynvml handle
+            handle = self._diag_get_nvml_handle()
+            if handle is not None:
+                try:
+                    record["gpu_power_w"] = round(self._pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0, 1)
+                    record["gpu_temp_c"] = self._pynvml.nvmlDeviceGetTemperature(handle, self._pynvml.NVML_TEMPERATURE_GPU)
+                except Exception:
+                    pass
 
         # --- CPU metrics ---
         try:
-            record["cpu_load_avg_1m"] = os.getloadavg()[0]
+            record["cpu_load_1m"] = round(os.getloadavg()[0], 1)
         except (OSError, AttributeError):
             pass
-        try:
-            import psutil
-            record["cpu_percent"] = psutil.cpu_percent(interval=None)
-            mem = psutil.virtual_memory()
-            record["ram_used_gb"] = mem.used / (1 << 30)
-            record["ram_total_gb"] = mem.total / (1 << 30)
-            record["ram_percent"] = mem.percent
-        except ImportError:
-            pass
+        psutil = self._diag_get_psutil()
+        if psutil is not None:
+            try:
+                record["cpu_pct"] = psutil.cpu_percent(interval=None)
+                mem = psutil.virtual_memory()
+                record["ram_pct"] = mem.percent
+            except Exception:
+                pass
 
         # --- Timing ---
         record["plan_ms"] = round(plan_ms, 1)
         record["exec_ms"] = round(exec_ms, 1)
-        record["total_step_ms"] = round(total_ms, 1)
-        record["inter_step_gap_ms"] = round(inter_step_gap_ms, 1) if inter_step_gap_ms is not None else None
-        # Derived: what fraction of wall time is the GPU actually computing?
+        record["step_ms"] = round(total_ms, 1)
+        record["gap_ms"] = round(inter_step_gap_ms, 1) if inter_step_gap_ms is not None else None
         if inter_step_gap_ms is not None and total_ms > 0:
-            wall = total_ms + inter_step_gap_ms
-            record["gpu_busy_pct_walltime"] = round(100.0 * exec_ms / wall, 1)
-        else:
-            record["gpu_busy_pct_walltime"] = None
+            record["busy_pct"] = round(100.0 * exec_ms / (total_ms + inter_step_gap_ms), 1)
 
         # --- Batch stats ---
-        record["num_examples"] = num_examples
-        record["num_tokens"] = num_tokens
-        record["eff_tokens"] = eff_tokens
-        record["num_microbatches"] = num_microbatches
+        record["examples"] = num_examples
+        record["tokens"] = num_tokens
+        record["eff_tok"] = eff_tokens
+        record["n_mb"] = num_microbatches
         if mb_eff_tokens:
-            record["max_mb_eff_tokens"] = max(mb_eff_tokens)
-            record["min_mb_eff_tokens"] = min(mb_eff_tokens)
+            record["max_mb_tok"] = max(mb_eff_tokens)
 
         # --- Regime state ---
         if regime_key is not None:
             st = self._regime_state(regime_key)
-            record["regime_key"] = regime_key
-            record["regime_T"] = st.get("T")
-            record["regime_B"] = st.get("B")
-            record["regime_hwm_T"] = st.get("hwm_T")
-            record["regime_stable"] = st.get("stable")
-            record["regime_bytes_per_token"] = st.get("bytes_per_token")
-            record["regime_util_ramp_attempts"] = st.get("_util_ramp_attempts", 0)
+            record["rk"] = regime_key
+            record["rT"] = st.get("T")
+            record["rB"] = st.get("B")
+            record["hwm_T"] = st.get("hwm_T")
+            record["stable"] = st.get("stable")
+            bpt = st.get("bytes_per_token")
+            if bpt is not None:
+                record["bpt"] = round(bpt, 0)
 
-        # --- GPU utilization rolling average ---
         _uh = getattr(self, "_gpu_util_history", [])
         if _uh:
-            record["gpu_util_avg_20"] = round(sum(_uh) / len(_uh), 1)
-        record["oom_events_total"] = getattr(self, "_oom_events", 0)
+            record["util_avg20"] = round(sum(_uh) / len(_uh), 1)
+        ooms = getattr(self, "_oom_events", 0)
+        if ooms > 0:
+            record["ooms"] = ooms
 
-        try:
-            self._diag_file.write(json.dumps(record) + "\n")
-        except Exception:
-            pass
+        # --- Ring buffer + async flush ---
+        import json
+        line = json.dumps(record, separators=(",", ":"))  # compact JSON
+
+        if not hasattr(self, "_diag_ring"):
+            self._diag_ring = []
+            self._diag_writes_since_flush = 0
+
+        self._diag_ring.append(line)
+        # Trim ring buffer
+        if len(self._diag_ring) > self._DIAG_MAX_RECORDS:
+            self._diag_ring = self._diag_ring[-self._DIAG_MAX_RECORDS:]
+
+        self._diag_writes_since_flush += 1
+        if self._diag_writes_since_flush >= self._DIAG_FLUSH_EVERY:
+            self._diag_writes_since_flush = 0
+            self._diag_flush_async()
+
+    def _diag_flush_async(self):
+        """Flush the ring buffer to disk on a daemon thread."""
+        import threading
+
+        snapshot = list(self._diag_ring)  # snapshot under GIL (atomic for list copy)
+        diag_path = os.path.join(self.args.output_dir, "tokenpack_diagnostics.jsonl")
+
+        def _write():
+            try:
+                os.makedirs(os.path.dirname(diag_path), exist_ok=True)
+                # Atomic-ish rewrite: write to tmp, rename
+                tmp_path = diag_path + ".tmp"
+                with open(tmp_path, "w") as f:
+                    f.write("\n".join(snapshot))
+                    f.write("\n")
+                os.replace(tmp_path, diag_path)  # atomic on POSIX
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_write, daemon=True)
+        t.start()
+        # Don't join — let it finish in the background
 
     def _bottleneck_gpu_stats(self) -> tuple[int, int, int] | None:
         """Return (total, peak, baseline) for the GPU with least headroom.
@@ -3286,8 +3335,15 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 self._load_regime_state(ckpt_dir)
 
         try:
-            return super().train(*args, **kwargs)
+            result = super().train(*args, **kwargs)
+            # Final flush of diagnostics ring buffer
+            if hasattr(self, "_diag_ring") and self._diag_ring:
+                self._diag_flush_async()
+            return result
         except _catch as err:
+            # Flush diagnostics before handling crash
+            if hasattr(self, "_diag_ring") and self._diag_ring:
+                self._diag_flush_async()
             # Let _handle_oom_and_save decide whether to checkpoint
             return self._handle_oom_and_save(err, reason="train")
 
