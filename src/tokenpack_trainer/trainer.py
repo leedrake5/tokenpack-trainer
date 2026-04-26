@@ -271,6 +271,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
         builtin_metrics_tokenize: str = "13a",
         builtin_metrics_lowercase: bool = False,
         max_metric_samples: int | None = 100000,  # Max samples for metric computation (None = all, default 2000 for speed)
+        diagnostic_interval: int = 10,  # write diagnostics every N steps (0 = disable); file: {output_dir}/tokenpack_diagnostics.jsonl
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -411,6 +412,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
         # Captured lazily on the first training_step call.
         self._gpu_baseline_mem: int | None = None
         self._gpu_baseline_mem_per_device: dict[int, int] = {}  # per-device baselines for multi-GPU
+
+        # --- Diagnostics file ---
+        # Writes a JSONL file every N steps with GPU/CPU metrics, timing
+        # breakdown, regime state, and batch stats.  No stdout clutter.
+        # Clearly distinguishes "small T" from "dataloader starvation".
+        self._diag_interval = int(diagnostic_interval)
+        self._diag_file = None  # opened lazily on first write
+        self._last_step_end_time = None  # for inter-step gap measurement
 
         if getattr(self, "processing_class", None) is None:
             # fallback, just in case
@@ -1229,6 +1238,130 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 if getattr(self, "_gpu_util_history", []) else None
             ),
         }
+
+    # ------------------------------------------------------------------
+    # Diagnostics file writer
+    # ------------------------------------------------------------------
+
+    def _write_step_diagnostics(
+        self,
+        step: int,
+        regime_key,
+        plan_ms: float,
+        exec_ms: float,
+        total_ms: float,
+        inter_step_gap_ms: float | None,
+        num_examples: int,
+        num_tokens: int,
+        eff_tokens: int,
+        num_microbatches: int,
+        mb_eff_tokens: list | None = None,
+    ):
+        """Write one diagnostic record to {output_dir}/tokenpack_diagnostics.jsonl.
+
+        Called every diagnostic_interval steps.  Captures GPU/CPU state,
+        timing breakdown, and regime state in a single JSON line.
+        No stdout output — file only.
+        """
+        import json
+
+        if self._diag_interval <= 0:
+            return
+
+        # Lazy open
+        if self._diag_file is None:
+            diag_path = os.path.join(self.args.output_dir, "tokenpack_diagnostics.jsonl")
+            os.makedirs(self.args.output_dir, exist_ok=True)
+            self._diag_file = open(diag_path, "a", buffering=1)  # line-buffered
+
+        record = {
+            "step": step,
+            "timestamp": time.time(),
+        }
+
+        # --- GPU metrics ---
+        if torch.cuda.is_available():
+            dev = self.args.device
+            dev_idx = dev.index if hasattr(dev, "index") and dev.index is not None else 0
+            try:
+                record["gpu_utilization_pct"] = torch.cuda.utilization(dev)
+            except Exception:
+                record["gpu_utilization_pct"] = None
+            record["gpu_memory_allocated_gb"] = torch.cuda.memory_allocated(dev) / (1 << 30)
+            record["gpu_memory_reserved_gb"] = torch.cuda.memory_reserved(dev) / (1 << 30)
+            record["gpu_memory_peak_gb"] = torch.cuda.max_memory_allocated(dev) / (1 << 30)
+            try:
+                props = torch.cuda.get_device_properties(dev)
+                record["gpu_memory_total_gb"] = props.total_memory / (1 << 30)
+            except Exception:
+                pass
+            # Power and temperature via pynvml (optional)
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(dev_idx)
+                record["gpu_power_w"] = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
+                record["gpu_temp_c"] = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+            except Exception:
+                pass
+
+        # --- CPU metrics ---
+        try:
+            record["cpu_load_avg_1m"] = os.getloadavg()[0]
+        except (OSError, AttributeError):
+            pass
+        try:
+            import psutil
+            record["cpu_percent"] = psutil.cpu_percent(interval=None)
+            mem = psutil.virtual_memory()
+            record["ram_used_gb"] = mem.used / (1 << 30)
+            record["ram_total_gb"] = mem.total / (1 << 30)
+            record["ram_percent"] = mem.percent
+        except ImportError:
+            pass
+
+        # --- Timing ---
+        record["plan_ms"] = round(plan_ms, 1)
+        record["exec_ms"] = round(exec_ms, 1)
+        record["total_step_ms"] = round(total_ms, 1)
+        record["inter_step_gap_ms"] = round(inter_step_gap_ms, 1) if inter_step_gap_ms is not None else None
+        # Derived: what fraction of wall time is the GPU actually computing?
+        if inter_step_gap_ms is not None and total_ms > 0:
+            wall = total_ms + inter_step_gap_ms
+            record["gpu_busy_pct_walltime"] = round(100.0 * exec_ms / wall, 1)
+        else:
+            record["gpu_busy_pct_walltime"] = None
+
+        # --- Batch stats ---
+        record["num_examples"] = num_examples
+        record["num_tokens"] = num_tokens
+        record["eff_tokens"] = eff_tokens
+        record["num_microbatches"] = num_microbatches
+        if mb_eff_tokens:
+            record["max_mb_eff_tokens"] = max(mb_eff_tokens)
+            record["min_mb_eff_tokens"] = min(mb_eff_tokens)
+
+        # --- Regime state ---
+        if regime_key is not None:
+            st = self._regime_state(regime_key)
+            record["regime_key"] = regime_key
+            record["regime_T"] = st.get("T")
+            record["regime_B"] = st.get("B")
+            record["regime_hwm_T"] = st.get("hwm_T")
+            record["regime_stable"] = st.get("stable")
+            record["regime_bytes_per_token"] = st.get("bytes_per_token")
+            record["regime_util_ramp_attempts"] = st.get("_util_ramp_attempts", 0)
+
+        # --- GPU utilization rolling average ---
+        _uh = getattr(self, "_gpu_util_history", [])
+        if _uh:
+            record["gpu_util_avg_20"] = round(sum(_uh) / len(_uh), 1)
+        record["oom_events_total"] = getattr(self, "_oom_events", 0)
+
+        try:
+            self._diag_file.write(json.dumps(record) + "\n")
+        except Exception:
+            pass
 
     def _bottleneck_gpu_stats(self) -> tuple[int, int, int] | None:
         """Return (total, peak, baseline) for the GPU with least headroom.
@@ -3371,6 +3504,12 @@ class TokenPackTrainer(Seq2SeqTrainer):
         model.train()
         _t0 = time.time()  # step-level timing
 
+        # Inter-step gap: time between previous training_step return and this call.
+        # This is the dataloader + collator time — invisible to within-step timing.
+        _inter_step_gap_ms = None
+        if self._last_step_end_time is not None:
+            _inter_step_gap_ms = (_t0 - self._last_step_end_time) * 1000
+
         # turn off KV cache during training to reduce memory spikes
         if hasattr(model, "config") and getattr(model.config, "use_cache", None) is True:
             model.config.use_cache = False
@@ -3764,7 +3903,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 # Accumulate for averaging
                 if not hasattr(self, "_timing_accum"):
                     self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
-                                          "examples": 0, "tokens": 0, "microbatches": 0}
+                                          "examples": 0, "tokens": 0, "microbatches": 0,
+                                          "inter_step_gap": 0.0, "inter_step_n": 0}
                 ta = self._timing_accum
                 ta["plan"] += _plan_ms
                 ta["exec"] += _exec_ms
@@ -3773,22 +3913,29 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 ta["examples"] += total_examples
                 ta["tokens"] += total_tokens
                 ta["microbatches"] += num_micro
+                if _inter_step_gap_ms is not None:
+                    ta["inter_step_gap"] += _inter_step_gap_ms
+                    ta["inter_step_n"] += 1
 
                 if ta["n"] >= 100:
                     n = ta["n"]
                     _uh = getattr(self, "_gpu_util_history", [])
                     _avg_util = sum(_uh) / len(_uh) if _uh else -1
+                    _avg_gap = ta["inter_step_gap"] / max(ta["inter_step_n"], 1)
+                    _gap_pct = 100.0 * _avg_gap / (_avg_gap + ta["total"]/n) if _avg_gap > 0 else 0
                     logger.info(
                         f"[TokenPackTrainer] Step timing (avg of {n}): "
                         f"plan={ta['plan']/n:.1f}ms, exec={ta['exec']/n:.1f}ms, "
-                        f"total={ta['total']/n:.1f}ms | "
+                        f"total={ta['total']/n:.1f}ms, "
+                        f"data_wait={_avg_gap:.0f}ms ({_gap_pct:.0f}% idle) | "
                         f"examples/step={ta['examples']/n:.0f}, "
                         f"tokens/step={ta['tokens']/n:.0f}, "
                         f"microbatches/step={ta['microbatches']/n:.1f} | "
                         f"gpu_util={_avg_util:.0f}%"
                     )
                     self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
-                                          "examples": 0, "tokens": 0, "microbatches": 0}
+                                          "examples": 0, "tokens": 0, "microbatches": 0,
+                                          "inter_step_gap": 0.0, "inter_step_n": 0}
 
                 # --- Step diagnostic ---
                 # Log regime details (gated by debug=True).
@@ -3872,6 +4019,27 @@ class TokenPackTrainer(Seq2SeqTrainer):
                                 "slow_accum_s": _slow_accum,
                                 "pressure_vram_util": _util,
                             })
+
+                # --- Diagnostics file (every N steps) ---
+                if self._diag_interval > 0 and _step_count % self._diag_interval == 0:
+                    try:
+                        self._write_step_diagnostics(
+                            step=_step_count,
+                            regime_key=regime_key,
+                            plan_ms=_plan_ms,
+                            exec_ms=_exec_ms,
+                            total_ms=_total_ms,
+                            inter_step_gap_ms=_inter_step_gap_ms,
+                            num_examples=total_examples,
+                            num_tokens=total_tokens,
+                            eff_tokens=eff_tokens,
+                            num_microbatches=num_micro,
+                            mb_eff_tokens=mb_eff_tokens,
+                        )
+                    except Exception:
+                        pass  # never let diagnostics crash training
+
+                self._last_step_end_time = time.time()
 
                 # Return a sane scalar for logging
                 return total_loss_weighted
