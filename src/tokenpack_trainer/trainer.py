@@ -1027,30 +1027,49 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 )
             return
 
-        # At or above HWM — regime is at its proven stable pace.
-        # Normally don't ramp further — the autotune calibrated T.
+        # --- GPU utilization-aware ramp ---
+        # If the GPU is consistently underutilized, the regime is likely too
+        # conservative (the autotune may have set T too low due to safety
+        # margins or the eff_tokens denominator bug).  Cautiously ramp T
+        # when utilization is low — if it OOMs, normal recovery handles it.
         #
-        # However, if the regime has been stable for a VERY long time, the
-        # original autotune may have been conservative (e.g., post-OOM with
-        # safety=0.60, or from a small batch with inflated bytes_per_token).
-        # Allow a cautious probe: every 200 stable steps, try a tiny 1.03x
-        # ramp.  If it OOMs, the regime shrinks back (no worse than before).
-        # If it succeeds, the new T becomes the HWM after 5 more successes,
-        # breaking out of the conservative local minimum.
-        if st["stable"] > 0 and st["stable"] % 200 == 0:
-            old_T = st["T"]
-            st["T"] = self._clamp_int(
-                int(st["T"] * 1.03),
-                self._regime_min_T,
-                min(self._regime_max_T, self.INT64_MAX),
-            )
-            if st["T"] != old_T:
-                st["stable"] = 0  # reset stable counter for the new T
-                if self.debug:
-                    logger.info(
-                        f"[TokenPackTrainer] Stability probe regime {key}: "
-                        f"T={old_T}→{st['T']} (3% ramp after 200 stable steps)"
+        # Conversely, if utilization is ≥80% for 20+ steps, the regime is
+        # at a good operating point — leave it alone.
+        _util_history = getattr(self, "_gpu_util_history", [])
+        if len(_util_history) >= 20 and st["stable"] >= 20:
+            _avg_util = sum(_util_history[-20:]) / 20
+
+            if _avg_util >= 80:
+                # GPU is well-utilized — confirmed good operating point.
+                # Reset the utilization ramp counter (we found a good T).
+                st["_util_ramp_attempts"] = 0
+                return
+
+            if _avg_util < 50:
+                # GPU is underutilized — cautiously ramp T.
+                # Cap at 10 consecutive ramps to prevent runaway escalation
+                # (e.g., if low utilization is from dataloader starvation,
+                # not conservative T, ramping T won't help).
+                _ramp_attempts = st.get("_util_ramp_attempts", 0)
+                if _ramp_attempts < 10:
+                    old_T = st["T"]
+                    st["T"] = self._clamp_int(
+                        int(st["T"] * 1.05),   # 5% ramp
+                        self._regime_min_T,
+                        min(self._regime_max_T, self.INT64_MAX),
                     )
+                    if st["T"] != old_T:
+                        st["stable"] = 0  # wait for stability at new T
+                        st["_util_ramp_attempts"] = _ramp_attempts + 1
+                        if self.debug:
+                            logger.info(
+                                f"[TokenPackTrainer] GPU util ramp regime {key}: "
+                                f"T={old_T}→{st['T']} (5% ramp, "
+                                f"avg_util={_avg_util:.0f}%, "
+                                f"attempt {_ramp_attempts + 1}/10)"
+                            )
+                return
+
         return
 
     def _safe_floor_T(self) -> int:
@@ -1122,6 +1141,7 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
         st["stable"] = 0
         st["adaptive_ramps"] = 0  # OOM ends adaptive exploration for this regime
+        st["_util_ramp_attempts"] = 0  # reset utilization ramp counter (can try again after recovery)
 
         # Invalidate bytes_per_token — the calibration that said "this T is safe"
         # was wrong, so don't let the predictive check trust it until re-autotune.
@@ -1203,6 +1223,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
             "eval_ramp_T": self._eval_ramp_T,
             "max_microbatches_per_step": self.max_microbatches_per_step,
             "adaptive_regime_state": getattr(self, "_adaptive_regime_state", False),
+            "gpu_util_history": list(getattr(self, "_gpu_util_history", [])),
+            "gpu_util_avg": (
+                sum(getattr(self, "_gpu_util_history", [])) / len(getattr(self, "_gpu_util_history", [1]))
+                if getattr(self, "_gpu_util_history", []) else None
+            ),
         }
 
     def _bottleneck_gpu_stats(self) -> tuple[int, int, int] | None:
@@ -3701,6 +3726,23 @@ class TokenPackTrainer(Seq2SeqTrainer):
                             self._regime_oom_count = oom_history
 
 
+                # --- GPU utilization tracking ---
+                # Sample GPU utilization after execution to detect under-
+                # utilization caused by conservative regimes.  The rolling
+                # window feeds _regime_on_success for utilization-aware ramps.
+                if torch.cuda.is_available() and not _oom_mid_batch:
+                    try:
+                        _gpu_util = torch.cuda.utilization(self.args.device)
+                        _uh = getattr(self, "_gpu_util_history", [])
+                        _uh.append(_gpu_util)
+                        # Keep last 20 samples
+                        if len(_uh) > 20:
+                            self._gpu_util_history = _uh[-20:]
+                        else:
+                            self._gpu_util_history = _uh
+                    except Exception:
+                        pass  # NVML not available or device error
+
                 # optional logging
                 if attempt > 0 and self.control.should_log:
                     self.log({
@@ -3734,13 +3776,16 @@ class TokenPackTrainer(Seq2SeqTrainer):
 
                 if ta["n"] >= 100:
                     n = ta["n"]
+                    _uh = getattr(self, "_gpu_util_history", [])
+                    _avg_util = sum(_uh) / len(_uh) if _uh else -1
                     logger.info(
                         f"[TokenPackTrainer] Step timing (avg of {n}): "
                         f"plan={ta['plan']/n:.1f}ms, exec={ta['exec']/n:.1f}ms, "
                         f"total={ta['total']/n:.1f}ms | "
                         f"examples/step={ta['examples']/n:.0f}, "
                         f"tokens/step={ta['tokens']/n:.0f}, "
-                        f"microbatches/step={ta['microbatches']/n:.1f}"
+                        f"microbatches/step={ta['microbatches']/n:.1f} | "
+                        f"gpu_util={_avg_util:.0f}%"
                     )
                     self._timing_accum = {"plan": 0.0, "exec": 0.0, "total": 0.0, "n": 0,
                                           "examples": 0, "tokens": 0, "microbatches": 0}
