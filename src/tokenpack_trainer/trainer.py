@@ -1028,10 +1028,29 @@ class TokenPackTrainer(Seq2SeqTrainer):
             return
 
         # At or above HWM — regime is at its proven stable pace.
-        # DON'T ramp further.  The autotune already calibrated T; pushing
-        # B and T higher causes the "sugar high" → OOM → crash cycle.
-        # The HWM is updated naturally when the autotune sets a higher T
-        # (because conditions improved), which then becomes the new ceiling.
+        # Normally don't ramp further — the autotune calibrated T.
+        #
+        # However, if the regime has been stable for a VERY long time, the
+        # original autotune may have been conservative (e.g., post-OOM with
+        # safety=0.60, or from a small batch with inflated bytes_per_token).
+        # Allow a cautious probe: every 200 stable steps, try a tiny 1.03x
+        # ramp.  If it OOMs, the regime shrinks back (no worse than before).
+        # If it succeeds, the new T becomes the HWM after 5 more successes,
+        # breaking out of the conservative local minimum.
+        if st["stable"] > 0 and st["stable"] % 200 == 0:
+            old_T = st["T"]
+            st["T"] = self._clamp_int(
+                int(st["T"] * 1.03),
+                self._regime_min_T,
+                min(self._regime_max_T, self.INT64_MAX),
+            )
+            if st["T"] != old_T:
+                st["stable"] = 0  # reset stable counter for the new T
+                if self.debug:
+                    logger.info(
+                        f"[TokenPackTrainer] Stability probe regime {key}: "
+                        f"T={old_T}→{st['T']} (3% ramp after 200 stable steps)"
+                    )
         return
 
     def _safe_floor_T(self) -> int:
@@ -1252,6 +1271,14 @@ class TokenPackTrainer(Seq2SeqTrainer):
         old_T = st["T"]
         st["T"] = max(self._regime_min_T, min(target_eff_tokens, INT64_MAX, getattr(self, "_regime_max_T", INT64_MAX)))
 
+        # Capture hwm_T immediately when autotune sets T.
+        # Previously hwm_T was only set in _regime_on_success after stable >= 3,
+        # meaning an OOM within the first 3 steps would lose the pre-OOM T.
+        # The post-OOM re-autotune (with conservative safety=0.60) would then
+        # become the hwm_T, permanently capping the regime.
+        if st["T"] > (st.get("hwm_T") or 0):
+            st["hwm_T"] = st["T"]
+
         # Persist bytes_per_token for the predictive VRAM pre-flight check.
         # This lets the next step predict memory before sending data to GPU.
         st["bytes_per_token"] = bytes_per_eff_token
@@ -1261,7 +1288,8 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 f"[autotune] regime {key}: baseline={baseline/(1<<30):.1f}G, "
                 f"peak={peak/(1<<30):.1f}G, batch_mem={batch_mem/(1<<30):.1f}G, "
                 f"bytes/tok={bytes_per_eff_token:.0f}, eff_tokens={eff_tokens_in_step}, "
-                f"target_tokens={target_eff_tokens}, T: {old_T} -> {st['T']}"
+                f"target_tokens={target_eff_tokens}, T: {old_T} -> {st['T']}, "
+                f"hwm_T={st.get('hwm_T')}"
             )
 
     def _is_cuda_oom(self, err: BaseException) -> bool:
@@ -3611,13 +3639,43 @@ class TokenPackTrainer(Seq2SeqTrainer):
                 if regime_key is not None and not _oom_mid_batch:
                     self._regime_on_success(regime_key)
 
+                # --- Autotune T from observed peak memory ---
+                #
+                # FIX: use per-microbatch eff_tokens, not total across all MBs.
+                # Peak memory reflects the SINGLE largest microbatch (only one is
+                # on GPU at a time with use_cpu_microbatch=True), but eff_tokens
+                # was the sum across ALL microbatches.  Dividing peak by total
+                # underestimates bytes_per_token by ~Nx, causing T to overshoot
+                # → OOM → conservative shrink → stuck at a local minimum.
+                #
+                # The correct denominator is max(mb_eff_tokens) — the effective
+                # tokens in the microbatch that actually caused the peak.
+                _autotune_eff_tokens = max(mb_eff_tokens) if mb_eff_tokens else eff_tokens
+
                 # Skip autotune when peak memory stats are unrepresentative:
                 #   - mid-batch recovery (partial step)
                 #   - retry attempts (attempt > 0): tiny desperation-mode
                 #     microbatches produce artificially low bytes_per_token,
                 #     causing the autotune to think tokens are cheap → sets
                 #     T=max → next cap-bumped attempt OOMs → B shrinks → repeat
-                if attempt == 0 and not _oom_mid_batch and regime_key is not None and not getattr(self, "_autotuned_keys", set()).__contains__(regime_key):
+                _autotuned_keys = getattr(self, "_autotuned_keys", set())
+                _needs_autotune = regime_key not in _autotuned_keys
+
+                # Periodic re-autotune: even after the initial calibration,
+                # allow re-autotune every 500 steps using the normal safety
+                # factor.  This prevents a conservative initial autotune
+                # (e.g., from a post-OOM step with safety=0.60) from permanently
+                # capping the regime.  Uses a dedicated counter (not 'stable',
+                # which resets on probes and OOMs).
+                if not _needs_autotune and regime_key is not None:
+                    _retune_counts = getattr(self, "_regime_retune_counter", {})
+                    _retune_count = _retune_counts.get(regime_key, 0) + 1
+                    _retune_counts[regime_key] = _retune_count
+                    self._regime_retune_counter = _retune_counts
+                    if _retune_count % 500 == 0:
+                        _needs_autotune = True  # re-calibrate with normal safety
+
+                if attempt == 0 and not _oom_mid_batch and regime_key is not None and _needs_autotune:
                     # Use lower safety factor if this regime recently OOM'd
                     # (previous autotune overshot, so be more conservative)
                     st = self._regime_state(regime_key)
@@ -3630,11 +3688,11 @@ class TokenPackTrainer(Seq2SeqTrainer):
                     # estimate that prolongs recovery.  Let the fast ramp handle
                     # recovery instead; autotune on a properly-sized batch later.
                     hwm = st.get("hwm_T") or st["T"]
-                    if recent_oom and eff_tokens < hwm * 0.1:
+                    if recent_oom and _autotune_eff_tokens < hwm * 0.1:
                         pass  # defer autotune to a larger batch
                     else:
                         safety = self._autotune_oom_safety if recent_oom else self._autotune_safety
-                        self._autotune_regime_from_peak(regime_key, eff_tokens, safety=safety)
+                        self._autotune_regime_from_peak(regime_key, _autotune_eff_tokens, safety=safety)
                         self._autotuned_keys = getattr(self, "_autotuned_keys", set())
                         self._autotuned_keys.add(regime_key)
                         # Clear OOM history for this key now that we've re-autotuned
